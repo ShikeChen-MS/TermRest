@@ -256,4 +256,321 @@ public class YamlTests
         Assert.True(JsonNode.DeepEquals(new JsonObject { ["a"] = 1, ["b"] = 2 }, new JsonObject { ["b"] = 2, ["a"] = 1 }));
         Assert.True(JsonNode.DeepEquals(YamlFile.Parse("a: 1000").Json, new JsonObject { ["a"] = 1000 }));
     }
+
+    // ----- wrapping long values ------------------------------------------------------------------------
+
+    private const string LongHeaderName = "X-An-Extremely-Long-Header-Name-That-Keeps-Going-And-Going-Forever";
+
+    /// <summary>A request with long values of every kind (expected output: what Postman's YAML library writes).</summary>
+    private static JsonObject LongValues() => new()
+    {
+        ["$kind"] = "http-request",
+        ["description"] = "Lists the widgets the caller can see. Results are paginated and sorted by name; use the cursor from the previous page.",
+        ["url"] = "{{baseUrl}}/v1/organizations/org_7d3k2m9x0q1w5e8r4t6y/projects/prj_a1b2c3d4e5f6/archived-items",
+        ["headers"] = new JsonObject
+        {
+            ["X-Custom"] = "A custom header whose value is long enough to need wrapping once it passes the width",
+            [LongHeaderName] = "this value starts on the line after its key because the key leaves no room on the first line",
+        },
+        ["queryParams"] = new JsonArray(new JsonObject
+        {
+            ["key"] = "filter",
+            ["value"] = "status eq 'open' and owner eq 'me' and created gt 2024-01-01 and priority in (1,2,3)",
+        }),
+        ["body"] = new JsonObject
+        {
+            ["type"] = "json",
+            ["content"] = "{\n    \"name\": \"Sprocket\",\n    \"notes\": \"This note is deliberately long so that the line goes well past the eighty column limit.\"\n}",
+        },
+        ["scripts"] = new JsonArray(
+            new JsonObject
+            {
+                ["type"] = "afterResponse",
+                ["code"] = "pm.test('status is 200', () => pm.response.to.have.status(200)); pm.test('json body', () => pm.response.to.be.json);\nconsole.log('done');",
+                ["language"] = "text/javascript",
+            },
+            new JsonObject
+            {
+                ["type"] = "beforeRequest",
+                ["code"] = "const url = 'https://example.com/a/very/long/path/that/cannot/be/broken/because/it/has/no/spaces/at/all';\nconsole.log(url);",
+            }),
+        ["tags"] = new JsonArray("short", "a tag that is very long and goes on and on until it has to be wrapped onto another line"),
+    };
+
+    [Fact]
+    public void Long_values_are_wrapped_like_postman_at_80_columns()
+    {
+        Assert.Equal(
+            """
+            $kind: http-request
+            description: Lists the widgets the caller can see. Results are paginated and
+              sorted by name; use the cursor from the previous page.
+            url: "{{baseUrl}}/v1/organizations/org_7d3k2m9x0q1w5e8r4t6y/projects/prj_a1b2c3\
+              d4e5f6/archived-items"
+            headers:
+              X-Custom: A custom header whose value is long enough to need wrapping once it
+                passes the width
+              X-An-Extremely-Long-Header-Name-That-Keeps-Going-And-Going-Forever:
+                this value starts on the line after its key because the key leaves no room
+                on the first line
+            queryParams:
+              - key: filter
+                value: status eq 'open' and owner eq 'me' and created gt 2024-01-01 and priority
+                  in (1,2,3)
+            body:
+              type: json
+              content: >-
+                {
+                    "name": "Sprocket",
+                    "notes": "This note is deliberately long so that the line goes well past the eighty column limit."
+                }
+            scripts:
+              - type: afterResponse
+                code: >-
+                  pm.test('status is 200', () => pm.response.to.have.status(200));
+                  pm.test('json body', () => pm.response.to.be.json);
+
+                  console.log('done');
+                language: text/javascript
+              - type: beforeRequest
+                code: |-
+                  const url = 'https://example.com/a/very/long/path/that/cannot/be/broken/because/it/has/no/spaces/at/all';
+                  console.log(url);
+            tags:
+              - short
+              - a tag that is very long and goes on and on until it has to be wrapped onto
+                another line
+
+            """.ReplaceLineEndings("\n"),
+            YamlFile.Write(LongValues(), YamlStyle.Default.WithLineWidth(80)));
+    }
+
+    [Fact]
+    public void Any_width_can_be_chosen_and_0_never_wraps()
+    {
+        Assert.Equal(
+            """
+            $kind: http-request
+            description: Lists the widgets the
+              caller can see. Results are paginated
+              and sorted by name; use the cursor
+              from the previous page.
+            url: "{{baseUrl}}/v1/organizations/org_\
+              7d3k2m9x0q1w5e8r4t6y/projects/prj_a1b\
+              2c3d4e5f6/archived-items"
+            headers:
+              X-Custom: A custom header whose value is
+                long enough to need wrapping once it
+                passes the width
+              X-An-Extremely-Long-Header-Name-That-Keeps-Going-And-Going-Forever:
+                this value starts on the line after
+                its key because the key leaves no
+                room on the first line
+            queryParams:
+              - key: filter
+                value: status eq 'open' and owner eq
+                  'me' and created gt 2024-01-01 and
+                  priority in (1,2,3)
+            body:
+              type: json
+              content: >-
+                {
+                    "name": "Sprocket",
+                    "notes": "This note is deliberately long so that the line goes well past the eighty column limit."
+                }
+            scripts:
+              - type: afterResponse
+                code: >-
+                  pm.test('status is 200', () =>
+                  pm.response.to.have.status(200));
+                  pm.test('json body', () =>
+                  pm.response.to.be.json);
+
+                  console.log('done');
+                language: text/javascript
+              - type: beforeRequest
+                code: |-
+                  const url = 'https://example.com/a/very/long/path/that/cannot/be/broken/because/it/has/no/spaces/at/all';
+                  console.log(url);
+            tags:
+              - short
+              - a tag that is very long and goes on
+                and on until it has to be wrapped
+                onto another line
+
+            """.ReplaceLineEndings("\n"),
+            YamlFile.Write(LongValues(), YamlStyle.Default.WithLineWidth(40)));
+
+        var unwrapped = YamlFile.Write(LongValues(), YamlStyle.Default.WithLineWidth(0));
+        Assert.Equal(
+            """
+            $kind: http-request
+            description: Lists the widgets the caller can see. Results are paginated and sorted by name; use the cursor from the previous page.
+            url: "{{baseUrl}}/v1/organizations/org_7d3k2m9x0q1w5e8r4t6y/projects/prj_a1b2c3d4e5f6/archived-items"
+            headers:
+              X-Custom: A custom header whose value is long enough to need wrapping once it passes the width
+              X-An-Extremely-Long-Header-Name-That-Keeps-Going-And-Going-Forever: this value starts on the line after its key because the key leaves no room on the first line
+            queryParams:
+              - key: filter
+                value: status eq 'open' and owner eq 'me' and created gt 2024-01-01 and priority in (1,2,3)
+            body:
+              type: json
+              content: |-
+                {
+                    "name": "Sprocket",
+                    "notes": "This note is deliberately long so that the line goes well past the eighty column limit."
+                }
+            scripts:
+              - type: afterResponse
+                code: |-
+                  pm.test('status is 200', () => pm.response.to.have.status(200)); pm.test('json body', () => pm.response.to.be.json);
+                  console.log('done');
+                language: text/javascript
+              - type: beforeRequest
+                code: |-
+                  const url = 'https://example.com/a/very/long/path/that/cannot/be/broken/because/it/has/no/spaces/at/all';
+                  console.log(url);
+            tags:
+              - short
+              - a tag that is very long and goes on and on until it has to be wrapped onto another line
+
+            """.ReplaceLineEndings("\n"),
+            unwrapped);
+        Assert.Equal(unwrapped, YamlFile.Write(LongValues(), YamlStyle.Default));
+        foreach (var style in (YamlStyle[])[YamlStyle.Default.WithLineWidth(80), YamlStyle.Default.WithLineWidth(40), YamlStyle.Default])
+        {
+            Assert.True(JsonNode.DeepEquals(LongValues(), YamlFile.Parse(YamlFile.Write(LongValues(), style)).Json));
+        }
+    }
+
+    public static TheoryData<string> LongStrings() =>
+    [
+        string.Join(' ', Enumerable.Repeat("word", 60)),
+        "double  spaces  are  never  places  to  break  " + string.Join("  ", Enumerable.Repeat("long-ish-token", 12)),
+        "tabs\tbetween\twords\t" + string.Join('\t', Enumerable.Repeat("tabbed", 20)),
+        "key: value pairs make it quoted " + string.Join(' ', Enumerable.Repeat("and long", 20)),
+        "a #hash forces quotes " + string.Join(' ', Enumerable.Repeat("and more text", 12)),
+        "{{start}} with a variable " + string.Join(' ', Enumerable.Repeat("then words", 15)),
+        "it's got 'single' quotes " + string.Join(' ', Enumerable.Repeat("filler", 20)),
+        "say \"hi\" with double quotes " + string.Join(' ', Enumerable.Repeat("filler", 20)),
+        "control\u0001chars\u001fand\ttabs " + string.Join(' ', Enumerable.Repeat("x\u0007y", 30)),
+        "{{noSpacesAtAll}}" + string.Concat(Enumerable.Repeat("abcdefghij", 25)),
+        "\\backslashes\\n and \\\"quotes\\\" " + string.Join(' ', Enumerable.Repeat("\\path\\to", 20)),
+        "unicode é ü ✓ 😀 " + string.Join(' ', Enumerable.Repeat("日本語のテキスト", 20)),
+        "trailing space at the end of a long line of text that needs wrapping somewhere along the way ",
+        "  leading spaces and a long line of text that needs wrapping somewhere along the way please",
+        "first line\nsecond line " + string.Join(' ', Enumerable.Repeat("long", 40)) + "\nthird",
+        "paragraph one " + string.Join(' ', Enumerable.Repeat("one", 30)) + "\n\nparagraph two " + string.Join(' ', Enumerable.Repeat("two", 30)) + "\n",
+        "{\n  \"indented\": \"" + string.Join(' ', Enumerable.Repeat("json", 40)) + "\"\n}\n\n\n",
+        "\tTabbed first line " + string.Join(' ', Enumerable.Repeat("tab", 30)) + "\nnext",
+        "line one " + string.Join(' ', Enumerable.Repeat("crlf", 30)) + "\r\nline two\r\n",
+        "ends with spaces " + string.Join(' ', Enumerable.Repeat("w", 50)) + " \n   ",
+        "space before break " + string.Join(' ', Enumerable.Repeat("w", 40)) + " \nand after\n  indented continuation",
+        "line\u2028separator and next\u0085line " + string.Join(' ', Enumerable.Repeat("w", 50)),
+        string.Concat(Enumerable.Repeat("x", 300)),
+        string.Concat(Enumerable.Repeat("\\x", 120)),
+        "escapes right after a space \u0001\u0002 " + string.Join(" \u0003", Enumerable.Repeat("ab", 40)),
+        string.Join(' ', Enumerable.Repeat("\u0007\u0008\u001b", 40)),
+    ];
+
+    [Theory]
+    [MemberData(nameof(LongStrings))]
+    public void Wrapped_values_read_back_unchanged(string value)
+    {
+        JsonNode deep = new JsonObject { ["key"] = value, ["list"] = new JsonArray(value) };
+        for (var level = 0; level < 12; level++)
+        {
+            deep = new JsonObject { [$"level{level}"] = deep };
+        }
+
+        foreach (var width in (int[])[1, 10, 20, 40, 80, 120])
+        {
+            foreach (var preferSingle in (bool[])[false, true])
+            {
+                var root = new JsonObject
+                {
+                    ["value"] = value,
+                    ["nested"] = new JsonObject { ["deeper"] = new JsonObject { ["key"] = value } },
+                    ["list"] = new JsonArray(value, new JsonObject { ["key"] = value, ["other"] = value }, new JsonArray(value)),
+                    [LongHeaderName] = value,
+                    ["deep"] = deep.DeepClone(),
+                };
+
+                var text = YamlFile.Write(root, new YamlStyle(preferSingle).WithLineWidth(width));
+                var parsed = YamlFile.Parse(text).Json;
+
+                Assert.True(JsonNode.DeepEquals(root, parsed), $"width {width}:\n{text}\n→ {parsed.ToJsonString()}");
+            }
+        }
+    }
+
+    [Fact]
+    public void Line_width_is_detected_from_how_files_were_written()
+    {
+        const string wrapped = "description: Lists the widgets the caller can see. Results are paginated and\n  sorted by name; use the cursor from the previous page.\n";
+        const string unwrapped = "description: Lists the widgets the caller can see. Results are paginated and sorted by name; use the cursor from the previous page.\n";
+        const string neither = "description: Short.\nurl: https://example.com\n";
+
+        Assert.Equal(80, YamlStyle.Detect([YamlFile.Parse(wrapped).Tree]).LineWidth);
+        Assert.Equal(0, YamlStyle.Detect([YamlFile.Parse(unwrapped).Tree]).LineWidth);
+        Assert.Equal(0, YamlStyle.Detect([YamlFile.Parse(neither).Tree]).LineWidth);
+        Assert.Equal(80, YamlStyle.Detect([YamlFile.Parse(neither).Tree], new YamlStyle(false, 80)).LineWidth);
+        Assert.Equal(80, YamlStyle.Detect([YamlFile.Parse(wrapped).Tree, YamlFile.Parse(wrapped).Tree, YamlFile.Parse(unwrapped).Tree]).LineWidth);
+
+        // Folded the way no Postman version does (the first line is too long): no evidence either way.
+        Assert.Equal(0, YamlStyle.Detect([YamlFile.Parse(Request).Tree]).LineWidth);
+
+        // The user's choice wins over the files.
+        var fixedStyle = YamlStyle.Detect([YamlFile.Parse(wrapped).Tree], YamlStyle.Default.WithLineWidth(0));
+        Assert.Equal((0, true), (fixedStyle.LineWidth, fixedStyle.LineWidthIsFixed));
+        Assert.Equal(100, YamlStyle.Detect([YamlFile.Parse(unwrapped).Tree], YamlStyle.Default.WithLineWidth(100)).LineWidth);
+    }
+
+    [Fact]
+    public void Wrapping_applies_to_changed_values_only()
+    {
+        var file = YamlFile.Parse("""
+            $kind: http-request
+            description: Lists the widgets the caller can see. Results are paginated and
+              sorted by name; use the cursor from the previous page.
+            url: https://example.com/widgets
+            order: 1000
+
+            """.ReplaceLineEndings("\n"));
+        var changed = (JsonObject)file.Json.DeepClone();
+        changed["url"] = "https://example.com/widgets?filter=a long filter value that makes this line longer than eighty columns";
+
+        // The file is wrapped: so is the new value; the unchanged one keeps its line breaks.
+        var text = file.Render(changed, YamlStyle.Default);
+        Assert.Equal(
+            ["- url: https://example.com/widgets", "+ url: https://example.com/widgets?filter=a long filter value that makes this line", "+ longer than eighty columns"],
+            TestFiles.ChangedLines(file.Tree.Text, text));
+
+        // Never wrapping: still only the changed value is affected.
+        text = file.Render(changed, YamlStyle.Default.WithLineWidth(0));
+        Assert.Equal(
+            ["- url: https://example.com/widgets", "+ url: https://example.com/widgets?filter=a long filter value that makes this line longer than eighty columns"],
+            TestFiles.ChangedLines(file.Tree.Text, text));
+    }
+
+    [Fact]
+    public void Edited_blocks_keep_their_literal_or_folded_style()
+    {
+        var file = YamlFile.Parse("""
+            literal: |-
+              short
+              lines
+            folded: >-
+              short
+              text
+
+            """.ReplaceLineEndings("\n"));
+        var longLine = "a line that is long enough to be folded if this value were new: " + string.Join(' ', Enumerable.Repeat("word", 12));
+        var changed = new JsonObject { ["literal"] = longLine + "\nmore", ["folded"] = "now\nshort" };
+
+        var text = file.Render(changed, YamlStyle.Default.WithLineWidth(80));
+
+        Assert.StartsWith("literal: |-\n  " + longLine + "\n  more\nfolded: >-\n  now\n\n  short\n", text, StringComparison.Ordinal);
+        Assert.True(JsonNode.DeepEquals(changed, YamlFile.Parse(text).Json));
+    }
 }

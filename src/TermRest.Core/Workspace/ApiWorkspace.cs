@@ -166,8 +166,35 @@ public sealed class ApiWorkspace
             }
         }
 
+        workspace.ApplyYamlLineWidth();
         return workspace;
     }
+
+    /// <summary>
+    /// Passes <see cref="WorkspaceSettings.YamlLineWidth"/> to every loaded collection and environment (done when
+    /// loading and by <see cref="SaveSettings"/>; call it after changing the setting without saving).
+    /// </summary>
+    public void ApplyYamlLineWidth()
+    {
+        foreach (var collection in Collections)
+        {
+            collection.YamlLineWidth = Settings.YamlLineWidth;
+        }
+
+        foreach (var environment in Environments)
+        {
+            environment.YamlLineWidth = Settings.YamlLineWidth;
+        }
+
+        if (Globals is not null)
+        {
+            Globals.YamlLineWidth = Settings.YamlLineWidth;
+        }
+    }
+
+    /// <summary>The settings in <c>.termrest/settings.json</c> under <paramref name="workspaceRoot"/>; defaults when missing or invalid.</summary>
+    public static WorkspaceSettings ReadSettings(string workspaceRoot) =>
+        LoadSettings(Path.Combine(workspaceRoot, ConfigDirectoryName, "settings.json"), []);
 
     public const string PostmanFolder = "postman";
 
@@ -197,7 +224,7 @@ public sealed class ApiWorkspace
         {
             var parent = Path.Combine(RootPath, PostmanFolder, "collections");
             var directory = UniqueFolder(parent, V3Names.Safe(name));
-            var created = V3CollectionStorage.Create(directory, name);
+            var created = V3CollectionStorage.Create(directory, name, Settings.YamlLineWidth);
             Collections.Add(created);
             return created;
         }
@@ -213,6 +240,7 @@ public sealed class ApiWorkspace
         var environment = UsesV3Layout
             ? PostmanEnvironment.CreateYaml(name, UniqueFile(Path.Combine(RootPath, PostmanFolder, "environments"), V3Names.Safe(name), V3Names.EnvironmentSuffix))
             : PostmanEnvironment.Create(name, UniquePath(name, PostmanEnvironment.EnvironmentSuffix));
+        environment.YamlLineWidth = Settings.YamlLineWidth;
         environment.Save();
         Environments.Add(environment);
         return environment;
@@ -249,7 +277,7 @@ public sealed class ApiWorkspace
         {
             if (UsesV3Layout && !collection.IsV3)
             {
-                collection = collection.ConvertToV3(UniqueFolder(Path.Combine(RootPath, PostmanFolder, "collections"), V3Names.Safe(collection.Name)));
+                collection = collection.ConvertToV3(UniqueFolder(Path.Combine(RootPath, PostmanFolder, "collections"), V3Names.Safe(collection.Name)), Settings.YamlLineWidth);
             }
             else
             {
@@ -259,6 +287,7 @@ public sealed class ApiWorkspace
             }
         }
 
+        collection.YamlLineWidth = Settings.YamlLineWidth;
         Collections.Add(collection);
         return collection;
     }
@@ -280,6 +309,7 @@ public sealed class ApiWorkspace
         }
 
         var reloaded = PostmanCollection.Load(collection.FilePath);
+        reloaded.YamlLineWidth = Settings.YamlLineWidth;
         Collections[index] = reloaded;
         return reloaded;
     }
@@ -292,7 +322,9 @@ public sealed class ApiWorkspace
         if (loadedIndex >= 0)
         {
             ThrowIfDirty(Environments[loadedIndex].IsDirty, Environments[loadedIndex].Name);
-            return Environments[loadedIndex] = PostmanEnvironment.Load(fullSource);
+            var reloaded = PostmanEnvironment.Load(fullSource);
+            reloaded.YamlLineWidth = Settings.YamlLineWidth;
+            return Environments[loadedIndex] = reloaded;
         }
 
         var environment = PostmanEnvironment.Load(sourcePath);
@@ -303,6 +335,7 @@ public sealed class ApiWorkspace
             environment = PostmanEnvironment.Load(target);
         }
 
+        environment.YamlLineWidth = Settings.YamlLineWidth;
         Environments.Add(environment);
         return environment;
     }
@@ -320,6 +353,7 @@ public sealed class ApiWorkspace
         Directory.CreateDirectory(ConfigDirectory);
         var json = JsonSerializer.Serialize(Settings, CoreJsonContext.Default.WorkspaceSettings);
         TextFile.WriteAtomic(SettingsPath, json.Replace("\r\n", "\n", StringComparison.Ordinal), new TextFileInfo(false, true, false));
+        ApplyYamlLineWidth();
     }
 
     public void SaveCertificates()

@@ -171,6 +171,12 @@ public sealed class PreparedRequest
     /// <summary>Resolved values of secret variables and auth credentials, masked by <see cref="Redact"/>.</summary>
     public HashSet<string> SecretValues { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Resolved values of variables named like credentials (password, token, apiKey …) that are not typed "secret".
+    /// Recordings redact them as well (see <see cref="Recording.Redactor"/>).
+    /// </summary>
+    public HashSet<string> SensitiveValues { get; } = new(StringComparer.Ordinal);
+
     public string? GetHeader(string name) =>
         Headers.LastOrDefault(h => string.Equals(h.Key, name, StringComparison.OrdinalIgnoreCase)).Value;
 

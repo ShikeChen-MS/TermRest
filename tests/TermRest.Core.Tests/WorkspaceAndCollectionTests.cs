@@ -36,6 +36,32 @@ public class WorkspaceAndCollectionTests
     }
 
     [Fact]
+    public void User_settings_are_kept_in_the_user_s_configuration_folder()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        Assert.Null(UserSettings.Load(directory).Theme);
+
+        new UserSettings { Theme = "Nord" }.Save(directory);
+        Assert.Equal("Nord", UserSettings.Load(directory).Theme);
+        Assert.Contains("\"theme\": \"Nord\"", File.ReadAllText(Path.Combine(directory, "settings.json")), StringComparison.Ordinal);
+
+        File.WriteAllText(Path.Combine(directory, "settings.json"), "{ not json");
+        Assert.Null(UserSettings.Load(directory).Theme);
+
+        var previous = Environment.GetEnvironmentVariable(UserSettings.DirectoryVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(UserSettings.DirectoryVariable, directory);
+            Assert.Equal(Path.GetFullPath(directory), UserSettings.DefaultDirectory());
+            Assert.Equal(Path.Combine(directory, "themes"), UserSettings.ThemesDirectory());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(UserSettings.DirectoryVariable, previous);
+        }
+    }
+
+    [Fact]
     public void Runner_resolves_environment_over_collection_variables()
     {
         var workspace = OpenSampleCopy();

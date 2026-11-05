@@ -3,6 +3,7 @@ using TermRest.Core.History;
 using TermRest.Core.Http;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
+using TermRest.Core.Recording;
 using TermRest.Core.Variables;
 
 namespace TermRest.Core.Workspace;
@@ -40,6 +41,9 @@ public sealed class RequestRunner : IDisposable
 
     /// <summary>Where sent requests are recorded; null turns recording off (see <see cref="ConfigureHistory"/>).</summary>
     public HistoryStore? History { get; set; }
+
+    /// <summary>While set, every sent request is also recorded into a HAR file (see <see cref="RequestRecorder"/>).</summary>
+    public RequestRecorder? Recorder { get; set; }
 
     /// <summary>Largest response body kept with a history entry.</summary>
     public int HistoryMaxBodyBytes { get; set; } = 256 * 1024;
@@ -114,15 +118,17 @@ public sealed class RequestRunner : IDisposable
             saved ? node!.PathInCollection : null,
             saved ? node!.Name : null);
         prepared.SecretValues.UnionWith(SecretVariableValues(collection));
+        prepared.SensitiveValues.UnionWith(VariablesNamedLikeSecrets(collection, preparer.Variables));
         return prepared;
     }
 
-    /// <summary>Sends a prepared request and records it in <see cref="History"/> (when on).</summary>
+    /// <summary>Sends a prepared request and records it in <see cref="History"/> and <see cref="Recorder"/> (when on).</summary>
     public async Task<HttpExchange> SendAsync(PreparedRequest prepared, CancellationToken cancellationToken = default)
     {
         // No ConfigureAwait(false): UI callers resume on their own thread, which also records the entry.
         var exchange = await Executor.SendAsync(prepared, cancellationToken).ConfigureAwait(true);
         Record(exchange);
+        Recorder?.Record(exchange, Environment?.Name);
         return exchange;
     }
 
@@ -161,6 +167,25 @@ public sealed class RequestRunner : IDisposable
         }
 
         return entries.Where(e => e.Enabled && e.IsSecret && !string.IsNullOrEmpty(e.Value)).Select(e => e.Value!);
+    }
+
+    /// <summary>
+    /// Resolved values of variables named like credentials (password, token, apiKey … and the workspace's extra
+    /// <see cref="WorkspaceSettings.RecordingRedact"/> names) that are not typed "secret": recordings redact them too.
+    /// </summary>
+    private IEnumerable<string> VariablesNamedLikeSecrets(PostmanCollection collection, VariableResolver resolver)
+    {
+        var extraNames = SecretNames.NormalizeAll(Workspace.Settings.RecordingRedact);
+        IEnumerable<KeyValuePair<string, string?>> variables = (Environment?.Values ?? [])
+            .Concat(collection.GetVariables())
+            .Concat(Workspace.Globals?.Values ?? [])
+            .Where(e => e.Enabled)
+            .Select(e => new KeyValuePair<string, string?>(e.Key, e.Value));
+        variables = variables.Concat(LocalVariables.Select(v => new KeyValuePair<string, string?>(v.Key, v.Value)));
+        return variables
+            .Where(v => !string.IsNullOrEmpty(v.Value) && SecretNames.IsSecret(v.Key, NameKind.Field, extraNames))
+            .Select(v => resolver.Resolve(v.Value))
+            .Where(v => v.Length > 0);
     }
 
     /// <summary>Call after editing the certificate registry so changed entries are reloaded.</summary>

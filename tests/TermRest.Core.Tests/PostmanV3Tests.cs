@@ -277,6 +277,123 @@ public class PostmanV3Tests
     }
 
     [Fact]
+    public void Long_values_are_wrapped_as_the_workspace_setting_says()
+    {
+        var root = V3Fixture.Create();
+        Directory.CreateDirectory(Path.Combine(root, ".termrest"));
+        File.WriteAllText(Path.Combine(root, ".termrest", "settings.json"), "{ \"yamlLineWidth\": 80 }");
+        var (workspace, collection) = Open(root);
+        Assert.Equal(80, collection.YamlLineWidth);
+        Assert.Equal(80, workspace.Environments[0].YamlLineWidth);
+
+        var health = collection.FindRequest("Health")!;
+        var spec = health.ReadSpec();
+        spec.Description = "The health endpoint answers without authentication, so monitors can call it every few seconds to check the service.";
+        collection.UpdateRequest(health, spec);
+        collection.Save();
+        var file = Path.Combine(V3Fixture.CollectionPath(root), "Health.request.yaml");
+        Assert.Equal(
+            """
+            $kind: http-request
+            description: The health endpoint answers without authentication, so monitors can
+              call it every few seconds to check the service.
+            url: '{{baseUrl}}/health'
+            method: GET
+            auth:
+              type: noauth
+            order: 1000
+
+            """.ReplaceLineEndings("\n"),
+            File.ReadAllText(file));
+
+        var environment = workspace.Environments[0];
+        environment.SetValue("baseUrl", "http://localhost:8080 is where the service listens when it runs on a developer machine with default settings");
+        environment.Save();
+        Assert.Contains(
+            "    value: 'http://localhost:8080 is where the service listens when it runs on a\n      developer machine with default settings'\n",
+            File.ReadAllText(environment.FilePath!),
+            StringComparison.Ordinal);
+
+        var imported = workspace.ImportCollection(Path.Combine(AppContext.BaseDirectory, "samples", "TermRest Demo.postman_collection.json"));
+        Assert.StartsWith(
+            "$kind: collection\ndescription: Sample requests against Postman Echo (https://postman-echo.com).\n  Select the 'Postman Echo' environment to set {{baseUrl}}.\n",
+            File.ReadAllText(V3Names.DefinitionPath(imported.FilePath!)),
+            StringComparison.Ordinal);
+        Assert.Equal(80, workspace.CreateCollection("Created").YamlLineWidth);
+
+        // Changing the setting applies to everything that is open.
+        workspace.Settings.YamlLineWidth = 0;
+        workspace.SaveSettings();
+        Assert.All(workspace.Collections, c => Assert.Equal(0, c.YamlLineWidth));
+        Assert.Equal(0, environment.YamlLineWidth);
+        spec.Description = "Second edit, still a long description, written on one line because wrapping is now turned off for this workspace.";
+        collection.UpdateRequest(health, spec);
+        collection.Save();
+        Assert.Contains("\ndescription: Second edit, still a long description, written on one line because wrapping is now turned off for this workspace.\n", File.ReadAllText(file), StringComparison.Ordinal);
+        Assert.Contains("\"yamlLineWidth\": 0", File.ReadAllText(workspace.SettingsPath), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void By_default_new_values_are_wrapped_like_the_collection_s_files()
+    {
+        // A collection that a wrapping Postman version wrote: new and changed values are wrapped the same way.
+        var root = V3Fixture.Create();
+        var listFile = Path.Combine(V3Fixture.CollectionPath(root), "Widgets", "List widgets.request.yaml");
+        File.WriteAllText(listFile, File.ReadAllText(listFile).Replace(
+            "description: Lists the widgets the caller can see. Results are paginated and sorted by\n  name; use the cursor from the previous page.",
+            "description: Lists every widget, including archived ones, so that this\n  description is long enough to be wrapped by Postman.",
+            StringComparison.Ordinal));
+        var (_, collection) = Open(root);
+        Assert.Null(collection.YamlLineWidth);
+        Assert.Equal(80, collection.EffectiveYamlLineWidth);
+        const string description = "The health endpoint answers without authentication, so monitors can call it every few seconds to check the service.";
+
+        var health = collection.FindRequest("Health")!;
+        var spec = health.ReadSpec();
+        spec.Description = description;
+        collection.UpdateRequest(health, spec);
+        collection.Save();
+        Assert.StartsWith(
+            "$kind: http-request\ndescription: The health endpoint answers without authentication, so monitors can\n  call it every few seconds to check the service.\n",
+            File.ReadAllText(Path.Combine(V3Fixture.CollectionPath(root), "Health.request.yaml")),
+            StringComparison.Ordinal);
+
+        // Long values that are not wrapped (or none long enough to tell): like current Postman versions, no wrapping.
+        var plainRoot = V3Fixture.Create();
+        var (_, plain) = Open(plainRoot);
+        Assert.Equal(0, plain.EffectiveYamlLineWidth);
+        health = plain.FindRequest("Health")!;
+        plain.UpdateRequest(health, spec);
+        plain.Save();
+        Assert.StartsWith(
+            $"$kind: http-request\ndescription: {description}\n",
+            File.ReadAllText(Path.Combine(V3Fixture.CollectionPath(plainRoot), "Health.request.yaml")),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Converting_to_v3_wraps_at_the_requested_width()
+    {
+        var source = PostmanCollection.Load(Path.Combine(AppContext.BaseDirectory, "samples", "TermRest Demo.postman_collection.json"));
+        var directory = TestFiles.NewTempDirectory();
+
+        var wrapped = source.ConvertToV3(Path.Combine(directory, "wrapped", "TermRest Demo"), 80);
+        var unwrapped = source.ConvertToV3(Path.Combine(directory, "unwrapped", "TermRest Demo"));
+
+        Assert.StartsWith(
+            "$kind: collection\ndescription: Sample requests against Postman Echo (https://postman-echo.com).\n  Select the 'Postman Echo' environment to set {{baseUrl}}.\n",
+            File.ReadAllText(V3Names.DefinitionPath(wrapped.FilePath!)),
+            StringComparison.Ordinal);
+        Assert.StartsWith(
+            "$kind: collection\ndescription: Sample requests against Postman Echo (https://postman-echo.com). Select the 'Postman Echo' environment to set {{baseUrl}}.\n",
+            File.ReadAllText(V3Names.DefinitionPath(unwrapped.FilePath!)),
+            StringComparison.Ordinal);
+        Assert.Equal(80, PostmanCollection.Load(wrapped.FilePath!).EffectiveYamlLineWidth);
+        Assert.Equal(0, PostmanCollection.Load(unwrapped.FilePath!).EffectiveYamlLineWidth);
+        Assert.Empty(PostmanCollection.Load(wrapped.FilePath!).Verify());
+    }
+
+    [Fact]
     public void Yaml_environments_save_only_changed_values()
     {
         var root = V3Fixture.Create();

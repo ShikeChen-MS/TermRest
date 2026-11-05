@@ -6,25 +6,44 @@ using System.Text.Json.Nodes;
 namespace TermRest.Core.Yaml;
 
 /// <summary>Formatting choices that differ between Postman versions; detected from existing files.</summary>
-internal sealed record YamlStyle(bool PreferSingleQuotes)
+/// <param name="PreferSingleQuotes">Quote with single rather than double quotes where either works.</param>
+/// <param name="LineWidth">Column at which long values are wrapped (folded), like Postman's YAML library; 0 never wraps.</param>
+/// <param name="LineWidthIsFixed">The width is the user's choice: it is not detected from documents.</param>
+internal sealed record YamlStyle(bool PreferSingleQuotes, int LineWidth = 0, bool LineWidthIsFixed = false)
 {
-    /// <summary>Double quotes: what most Postman-written collections use.</summary>
+    /// <summary>Double quotes, no wrapping: what current Postman versions write.</summary>
     public static YamlStyle Default { get; } = new(false);
 
+    /// <summary>This style with the user's line width setting applied; null keeps the detected width.</summary>
+    public YamlStyle WithLineWidth(int? lineWidth) =>
+        lineWidth is int width ? this with { LineWidth = Math.Max(0, width), LineWidthIsFixed = true } : this;
+
     /// <summary>
-    /// Uses whichever quote character the given documents use most; <paramref name="fallback"/> (double quotes by
-    /// default) when they use neither, or both equally.
+    /// Quotes: whichever quote character the documents use most. Line width: 80 when their long values are wrapped the
+    /// way Postman wrapped them, 0 when long values are not wrapped. <paramref name="fallback"/> (double quotes and no
+    /// wrapping by default) applies where the documents show neither (or both equally), and a fixed width always wins.
     /// </summary>
     public static YamlStyle Detect(IEnumerable<YamlTree> trees, YamlStyle? fallback = null)
     {
+        fallback ??= Default;
         var single = 0;
         var @double = 0;
+        var wrapped = 0;
+        var unwrapped = 0;
         foreach (var tree in trees)
         {
             Count(tree.Root, ref single, ref @double);
+            if (!fallback.LineWidthIsFixed)
+            {
+                YamlWriter.CountWrapping(tree, tree.Root, ref wrapped, ref unwrapped);
+            }
         }
 
-        return single > @double ? new YamlStyle(true) : @double > single ? Default : fallback ?? Default;
+        var preferSingle = single == @double ? fallback.PreferSingleQuotes : single > @double;
+        var width = fallback.LineWidthIsFixed || wrapped == unwrapped
+            ? fallback.LineWidth
+            : wrapped > unwrapped ? YamlFolding.PostmanLineWidth : 0;
+        return new YamlStyle(preferSingle, width, fallback.LineWidthIsFixed);
 
         static void Count(YamlNode? node, ref int single, ref int @double)
         {
@@ -57,8 +76,9 @@ internal sealed record YamlStyle(bool PreferSingleQuotes)
 
 /// <summary>
 /// Writes JSON values as block YAML the way Postman does (2-space indentation, sequences indented under their key,
-/// literal blocks for multi-line text, quotes only when needed). When the original YAML is given as a hint, unchanged
-/// entries, items and scalars are copied verbatim, so an edit only touches the lines it has to.
+/// literal blocks for multi-line text, quotes only when needed, long values wrapped when the style has a line width).
+/// When the original YAML is given as a hint, unchanged entries, items and scalars are copied verbatim, so an edit only
+/// touches the lines it has to.
 /// </summary>
 internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
 {
@@ -81,8 +101,9 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
             _out.Append(' ', indent);
         }
 
-        _out.Append(FormatKey(key)).Append(':');
-        WriteValue(value, indent, hint?.Value);
+        var formattedKey = FormatKey(key);
+        _out.Append(formattedKey).Append(':');
+        WriteValue(value, indent, hint?.Value, formattedKey.Length);
     }
 
     /// <summary>Writes the entries of a mapping at <paramref name="indent"/>.</summary>
@@ -99,7 +120,7 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
     }
 
     /// <summary>The value after <c>key:</c> (scalars on the same line, collections on the following lines).</summary>
-    private void WriteValue(JsonNode? value, int indent, YamlNode? hint)
+    private void WriteValue(JsonNode? value, int indent, YamlNode? hint, int keyLength)
     {
         switch (value)
         {
@@ -118,7 +139,9 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
                 WriteSequence(array, indent + 2, hint as YamlSequenceNode);
                 break;
             default:
-                _out.Append(' ').Append(FormatScalar(value, indent, hint as YamlScalarNode, inSequence: false)).Append('\n');
+                // A wrapped value after a very long key starts on the next line.
+                var scalar = FormatScalar(value, indent, hint as YamlScalarNode, inSequence: false, keyLength);
+                _out.Append(scalar.StartsWith('\n') ? "" : " ").Append(scalar).Append('\n');
                 break;
         }
     }
@@ -198,7 +221,7 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
                 WriteSequence(nested, indent + 2, hint as YamlSequenceNode);
                 break;
             default:
-                _out.Append(' ').Append(FormatScalar(value, indent, hint as YamlScalarNode, inSequence: true)).Append('\n');
+                _out.Append(' ').Append(FormatScalar(value, indent, hint as YamlScalarNode, inSequence: true, keyLength: null)).Append('\n');
                 break;
         }
     }
@@ -254,10 +277,11 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
     // ----- scalars ---------------------------------------------------------------------------------
 
     /// <summary>
-    /// Formats a scalar written after <c>key: </c> or <c>- </c>. <paramref name="indent"/> is the indentation of the
-    /// owning key (block content goes two columns deeper). May span several lines (no trailing line break).
+    /// Formats a scalar written after <c>key: </c> (<paramref name="keyLength"/>: length of the written key) or <c>- </c>
+    /// (null). <paramref name="indent"/> is the column of the owning key or dash; continuation lines and block content go
+    /// two columns deeper. May span several lines (no trailing line break).
     /// </summary>
-    private string FormatScalar(JsonNode? value, int indent, YamlScalarNode? hint, bool inSequence)
+    private string FormatScalar(JsonNode? value, int indent, YamlScalarNode? hint, bool inSequence, int? keyLength)
     {
         if (hint is not null && source is not null && JsonNode.DeepEquals(Json(hint), value) && CanCopyScalar(hint, indent))
         {
@@ -283,18 +307,22 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
         }
 
         var text = scalar.GetValue<string>();
-        var quote = hint?.Style is YamlScalarStyle.SingleQuoted or YamlScalarStyle.DoubleQuoted ? hint.Style : (YamlScalarStyle?)null;
+        var contentIndent = indent + 2;
+        var indentAtStart = keyLength + 2; // the library measures a value's first line from the start of its key
         if (text.Contains('\n', StringComparison.Ordinal))
         {
-            return LiteralBlock(text, indent + 2, inSequence) ?? DoubleQuoted(text);
+            var keep = hint?.Style is YamlScalarStyle.Literal or YamlScalarStyle.Folded ? hint.Style : (YamlScalarStyle?)null;
+            return BlockScalar(text, contentIndent, inSequence, style.LineWidth, keep)
+                   ?? YamlFolding.FoldDoubleQuoted(DoubleQuoted(text), contentIndent, indentAtStart, style.LineWidth);
         }
 
+        var quote = hint?.Style is YamlScalarStyle.SingleQuoted or YamlScalarStyle.DoubleQuoted ? hint.Style : (YamlScalarStyle?)null;
         if (quote is null && IsPlainSafe(text))
         {
-            return text;
+            return YamlFolding.FoldFlow(text, contentIndent, indentAtStart, style.LineWidth);
         }
 
-        return Quoted(text, quote);
+        return Quoted(text, quote, contentIndent, indentAtStart);
     }
 
     /// <summary>A copied multi-line scalar must stay more indented than its (new) owner.</summary>
@@ -321,11 +349,11 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
         return true;
     }
 
-    private string Quoted(string text, YamlScalarStyle? preferred)
+    private string Quoted(string text, YamlScalarStyle? preferred, int contentIndent, int? indentAtStart)
     {
         if (!CanSingleQuote(text))
         {
-            return DoubleQuoted(text);
+            return YamlFolding.FoldDoubleQuoted(DoubleQuoted(text), contentIndent, indentAtStart, style.LineWidth);
         }
 
         var hasSingle = text.Contains('\'', StringComparison.Ordinal);
@@ -336,11 +364,38 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
             YamlScalarStyle.DoubleQuoted => false,
             _ => hasDouble && !hasSingle || (!(hasSingle && !hasDouble) && style.PreferSingleQuotes),
         };
-        return single ? "'" + text.Replace("'", "''", StringComparison.Ordinal) + "'" : DoubleQuoted(text);
+        return single
+            ? YamlFolding.FoldFlow(SingleQuoted(text), contentIndent, indentAtStart, style.LineWidth)
+            : YamlFolding.FoldDoubleQuoted(DoubleQuoted(text), contentIndent, indentAtStart, style.LineWidth);
     }
+
+    private static string SingleQuoted(string text) => "'" + text.Replace("'", "''", StringComparison.Ordinal) + "'";
 
     /// <summary>JSON number text is also a valid YAML 1.2 number (e.g. 1000, 1500.5, 1E+20).</summary>
     private static string FormatNumber(JsonValue value) => value.ToJsonString();
+
+    /// <summary>
+    /// Multi-line text as a block scalar, or null when it needs a quoted form. Literal (<c>|</c>) unless a line is longer
+    /// than <paramref name="lineWidth"/> allows: then folded (<c>&gt;</c>) when that shortens the lines, as Postman's YAML
+    /// library decides. <paramref name="keep"/> keeps the style of the value being replaced.
+    /// </summary>
+    private static string? BlockScalar(string text, int contentIndent, bool inSequence, int lineWidth, YamlScalarStyle? keep)
+    {
+        var literal = LiteralBlock(text, contentIndent, inSequence);
+        if (literal is null || lineWidth <= 0 || keep == YamlScalarStyle.Literal)
+        {
+            return literal;
+        }
+
+        if (keep == YamlScalarStyle.Folded)
+        {
+            return YamlFolding.FoldedBlock(text, contentIndent, lineWidth, literalWhenUnfoldable: false) ?? literal;
+        }
+
+        return YamlFolding.LineLengthOverLimit(text, lineWidth, contentIndent)
+            ? YamlFolding.FoldedBlock(text, contentIndent, lineWidth, literalWhenUnfoldable: true) ?? literal
+            : literal;
+    }
 
     /// <summary>A <c>|</c> block (chomping from the trailing line breaks), or null when the text needs a quoted form.</summary>
     private static string? LiteralBlock(string text, int contentIndent, bool inSequence)
@@ -482,6 +537,92 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
     }
 
     private static string FormatKey(string key) => IsPlainSafe(key) ? key : DoubleQuoted(key);
+
+    // ----- detecting how a document was wrapped -------------------------------------------------------
+
+    /// <summary>
+    /// Counts the values of a document that show how its writer wrapped long values: <paramref name="wrapped"/> are
+    /// written exactly as Postman's library wraps at 80 columns, <paramref name="unwrapped"/> exactly as it writes them
+    /// without wrapping (values that come out the same either way are not counted).
+    /// </summary>
+    internal static void CountWrapping(YamlTree tree, YamlNode? node, ref int wrapped, ref int unwrapped)
+    {
+        switch (node)
+        {
+            case YamlMappingNode { IsFlow: false } mapping:
+                foreach (var entry in mapping.Entries)
+                {
+                    if (entry.Value is YamlScalarNode value)
+                    {
+                        var keyLength = entry.Key.End - entry.Key.Start;
+                        CompareWrapping(tree, value, tree.ColumnOf(entry.Key.Start) + 2, keyLength + 2, inSequence: false, ref wrapped, ref unwrapped);
+                    }
+                    else
+                    {
+                        CountWrapping(tree, entry.Value, ref wrapped, ref unwrapped);
+                    }
+                }
+
+                break;
+            case YamlSequenceNode { IsFlow: false } sequence:
+                foreach (var item in sequence.Items)
+                {
+                    if (item.Value is YamlScalarNode value)
+                    {
+                        if (item.DashColumn >= 0)
+                        {
+                            CompareWrapping(tree, value, item.DashColumn + 2, null, inSequence: true, ref wrapped, ref unwrapped);
+                        }
+                    }
+                    else
+                    {
+                        CountWrapping(tree, item.Value, ref wrapped, ref unwrapped);
+                    }
+                }
+
+                break;
+        }
+    }
+
+    private static void CompareWrapping(YamlTree tree, YamlScalarNode node, int contentIndent, int? indentAtStart, bool inSequence, ref int wrapped, ref int unwrapped)
+    {
+        var wide = Render(node, contentIndent, indentAtStart, inSequence, YamlFolding.PostmanLineWidth);
+        var narrow = Render(node, contentIndent, indentAtStart, inSequence, 0);
+        if (wide is null || narrow is null || wide == narrow)
+        {
+            return;
+        }
+
+        var text = tree.Text[node.Start..node.End];
+        if (text.EndsWith('\n'))
+        {
+            text = text[..^1];
+        }
+
+        if (text == (wide.StartsWith('\n') ? wide.TrimStart('\n').TrimStart(' ') : wide))
+        {
+            wrapped++;
+        }
+        else if (text == narrow)
+        {
+            unwrapped++;
+        }
+    }
+
+    /// <summary>How the node's text is written in the node's own style at <paramref name="lineWidth"/>; null for forms TermRest does not write.</summary>
+    private static string? Render(YamlScalarNode node, int contentIndent, int? indentAtStart, bool inSequence, int lineWidth)
+    {
+        var text = node.Value;
+        return node.Style switch
+        {
+            YamlScalarStyle.Plain when IsPlainSafe(text) => YamlFolding.FoldFlow(text, contentIndent, indentAtStart, lineWidth),
+            YamlScalarStyle.SingleQuoted when CanSingleQuote(text) => YamlFolding.FoldFlow(SingleQuoted(text), contentIndent, indentAtStart, lineWidth),
+            YamlScalarStyle.DoubleQuoted => YamlFolding.FoldDoubleQuoted(DoubleQuoted(text), contentIndent, indentAtStart, lineWidth),
+            YamlScalarStyle.Literal or YamlScalarStyle.Folded when text.Contains('\n', StringComparison.Ordinal) =>
+                BlockScalar(text, contentIndent, inSequence, lineWidth, keep: null),
+            _ => null,
+        };
+    }
 
     /// <summary>Whether the text can be written as a plain (unquoted) scalar in block context and read back unchanged.</summary>
     public static bool IsPlainSafe(string text)

@@ -47,6 +47,26 @@ public sealed class PostmanCollection
     /// <summary>Problems found while loading (files that could not be read, items that are not shown).</summary>
     public List<string> LoadWarnings { get; } = [];
 
+    /// <summary>
+    /// For a v3 collection: the column at which new and changed values are wrapped when saving (0: never); null (the
+    /// default) follows the collection's files. See <see cref="Workspace.WorkspaceSettings.YamlLineWidth"/>. JSON
+    /// collections ignore it.
+    /// </summary>
+    public int? YamlLineWidth
+    {
+        get => (_storage as V3CollectionStorage)?.LineWidth;
+        set
+        {
+            if (_storage is V3CollectionStorage v3)
+            {
+                v3.LineWidth = value;
+            }
+        }
+    }
+
+    /// <summary>For a v3 collection: the column its new and changed values are wrapped at (0: not wrapped); null for JSON.</summary>
+    public int? EffectiveYamlLineWidth => (_storage as V3CollectionStorage)?.Style.LineWidth;
+
     public CollectionRootNode RootNode { get; }
 
     public string Name
@@ -124,8 +144,11 @@ public sealed class PostmanCollection
     /// </summary>
     public IReadOnlyList<string> Verify() => _storage is V3CollectionStorage v3 ? v3.Verify() : [];
 
-    /// <summary>Writes this collection (any format) as a new Postman v3 YAML collection folder and returns it.</summary>
-    public PostmanCollection ConvertToV3(string directory) => V3CollectionStorage.ConvertFrom(this, directory);
+    /// <summary>
+    /// Writes this collection (any format) as a new Postman v3 YAML collection folder and returns it. Long values are
+    /// wrapped at <paramref name="lineWidth"/> (null or 0: not wrapped).
+    /// </summary>
+    public PostmanCollection ConvertToV3(string directory, int? lineWidth = null) => V3CollectionStorage.ConvertFrom(this, directory, lineWidth);
 
     /// <summary>The collection as a Postman v2.1 JSON document (for any source format).</summary>
     public string ExportV21Json()

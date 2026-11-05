@@ -53,6 +53,17 @@ public sealed class PostmanEnvironment
     /// <summary>True for a v3 YAML environment/globals file.</summary>
     public bool IsYaml => FilePath is not null && IsYamlPath(FilePath);
 
+    /// <summary>
+    /// For YAML files: the column at which new and changed values are wrapped when saving (0: never); null (the default)
+    /// follows the file. See <see cref="Workspace.WorkspaceSettings.YamlLineWidth"/>.
+    /// </summary>
+    public int? YamlLineWidth { get; set; }
+
+    /// <summary>For YAML files: the column new and changed values are wrapped at (0: not wrapped); null for JSON.</summary>
+    public int? EffectiveYamlLineWidth => IsYaml
+        ? (_yaml is null ? YamlStyle.Default : YamlStyle.Detect([_yaml.Tree])).WithLineWidth(YamlLineWidth).LineWidth
+        : null;
+
     public bool IsDirty { get; private set; }
 
     public static bool IsYamlPath(string path) =>
@@ -152,7 +163,7 @@ public sealed class PostmanEnvironment
             var v3 = V3Convert.EnvironmentToV3(Root, _v3);
             if (_yaml is null || !JsonNode.DeepEquals(v3, _v3) || !string.Equals(path, FilePath, StringComparison.OrdinalIgnoreCase))
             {
-                var style = _yaml is null ? YamlStyle.Default : YamlStyle.Detect([_yaml.Tree]);
+                var style = (_yaml is null ? YamlStyle.Default : YamlStyle.Detect([_yaml.Tree])).WithLineWidth(YamlLineWidth);
                 var text = _yaml is null ? YamlFile.Write(v3, style) : _yaml.Render(v3, style);
                 TextFile.WriteAtomic(path, info.HasTrailingNewline ? text[..^1] : text, info);
                 _yaml = YamlFile.Parse(text);

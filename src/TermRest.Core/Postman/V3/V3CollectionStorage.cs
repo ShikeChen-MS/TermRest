@@ -41,6 +41,15 @@ internal sealed class V3CollectionStorage : ICollectionStorage
 
     public string BaseDirectory { get; }
 
+    /// <summary>
+    /// Column at which new and changed values are wrapped (0: never); null follows the files, as detected when loading
+    /// (see <see cref="Workspace.WorkspaceSettings.YamlLineWidth"/>).
+    /// </summary>
+    public int? LineWidth { get; set; }
+
+    /// <summary>The style new and changed content is written in (each file's own quoting and wrapping still win).</summary>
+    public YamlStyle Style => _style.WithLineWidth(LineWidth);
+
     /// <summary>What was read from (or last written to) disk for one item.</summary>
     private sealed class Origin
     {
@@ -102,7 +111,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
     }
 
     /// <summary>Creates an empty collection folder (with its definition file) and loads it.</summary>
-    public static PostmanCollection Create(string directory, string name)
+    public static PostmanCollection Create(string directory, string name, int? lineWidth = null)
     {
         directory = Path.GetFullPath(directory);
         var definition = new JsonObject { ["$kind"] = V3Convert.CollectionKind };
@@ -111,15 +120,18 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             definition["name"] = name;
         }
 
-        TextFile.WriteAtomic(V3Names.DefinitionPath(directory), YamlFile.Write(definition, YamlStyle.Default).TrimEnd('\n'), NewFile);
-        return Load(directory);
+        TextFile.WriteAtomic(V3Names.DefinitionPath(directory), YamlFile.Write(definition, YamlStyle.Default.WithLineWidth(lineWidth)).TrimEnd('\n'), NewFile);
+        var collection = Load(directory);
+        collection.YamlLineWidth = lineWidth;
+        return collection;
     }
 
     /// <summary>
     /// Writes <paramref name="source"/> (any format) as a new v3 collection folder, including saved responses as
-    /// <c>.example.yaml</c> files, and returns the loaded result.
+    /// <c>.example.yaml</c> files, and returns the loaded result. Long values are wrapped at
+    /// <paramref name="lineWidth"/> (null or 0: not wrapped, like current Postman versions).
     /// </summary>
-    public static PostmanCollection ConvertFrom(PostmanCollection source, string directory)
+    public static PostmanCollection ConvertFrom(PostmanCollection source, string directory, int? lineWidth = null)
     {
         directory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
         if (System.IO.Directory.Exists(directory) && System.IO.Directory.EnumerateFileSystemEntries(directory).Any())
@@ -129,7 +141,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
 
         System.IO.Directory.CreateDirectory(directory);
         var root = (JsonObject)source.Root.DeepClone();
-        var storage = new V3CollectionStorage(directory);
+        var storage = new V3CollectionStorage(directory) { LineWidth = lineWidth };
         var collection = PostmanCollection.FromStorage(root, directory, storage);
         storage.Save(collection);
         foreach (var request in collection.AllRequests())
@@ -137,7 +149,9 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             storage.WriteExamples(request.Json);
         }
 
-        return Load(directory);
+        var converted = Load(directory);
+        converted.YamlLineWidth = lineWidth;
+        return converted;
     }
 
     /// <summary>Saved responses (v2.1 <c>response</c>) as v3 example files next to the request.</summary>
@@ -158,12 +172,12 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             var example = V3Convert.ExampleToV3(response);
             order += 1000;
             example["order"] = order;
-            TextFile.WriteAtomic(Path.Combine(folder, name + ".example.yaml"), YamlFile.Write(example, _style).TrimEnd('\n'), NewFile);
+            TextFile.WriteAtomic(Path.Combine(folder, name + ".example.yaml"), YamlFile.Write(example, Style).TrimEnd('\n'), NewFile);
         }
 
         var v3 = (JsonObject)origin.V3!.DeepClone();
         v3.SetOrdered("examples", $"./{V3Names.ResourcesDirectory}/{V3Names.RequestStem(origin.Path)}.resources/examples", V3Convert.RequestOrder);
-        var text = origin.File!.Render(v3, _style);
+        var text = origin.File!.Render(v3, Style);
         TextFile.WriteAtomic(origin.Path, text[..^1], origin.FileInfo);
         origin.File = YamlFile.Parse(text);
         origin.V3 = v3;
@@ -431,7 +445,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
         var needsFile = !isFolder || existing || origin is null || v3.Count > 1;
         if (needsFile && !(existing && JsonNode.DeepEquals(v3, origin!.V3)))
         {
-            var text = existing ? origin!.File!.Render(v3, _style) : YamlFile.Write(v3, _style);
+            var text = existing ? origin!.File!.Render(v3, Style) : YamlFile.Write(v3, Style);
             var info = origin?.FileInfo ?? NewFile;
             TextFile.WriteAtomic(file, text.EndsWith('\n') && info.HasTrailingNewline ? text[..^1] : text, info);
             origin = Remember(item, origin, path, parent, YamlFile.Parse(text), info, v3, snapshot);
@@ -733,7 +747,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
                 problems.Add($"{relative}: editing would rewrite {string.Join(", ", changed)}");
             }
 
-            if (!JsonNode.DeepEquals(YamlFile.Parse(YamlFile.Write(original, _style)).Json, original))
+            if (!JsonNode.DeepEquals(YamlFile.Parse(YamlFile.Write(original, Style)).Json, original))
             {
                 problems.Add($"{relative}: some values cannot be written back exactly");
             }

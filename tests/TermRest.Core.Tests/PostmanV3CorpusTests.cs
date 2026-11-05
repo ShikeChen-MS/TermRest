@@ -1,6 +1,7 @@
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Postman.V3;
+using TermRest.Core.Yaml;
 using Xunit;
 
 namespace TermRest.Core.Tests;
@@ -83,6 +84,62 @@ public class PostmanV3CorpusTests
 
         Assert.True(problems.Count == 0, $"{collections.Count} collections, {problems.Count} problem(s):\n" + string.Join("\n", problems));
         TestContext.Current.SendDiagnosticMessage($"{collections.Count} collections, {collections.Sum(c => Directory.EnumerateFiles(c, "*.request.yaml", SearchOption.AllDirectories).Count())} request files round-tripped.");
+    }
+
+    /// <summary>
+    /// Files written by Postman versions that wrap long values (at 80 columns) are detected as such, and TermRest writes
+    /// their content exactly the same way: every line break where Postman put it.
+    /// </summary>
+    [Fact]
+    public void Wrapped_files_are_written_exactly_like_postman_wrote_them()
+    {
+        var corpus = Environment.GetEnvironmentVariable("TERMREST_V3_CORPUS");
+        if (string.IsNullOrEmpty(corpus) || !Directory.Exists(corpus))
+        {
+            Assert.Skip("Set TERMREST_V3_CORPUS to a folder with Postman v3 collections to run.");
+            return;
+        }
+
+        var wrapped = 0;
+        var unwrapped = 0;
+        var unwrappedSame = 0;
+        var problems = new List<string>();
+        foreach (var path in Directory.EnumerateFiles(corpus, "*.y*ml", SearchOption.AllDirectories))
+        {
+            var text = File.ReadAllText(path).ReplaceLineEndings("\n");
+            YamlFile file;
+            try
+            {
+                file = YamlFile.Parse(text);
+            }
+            catch (FormatException)
+            {
+                continue;
+            }
+
+            var style = YamlStyle.Detect([file.Tree]);
+            var written = YamlFile.Write(file.Json, style);
+            if (style.LineWidth > 0)
+            {
+                wrapped++;
+
+                // Comments are not content: a new file cannot have them.
+                if (written != text && !text.Split('\n').Any(line => line.TrimStart().StartsWith('#')))
+                {
+                    problems.Add($"{Path.GetRelativePath(corpus, path)}\n    {string.Join("\n    ", Infrastructure.TestFiles.ChangedLines(text, written))}");
+                }
+            }
+            else
+            {
+                unwrapped++;
+                unwrappedSame += written == text ? 1 : 0;
+            }
+        }
+
+        TestContext.Current.SendDiagnosticMessage(
+            $"{wrapped} wrapped file(s) written like Postman; {unwrappedSame} of {unwrapped} other file(s) also identical when written from scratch.");
+        Assert.True(wrapped > 0, "No wrapped files in the corpus.");
+        Assert.True(problems.Count == 0, $"{problems.Count} of {wrapped} wrapped file(s) written differently:\n" + string.Join("\n", problems));
     }
 
     private static void Report(List<string> problems, string directory, string step, Dictionary<string, string> before, Dictionary<string, string> after)

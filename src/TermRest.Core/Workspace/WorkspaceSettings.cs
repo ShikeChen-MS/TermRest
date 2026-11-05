@@ -6,6 +6,12 @@ namespace TermRest.Core.Workspace;
 /// <summary>Per-workspace settings stored in <c>.termrest/settings.json</c>.</summary>
 public sealed class WorkspaceSettings
 {
+    /// <summary>Smallest <see cref="YamlLineWidth"/> the user interfaces accept (narrower wrapping is not readable).</summary>
+    public const int MinYamlLineWidth = 20;
+
+    /// <summary>Largest <see cref="YamlLineWidth"/> the user interfaces accept.</summary>
+    public const int MaxYamlLineWidth = 1000;
+
     /// <summary>Name of the selected environment.</summary>
     public string? ActiveEnvironment { get; set; }
 
@@ -37,6 +43,22 @@ public sealed class WorkspaceSettings
     /// </summary>
     public string? CollectionFormat { get; set; }
 
+    /// <summary>
+    /// Wrapping of long values in Postman v3 YAML files (collections and environments), as Postman's YAML library does
+    /// it: at this column, or never when 0. Null (the default) follows each file: files that Postman wrapped at 80
+    /// columns stay wrapped, other files and new ones are not wrapped, as current Postman versions write them. Only new
+    /// and changed values are wrapped; lines that do not change keep their layout.
+    /// </summary>
+    public int? YamlLineWidth { get; set; }
+
+    /// <summary>A short description of a <see cref="YamlLineWidth"/> value, e.g. "wrapped at 80 columns".</summary>
+    public static string DescribeYamlLineWidth(int? width) => width switch
+    {
+        null => "like each file (new files are not wrapped)",
+        <= 0 => "never wrapped",
+        _ => $"wrapped at {width} columns",
+    };
+
     /// <summary>Record sent requests in the history (kept per user, outside the workspace folder).</summary>
     public bool HistoryEnabled { get; set; } = true;
 
@@ -46,7 +68,25 @@ public sealed class WorkspaceSettings
     /// <summary>Response bodies up to this size (KB) are kept with each history entry; 0 keeps none.</summary>
     public int HistoryResponseKb { get; set; } = 256;
 
-    public WorkspaceSettings Clone() => (WorkspaceSettings)MemberwiseClone();
+    /// <summary>
+    /// Color theme of the full-screen UI for this workspace, overriding the user's theme (for example a red one for a
+    /// production workspace); null uses the user's theme.
+    /// </summary>
+    public string? Theme { get; set; }
+
+    /// <summary>
+    /// Extra names of headers, URL parameters, body fields and variables whose values recordings redact, in addition
+    /// to the built-in credential names (Authorization, Cookie, password, token, api key …). Compared without case
+    /// and separators, at the end of names: "Tenant-Key" matches X-Tenant-Key and tenant_key.
+    /// </summary>
+    public List<string>? RecordingRedact { get; set; }
+
+    public WorkspaceSettings Clone()
+    {
+        var clone = (WorkspaceSettings)MemberwiseClone();
+        clone.RecordingRedact = RecordingRedact is null ? null : [.. RecordingRedact];
+        return clone;
+    }
 }
 
 [JsonSourceGenerationOptions(
@@ -57,5 +97,6 @@ public sealed class WorkspaceSettings
     ReadCommentHandling = System.Text.Json.JsonCommentHandling.Skip,
     UseStringEnumConverter = true)]
 [JsonSerializable(typeof(WorkspaceSettings))]
+[JsonSerializable(typeof(UserSettings))]
 [JsonSerializable(typeof(List<CertificateEntry>))]
 internal sealed partial class CoreJsonContext : JsonSerializerContext;
