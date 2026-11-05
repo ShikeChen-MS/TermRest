@@ -70,6 +70,20 @@ jobs:
           cp -r samples/v3 "$RUNNER_TEMP/v3"
           "$exe" import-curl "$RUNNER_TEMP/v3" "curl -X POST https://api.example.com/items -H 'Content-Type: application/json' -d '{\"a\":1}'" --folder Imported
           "$exe" validate "$RUNNER_TEMP/v3/postman/collections/TermRest Demo"
+          "$exe" convert "samples/TermRest Demo.postman_collection.json" --to v3 -o "$RUNNER_TEMP/wrapped" --line-width 80
+          "$exe" validate "$RUNNER_TEMP/wrapped"
+          export TERMREST_CONFIG_DIR="$RUNNER_TEMP/termrest-config"
+          "$exe" themes copy Dracula "CI Theme"
+          "$exe" themes
+          "$exe" snapshot samples --width 110 --height 12 --theme "CI Theme"
+          "$exe" snapshot samples/v3 --width 110 --height 12 --theme "TurboPascal 5"
+          # Recording: an unreachable request is still recorded (with its error), secrets redacted; no network needed.
+          export TERMREST_TEMP_DIR="$RUNNER_TEMP/termrest-tmp"
+          "$exe" import-curl "$RUNNER_TEMP/v3" "curl http://127.0.0.1:1/unreachable -H 'X-API-Key: ci-secret-value'" --folder Recorded --name unreachable
+          "$exe" send "$RUNNER_TEMP/v3" "Recorded/unreachable" --record "$RUNNER_TEMP/recording.har" || true
+          grep -q '"version": "1.2"' "$RUNNER_TEMP/recording.har"
+          grep -q 'unreachable' "$RUNNER_TEMP/recording.har"
+          ! grep -q 'ci-secret-value' "$RUNNER_TEMP/recording.har"
       - name: Package
         shell: bash
         run: |

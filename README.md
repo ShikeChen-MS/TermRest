@@ -2,9 +2,10 @@
 
 A lightweight terminal REST client for development and testing:
 
-- **Full-screen, mouse-friendly UI** in the style of Microsoft Edit: menu bar, resizable panes, tables with checkboxes, context menus. Every action also works from the keyboard.
+- **Full-screen, mouse-friendly UI** in the style of Microsoft Edit: menu bar, resizable panes, tables with checkboxes, context menus. Every action also works from the keyboard. Color themes are built in (Dracula, Nord, Solarized, and more), or you can create your own.
 - **Postman-compatible storage.** Collections and environments are Postman files, edited in place: v2.1 JSON, or the v3 YAML folders that Postman v12 keeps in Git. TermRest writes them back as Postman would (untouched JSON byte-for-byte; in YAML only the lines you changed) and keeps everything it doesn't understand (scripts, examples, unknown fields).
 - **Request history and cURL import.** Every request you send is kept per workspace, with credentials masked, ready to reopen, send again or save. Paste a curl command (for example from a browser's *Copy as cURL*) into the URL bar to import it.
+- **Recording.** Press Record (F12) and every request and response you send is recorded. On stop, TermRest asks where to save it as a HAR file (JSON, opens in browser dev tools). Credentials, cookies, tokens and secret variables are redacted, and a recording streams to a private temporary file instead of growing in memory.
 - **Client certificates (mutual TLS)** are first-class: PEM (including encrypted keys and chains), PFX/PKCS#12, and OS certificate stores. That includes the Windows certificate store with non-exportable keys and the macOS keychain. Certificates bind to URL patterns via a Newman-compatible registry, and a TLS tab shows exactly what was negotiated and presented.
 - **One native executable** per platform: Windows, macOS and Linux on x64 and ARM64. Built with .NET 10 Native AOT: under 20 MB, starts in about 50 ms, no runtime to install.
 - **A headless CLI** (`send`, `run`, `validate`, `convert`, `history`, `import-curl`, `certs`) for scripts and CI, using the same engine.
@@ -12,7 +13,7 @@ A lightweight terminal REST client for development and testing:
 > Status: **first prototype** (v0.1). See [Roadmap](#roadmap) and the original [design proposal](docs/design-proposal.md).
 
 ```text
- File  Request  Environment  Tools  Help
+ File  Request  Environment  Tools  Help                                                                   ● Record F12
 ╭┤Collections├──────────────────╮╭┤Request — TermRest Demo / Basics/GET with query├────────────────────────────────────╮
 │└-TermRest Demo                ││GET      ▼ {{baseUrl}}/get?foo=bar&source=termrest                         ⟦ Send ⟧▖ │
 │  ├-Basics                     ││╭──────╮───────╮────╮────╮───────╮────────╮                                          │
@@ -84,8 +85,9 @@ my-api/
 ├─ workspace.postman_globals.json        ← optional
 ├─ certs/                                ← your certificate files (don't commit private keys)
 └─ .termrest/
-   ├─ settings.json                      ← active environment, TLS verification, CA bundle, timeout, proxy, history…
-   └─ certificates.json                  ← client-certificate registry (Newman --ssl-client-cert-list format)
+   ├─ settings.json                      ← active environment, TLS verification, CA bundle, timeout, proxy, history, YAML wrapping, color theme, recording redaction…
+   ├─ certificates.json                  ← client-certificate registry (Newman --ssl-client-cert-list format)
+   └─ themes/                            ← optional: color themes shared with the workspace
 ```
 
 The collections and environments can also be in Postman's v3 layout (`postman/collections/…`, YAML); see [Postman v3 (YAML) collections](#postman-v3-yaml-collections).
@@ -106,6 +108,7 @@ Everything is clickable: menus, tree items, tabs, buttons, table rows, and check
 | F6 / Shift+F6 | Next / previous pane | Tab / Shift+Tab | Next / previous field |
 | F10 | Menu | Shift+F10 | Context menu |
 | Ctrl+L | Focus the URL bar | Ctrl+Q | Quit (asks to save) |
+| F12 | Start / stop recording (see [Recording requests](#recording-requests)) | ← / → on a tab row | Previous / next tab (Home / End: first / last; ↓ or Enter: into the page) |
 
 **Request editor tabs**
 
@@ -122,6 +125,40 @@ Everything is clickable: menus, tree items, tabs, buttons, table rows, and check
 - **Headers**
 - **Timeline:** the exact request sent, DNS/connect/TLS/TTFB/download timing, and warnings.
 - **TLS:** protocol and cipher, the client certificate sent and whether the server asked for one, and the server chain with validation details.
+
+## Color themes
+
+Choose a theme in *Tools › Color theme…*. Moving through the list previews each theme live on the whole UI; *Use theme* keeps it and *Cancel* restores the previous one. The choice applies to all your workspaces. Tick *Use only in this workspace* to store it in the workspace's `.termrest/settings.json` instead, for example to give a production workspace a red menu bar.
+
+- **Built in:** Terminal.Gui's themes (Default uses your terminal's own colors; Dark, Light, TurboPascal 5, Anders, 8-Bit, Green Phosphor, Amber Phosphor) and TermRest's Dracula, Gruvbox Dark, High Contrast, Monokai, Nord, Solarized Dark and Solarized Light.
+- **Method and status colors:** every theme colors the request methods in the tree (GET, POST, PUT, PATCH, DELETE, others) and the response status (2xx/3xx, 4xx, 5xx).
+- **Custom themes** are JSON files. *Copy as custom theme…* (or `termrest themes copy`) writes a copy of any theme for you to edit, and *Reload theme files* picks up your edits without a restart. A theme file names a `base` theme and changes some of its palette colors. Every color of the UI is derived from the palette's 20 colors. For full control, `schemes` sets single roles of Terminal.Gui's color schemes:
+
+  ```jsonc
+  {
+    "name": "Production",
+    "base": "Nord",                      // any theme, including custom ones (default: Default)
+    "palette": {                         // color names (DarkBlue, Gold…), #rrggbb, rgb(r,g,b), or None (the terminal's color)
+      "bar": "#5c0000",                  // menu and status bar
+      "barText": "White",
+      "selection": "DarkRed"
+    },
+    "schemes": {                         // optional: "<foreground> [on <background>] [bold|italic|underline|faint|reverse|…]"
+      "Base": { "Focus": "white on #8b0000 bold" }
+    }
+  }
+  ```
+
+  Palette colors: `background`, `text`, `muted`, `accent` (hot keys), `selection`, `selectionText`, `input` (fields and tables), `bar`, `barText`, `dialog`, `dialogText`, `success`, `warning`, `error`, `get`, `post`, `put`, `patch`, `delete`, `otherMethods`. Schemes: `Base`, `Menu`, `Dialog`, `Error`, `Accent`, `Success`, `Warning`. Roles: `Normal`, `HotNormal`, `Focus`, `HotFocus`, `Active`, `HotActive`, `Highlight`, `Editable`, `ReadOnly`, `Disabled`. Mistakes such as an unknown key or an invalid color are listed in the dialog and by `termrest themes`, and the rest of the file still applies.
+- **Where theme files go:** your own themes are in the `themes` folder of your TermRest configuration folder. That is `%APPDATA%\TermRest` on Windows, `~/Library/Application Support/TermRest` on macOS, and `$XDG_CONFIG_HOME/termrest` (default `~/.config/termrest`) on Linux. Set `TERMREST_CONFIG_DIR` to move it. Themes in a workspace's `.termrest/themes` folder are shared with everyone who uses the workspace. A custom theme with the name of a built-in one replaces it.
+- **Which theme is used:** `--theme <name>` for one session, else `$TERMREST_THEME`, else the workspace's choice (`theme` in `.termrest/settings.json`), else yours (`settings.json` in the configuration folder), else Default.
+
+```sh
+termrest themes                          # list the themes (● marks the one in use) and the theme folders
+termrest themes use Nord                 # for all workspaces (--only-here: this workspace only)
+termrest themes copy Nord "My Nord"      # a custom theme to edit (--in-workspace: in .termrest/themes)
+termrest --theme "Solarized Light"       # this session only
+```
 
 ## Request history
 
@@ -144,6 +181,77 @@ termrest history samples --show c637d3a5     # one entry in full: request, respo
 termrest history samples --json -n 100       # machine-readable
 termrest history samples --clear
 termrest send … --no-history                 # send without recording
+```
+
+## Recording requests
+
+Click **● Record** at the right end of the menu bar (or press **F12**, or choose *Tools › Start recording*). Every request you send after that is recorded with its response:
+
+- **The request:** method, URL, headers, cookies, query parameters, and the body (text, form fields, uploaded files).
+- **The response:** status, headers, cookies and the full body.
+- **Connection details:** timing, the server address, and TLS (protocol, cipher, server certificate chain, the client certificate sent).
+- **Failures:** the error of requests that failed.
+
+While recording, the button turns into a red badge with a blinking dot, the time since recording started and the number of requests recorded: **● REC 01:23 · 3 requests · Stop F12**. The Response pane's title shows which request a response was recorded as (**Response · ● recorded #3**).
+
+Click the badge (or press F12) to stop. TermRest asks where to save the recording. The default is `termrest-recording-<date>-<time>.har` in the workspace folder; type another path or use *Browse…*.
+
+- **The file** is JSON in **HAR 1.2** format (HTTP Archive), the format browser dev tools export. Chrome, Edge and Firefox (*Network › Import HAR*), Fiddler, Charles, Insomnia and HAR viewers open it.
+- **TermRest's own details** are under `_termrest` keys, as HAR allows: collection, request, environment, auth type, settings, TLS, warnings, and what was redacted.
+- **The other choices:** *Keep recording* goes on, and *Discard* throws the recording away. Quitting or switching workspaces while recording asks first.
+
+```jsonc
+{
+  "startedDateTime": "2026-11-05T13:29:29.512-07:00",
+  "time": 272.098,
+  "request": {
+    "method": "GET",
+    "url": "https://postman-echo.com/headers",
+    "headers": [{ "name": "Authorization", "value": "Bearer [REDACTED]" }, { "name": "Cookie", "value": "sails.sid=[REDACTED]" }],
+    …
+  },
+  "response": {
+    "status": 200,
+    "content": { "size": 615, "mimeType": "application/json; charset=utf-8", "text": "{\"headers\":{…\"authorization\":\"[REDACTED]\"…}}" },
+    …
+  },
+  "timings": { "blocked": -1, "dns": 7.344, "connect": 151.33, "ssl": 145.214, "send": 0, "wait": 112.898, "receive": 0.126 },
+  "serverIPAddress": "162.159.142.41",
+  "_termrest": {
+    "collection": "TermRest Demo",
+    "request": "Auth/Auth inherited from folder",
+    "environment": "Postman Echo",
+    "tls": [{ "protocol": "Tls13", "cipherSuite": "TLS_AES_256_GCM_SHA384", "serverCertificates": […], "clientCertificate": null, … }],
+    "redacted": [{ "in": "request.headers", "name": "Authorization", "reason": "credential", "count": 1 }, …]
+  }
+}
+```
+
+- **Secrets are redacted** before anything is written, even to the temporary file. The placeholder `[REDACTED]` keeps the shape of the data, and each entry lists what was redacted, where and why (`_termrest.redacted`). Redacted are:
+  - `Authorization` and `Proxy-Authorization` credentials. The scheme stays: `Bearer [REDACTED]`.
+  - Cookie values in `Cookie` and `Set-Cookie`. Names and attributes stay.
+  - Headers, URL parameters (query and fragment), and JSON and form fields named like credentials: password, secret, token, API key, signature, session id, private key, connection string, client assertion …
+  - Passwords in URLs (`https://user:[REDACTED]@host`).
+  - The values of auth credentials, secret variables and variables named like credentials, wherever they appear: URLs, headers, bodies (also URL-encoded or JSON-escaped) and error messages.
+  - Every value redacted by name, wherever it appears later in the recording. For example, a token from a login response is redacted when a later request sends it.
+
+  Add your own names in *Tools › Settings › Recordings redact* (`recordingRedact` in `.termrest/settings.json`). Names are compared without case and separators, at the end of a name: `Tenant-Key` covers `X-Tenant-Key` and `tenant_key`.
+- **Memory:** a recording does not grow in memory.
+  - Each request is written to a temporary file as soon as its response arrives, on a background thread.
+  - Bodies are written in 64 KB pieces, and saving copies the temporary file into the HAR file through a small buffer.
+  - Responses and uploaded files are included up to the workspace's maximum response size (*Tools › Settings*, 50 MB).
+- **Temporary files** are private to you (on Unix, a folder only you can read) and are deleted after saving or discarding:
+  - Windows: `%TEMP%`.
+  - macOS: `$TMPDIR`, which is per user.
+  - Linux: `$TMPDIR` if it is set, otherwise `/tmp`. When `/tmp` is a RAM file system (tmpfs), `/var/tmp` is used instead, so a large recording doesn't take memory after all.
+
+  Set `TERMREST_TEMP_DIR` to use another folder. On Unix, the saved HAR file is also readable only by you (mode 600).
+- **Recovery:** if TermRest closes while recording (a closed terminal, a crash), nothing is lost. The next start says so, and *Tools › Recover unsaved recordings* saves the recording.
+- **Command line:** `--record <file>` on `send` and `run` records the same way, for example as evidence from a CI run:
+
+```sh
+termrest run "samples/TermRest Demo.postman_collection.json" -e "Postman Echo" --record run.har
+termrest send api.postman_collection.json "Users/Get user" --record get-user.har
 ```
 
 ## Importing cURL commands
@@ -189,16 +297,22 @@ my-api/
 - **Opening:** open the repository folder (`termrest my-api`) or a collection folder directly. A workspace may mix JSON and YAML collections.
 - **Saving changes only what changed.** An edit rewrites the affected lines of one file and keeps comments, key order, quoting and everything TermRest doesn't use. Renaming, moving, reordering and deleting requests and folders renames, moves and deletes their files (with their saved examples) the way Postman does, including the `order` values. Files TermRest doesn't manage are never deleted.
 - **New and imported collections:** in a workspace that already uses the v3 layout, new collections and environments are created as YAML, and *File › Import Postman collection* converts JSON collections. The choice is in *Tools › Settings › New collections* (`collectionFormat`: `v3` or `v2.1`).
+- **Wrapping long lines:** some earlier Postman versions wrapped long values at 80 columns; current versions write each value on one line. TermRest writes wrapped values exactly as Postman did: text breaks at spaces, URLs break with an escaped `\` line break, and multi-line text becomes a folded `>` block. Choose in *Tools › Settings › Wrap YAML lines*, or set `yamlLineWidth` in `.termrest/settings.json`:
+  - *Like the files* (the default, no setting): files that are wrapped stay wrapped, and new files are not wrapped.
+  - *Never* (`0`) or *At column* (for example `80`; 20 to 1000).
+
+  Only new and changed values are wrapped: lines you don't change keep their layout, so a different setting never rewrites a whole file. *Help › Workspace info* and `termrest validate` show which collections are wrapped.
 - **Conversion and validation:**
 
   ```sh
   termrest convert "Contoso API.postman_collection.json"     # → postman/collections/Contoso API/
+  termrest convert "Contoso API.postman_collection.json" --line-width 80   # wrapped like older Postman versions
   termrest convert "postman/collections/Contoso API" --to v2.1 -o contoso.postman_collection.json
   termrest convert dev.postman_environment.json              # → postman/environments/dev.environment.yaml
   termrest validate "postman/collections/Contoso API"        # checks that every file converts losslessly
   ```
 
-- **Tested on real files:** 31 collections written by Postman, from public GitHub repositories. Editing and reverting every part of every request leaves all files byte-for-byte unchanged.
+- **Tested on real files:** 31 collections written by Postman, from public GitHub repositories. Editing and reverting every part of every request leaves all files byte-for-byte unchanged. Every corpus file that Postman wrapped comes out byte-for-byte the same when TermRest writes its content from scratch (files with comments are skipped).
 
 Not yet supported in v3 collections:
 
@@ -206,7 +320,6 @@ Not yet supported in v3 collections:
 - Saved examples (`*.example.yaml`) are kept and move with their request, but are not shown, and `convert --to v2.1` leaves them out.
 - A client certificate pinned on a request (v2.1 `certificate`) has no v3 equivalent; use the certificate registry.
 - If a collection or folder defines several auth methods, only the first one can be edited; the others are kept.
-- Long lines are not folded at 80 columns as some Postman versions do, but lines you don't change keep their folding.
 
 ## Client certificates (mutual TLS)
 
@@ -254,7 +367,7 @@ termrest certs match https://client.badssl.com/ samples
 ## Command line
 
 ```text
-termrest [<workspace>]                         open the UI (default: current directory)
+termrest [<workspace>] [--theme <name>]        open the UI (default: current directory)
 termrest send <collection> <request> [opts]    send one request; body to stdout, status/diagnostics to stderr
 termrest run <collection> [--folder F] [opts]  run all requests in order; exit code 1 if any fail
 termrest validate <files…>                     check that files (JSON, YAML, v3 folders) round-trip unchanged through TermRest
@@ -262,14 +375,18 @@ termrest convert <input> [--to v3|v2.1] [-o O] convert a collection or environme
 termrest history [<workspace>] [opts]          requests sent from a workspace, newest first
 termrest import-curl <collection> [<command>]  add a request from a curl command (read from stdin when omitted)
 termrest certs list|store|match                client-certificate helpers
+termrest themes [use <theme>|copy <theme> <name>]  list, choose or copy color themes of the UI
 termrest snapshot [<workspace>] [--send]       render the UI headlessly (smoke test; --send includes a live response)
 
 <collection>: a *.postman_collection.json file or a v3 collection folder
-common options:      -e/--env <name|file>  --var key=value  --timeout <ms>  -k/--insecure
+common options:      -e/--env <name|file>  --var key=value  --timeout <ms>  -k/--insecure  --record <file.har>
 send options:        -i/--include  -v/--verbose  -o/--output <file>  --raw  -f/--fail  --curl  --no-history
 run options:         --bail  --allow-http-errors  --report-json <file>
 history options:     -n/--limit <n>  --show <id>  --json  --clear
 import-curl options: --folder <path>  --name <name>  --dry-run
+convert options:     --line-width <n>  (wrap YAML output at column n; 0: never)
+themes options:      -w/--workspace <folder>  --only-here (use)  --in-workspace (copy)
+snapshot options:    --send  --request <path>  --width <n>  --height <n>  --theme <name>
 ```
 
 ```sh
@@ -311,11 +428,11 @@ The [CI workflow](.github/workflows/ci.yml) tests on Windows, Linux and macOS. I
 
 ```text
 src/TermRest.Core   UI-free engine: Postman model + mapper (v2.1 JSON, v3 YAML), YAML reader/writer, variables,
-                    HTTP executor, certificates, history, cURL import, workspace
+                    HTTP executor, certificates, history, recording (HAR, redaction), cURL import, workspace
 src/TermRest.Tui    Terminal.Gui v2 views and dialogs
 src/TermRest.Cli    `termrest` executable (System.CommandLine): TUI by default + headless commands
 tests/…Core.Tests   xUnit v3: fidelity, mapper, URLs, variables, certificates, YAML, Postman v3, history, cURL,
-                    in-process Kestrel HTTP/TLS/mTLS tests
+                    recording and redaction, in-process Kestrel HTTP/TLS/mTLS tests
 tests/…Tui.Tests    headless UI tests: renders the real window, injects mouse/keyboard input, asserts on screen text
 ```
 
@@ -329,6 +446,7 @@ TERMREST_V3_CORPUS=<folder> dotnet test        # also edit and revert every Post
 Notes:
 
 - Terminal.Gui 2.5's `TextView` is marked obsolete in favour of the separate `Terminal.Gui.Editor` package. That package has not shipped a build for 2.5 yet, so TermRest uses `TextView` behind a small `TextArea` wrapper, which makes the later switch (syntax highlighting, folding) a one-file change.
+- Mouse responsiveness: the UI runs Terminal.Gui's main loop at 60 passes per second (its default is 25) and, on Windows, asks for 1 ms timer resolution while it runs (`TimerResolution`), because Windows rounds the loop's and the input poll's sleeps up to 15.6 ms ticks. The request and response tabs use `TabPanel` instead of Terminal.Gui's `Tabs`, which lays out and draws every page on each redraw; it looks the same and makes clicks, drags and resizes about twice as fast to repaint.
 - Each request uses a fresh connection, so timing and TLS details are exact. Cookies persist for the session (**Tools › Clear cookies**).
 
 ## Roadmap
