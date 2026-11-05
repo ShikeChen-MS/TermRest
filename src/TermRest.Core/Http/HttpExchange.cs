@@ -155,9 +155,20 @@ public sealed class TlsConnectionInfo
     {
         var builder = new StringBuilder();
         builder.Append(CultureInfo.InvariantCulture, $"Host              {Host}\n");
-        builder.Append(CultureInfo.InvariantCulture, $"Protocol          {(Protocol == SslProtocols.None ? "(handshake not completed)" : Protocol.ToString())}\n");
-        builder.Append(CultureInfo.InvariantCulture, $"Cipher suite      {CipherSuite?.ToString() ?? "-"}\n");
-        builder.Append(CultureInfo.InvariantCulture, $"ALPN              {ApplicationProtocol ?? "-"}\n");
+        builder.Append(CultureInfo.InvariantCulture,
+            $"Protocol          {(Protocol == SslProtocols.None ? "(handshake not completed)" : Protocol.ToString())} · {CipherSuite?.ToString() ?? "-"} · ALPN {ApplicationProtocol ?? "-"}\n");
+        builder.Append(CultureInfo.InvariantCulture, $"Client cert sent  {(ClientCertificate is null ? "none" : $"{ClientCertificate.Subject} ({ClientCertificateOrigin})")}\n");
+        if (ClientCertificate is not null)
+        {
+            builder.Append(CultureInfo.InvariantCulture, $"                  thumbprint {ClientCertificate.Thumbprint}, expires {ClientCertificate.NotAfter:yyyy-MM-dd}\n");
+        }
+
+        builder.Append(CultureInfo.InvariantCulture, $"Client cert asked {(ClientCertificateRequested ? "yes" : "no / not observed")}\n");
+        foreach (var issuer in AcceptableIssuers.Take(10))
+        {
+            builder.Append(CultureInfo.InvariantCulture, $"  accepts issuer  {issuer}\n");
+        }
+
         builder.Append(CultureInfo.InvariantCulture, $"Server validation {(Accepted ? "accepted" : "REJECTED")} — {AcceptReason}\n");
         if (PolicyErrors != SslPolicyErrors.None)
         {
@@ -167,18 +178,6 @@ public sealed class TlsConnectionInfo
         foreach (var status in ChainStatus)
         {
             builder.Append(CultureInfo.InvariantCulture, $"Chain status      {status}\n");
-        }
-
-        builder.Append(CultureInfo.InvariantCulture, $"Client cert asked {(ClientCertificateRequested ? "yes" : "no / not observed")}\n");
-        foreach (var issuer in AcceptableIssuers.Take(10))
-        {
-            builder.Append(CultureInfo.InvariantCulture, $"  accepts issuer  {issuer}\n");
-        }
-
-        builder.Append(CultureInfo.InvariantCulture, $"Client cert sent  {(ClientCertificate is null ? "none" : $"{ClientCertificate.Subject} ({ClientCertificateOrigin})")}\n");
-        if (ClientCertificate is not null)
-        {
-            builder.Append(CultureInfo.InvariantCulture, $"                  thumbprint {ClientCertificate.Thumbprint}, expires {ClientCertificate.NotAfter:yyyy-MM-dd}\n");
         }
 
         builder.Append("\nServer certificate chain:\n");

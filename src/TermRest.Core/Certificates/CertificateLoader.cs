@@ -39,9 +39,16 @@ public sealed record CertificateSummary(
 
     public bool IsNotYetValid => DateTime.Now < NotBefore;
 
-    public string CommonName => ExtractCommonName(Subject);
+    public string CommonName
+    {
+        get
+        {
+            var cn = ExtractCommonName(Subject);
+            return cn.Length > 0 ? cn : Subject.Length > 0 ? Subject : $"(no subject) {Thumbprint[..Math.Min(8, Thumbprint.Length)]}";
+        }
+    }
 
-    public string IssuerCommonName => ExtractCommonName(Issuer);
+    public string IssuerCommonName => ExtractCommonName(Issuer) is { Length: > 0 } cn ? cn : Issuer;
 
     public static CertificateSummary From(X509Certificate2 certificate, string? source = null) =>
         new(certificate.Subject, certificate.Issuer, certificate.NotBefore, certificate.NotAfter, certificate.Thumbprint, certificate.HasPrivateKey, source);

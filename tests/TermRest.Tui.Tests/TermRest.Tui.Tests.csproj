@@ -23,4 +23,10 @@
     <Content Include="..\..\samples\**\*.json" Link="samples\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Shared test PKI and HTTPS echo server. -->
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestPki.cs" Link="Infrastructure\Shared\TestPki.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\EchoServer.cs" Link="Infrastructure\Shared\EchoServer.cs" />
+  </ItemGroup>
+
 </Project>
