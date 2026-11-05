@@ -26,6 +26,7 @@ public static class TuiApp
         {
             var workspace = ApiWorkspace.Open(path);
             using var runner = new RequestRunner(workspace) { StrictSslOverride = options.StrictSslOverride };
+            runner.ConfigureHistory();
             using var app = Application.Create();
             app.Init(options.Driver);
             using var window = new MainWindow(workspace, runner);

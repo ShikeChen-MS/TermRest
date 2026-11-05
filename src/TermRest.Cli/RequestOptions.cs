@@ -40,10 +40,9 @@ internal sealed class RequestOptions
         }
 
         PostmanCollection? collection = null;
-        if (File.Exists(path))
+        if (File.Exists(path) || (Directory.Exists(path) && workspace.FindCollection(path) is not null))
         {
-            var full = Path.GetFullPath(path);
-            collection = workspace.Collections.FirstOrDefault(c => string.Equals(c.FilePath, full, StringComparison.OrdinalIgnoreCase));
+            collection = workspace.FindCollection(path);
             if (collection is null)
             {
                 Output.Error($"'{path}' is not a Postman collection.");

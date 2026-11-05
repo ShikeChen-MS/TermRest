@@ -13,7 +13,7 @@ internal static class RunCommand
     public static Command Create(Option<bool> insecure)
     {
         var command = new Command("run", "Run all requests in a collection (or one folder) in order and report status codes and timings.");
-        var collection = new Argument<string>("collection") { Description = "Collection file" };
+        var collection = new Argument<string>("collection") { Description = "Collection file or v3 collection folder" };
         var folder = new Option<string?>("--folder") { Description = "Only run requests inside this folder path" };
         var bail = new Option<bool>("--bail") { Description = "Stop at the first failure" };
         var allowHttpErrors = new Option<bool>("--allow-http-errors") { Description = "Do not treat HTTP 4xx/5xx responses as failures" };
@@ -29,14 +29,19 @@ internal static class RunCommand
         command.SetAction(async (parseResult, cancellationToken) =>
         {
             var path = parseResult.GetValue(collection)!;
-            if (!File.Exists(path))
+            if (!File.Exists(path) && !Directory.Exists(path))
             {
-                Output.Error($"'{path}' is not a collection file.");
+                Output.Error($"'{path}' is not a collection file or v3 collection folder.");
                 return 2;
             }
 
             if (options.Open(parseResult, path, insecure) is not { Collection: { } target } opened)
             {
+                if (Directory.Exists(path))
+                {
+                    Output.Error($"'{path}' is not a Postman v3 collection folder; pass the collection itself.");
+                }
+
                 return 2;
             }
 

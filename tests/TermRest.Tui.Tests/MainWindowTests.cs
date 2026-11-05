@@ -3,7 +3,9 @@ using Terminal.Gui.App;
 using Terminal.Gui.Drivers;
 using Terminal.Gui.Input;
 using Terminal.Gui.Testing;
+using TermRest.Core.Model;
 using TermRest.Core.Postman;
+using TermRest.Core.Tests.Infrastructure;
 using TermRest.Core.Workspace;
 using TermRest.Tui.Tests.Infrastructure;
 using Xunit;
@@ -312,6 +314,149 @@ public sealed class MainWindowTests : IDisposable
         {
             throw new Xunit.Sdk.XunitException($"'{expected}' is not on screen:\n{screen}");
         }
+    }
+
+    [Fact]
+    public async Task History_pane_lists_sent_requests_and_reopens_them()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            ui.App.InjectKey(Key.F5);
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            if (ui.Screen().Contains("200 OK", StringComparison.Ordinal) || DateTime.UtcNow > deadline)
+            {
+                ui.App.RequestStop();
+                return false;
+            }
+
+            return true;
+        });
+        ui.App.Run(ui.Window);
+
+        var token = ui.App.Begin(ui.Window);
+        ui.Click("POST POST JSON");
+        ui.App.InjectKey(Key.F9);
+        var screen = ui.Screen();
+        Assert.True(ui.Window.ShowingHistory);
+        OnScreen("History (1)", screen);
+        Assert.Equal("{{baseUrl}}/post", ui.Window.Editor.Spec.Url); // showing the pane does not change the request
+
+        var row = Assert.Single(ui.Window.HistoryPane.Rows);
+        Assert.Contains("200 GET    /echo/get?foo=bar&source=termrest", row, StringComparison.Ordinal);
+        ui.Click("200 GET    /echo/get"); // the sidebar cuts the row off
+        screen = ui.Screen();
+        Assert.Equal("{{baseUrl}}/get?foo=bar&source=termrest", ui.Window.Editor.Spec.Url);
+        Assert.Equal(200, ui.Window.ResponsePane.Exchange?.Response?.StatusCode);
+        OnScreen("Request (from history ·", screen);
+        OnScreen("\"path\": \"/echo/get\"", screen);
+
+        ui.App.InjectKey(Key.Delete);
+        screen = ui.Screen();
+        ui.App.InjectKey(Key.F9);
+        var back = ui.Screen();
+        ui.App.End(token!);
+
+        OnScreen("History (0)", screen);
+        Assert.Empty(ui.Runner.History!.Load());
+        OnScreen("Collections", back);
+        Assert.False(ui.Window.ShowingHistory);
+    }
+
+    [Fact]
+    public void Pasting_a_curl_command_into_the_url_bar_imports_it()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+
+        ui.Click("{{baseUrl}}/get?foo=bar&source=termrest");
+        // Terminals deliver the line breaks of a bracketed paste as CR.
+        ui.App.RaisePasteEvent("curl -X POST 'https://api.example.com/items?x=1' \\\r  -H 'Content-Type: application/json' \\\r  -H 'X-Trace: 7' \\\r  --data-raw '{\"a\":1}'");
+        var screen = ui.Screen();
+        var spec = ui.Window.Editor.Spec;
+        var modified = ui.Window.Editor.IsModified;
+        var status = ui.Window.StatusMessage;
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        Assert.Equal(("POST", "https://api.example.com/items?x=1"), (spec.Method, spec.Url));
+        Assert.Equal(["Content-Type: application/json", "X-Trace: 7"], spec.Headers.Select(h => $"{h.Key}: {h.Value}"));
+        Assert.Equal((BodyMode.Raw, "{\"a\":1}"), (spec.Body.Mode, spec.Body.Raw));
+        Assert.True(modified);
+        Assert.Equal("Imported from cURL: POST https://api.example.com/items?x=1. Ctrl+S saves it.", status);
+        OnScreen("Request — TermRest Demo / Basics/GET with query ●", screen);
+        OnScreen("POST     ▼ https://api.example.com/items?x=1 ", screen);
+
+        var saved = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json")).FindRequest("Basics/GET with query")!.ReadSpec();
+        Assert.Equal(("POST", "https://api.example.com/items?x=1", "{\"a\":1}"), (saved.Method, saved.Url, saved.Body.Raw));
+    }
+
+    [Fact]
+    public void Enter_on_a_curl_command_in_the_url_bar_imports_it_instead_of_sending()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+
+        ui.Click("{{baseUrl}}/get?foo=bar&source=termrest");
+        ui.App.InjectKey(Key.Home);
+        ui.Type("curl -X DELETE ");
+        ui.App.InjectKey(Key.Enter);
+        var spec = ui.Window.Editor.Spec;
+        var status = ui.Window.StatusMessage;
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        Assert.Equal(("DELETE", "{{baseUrl}}/get?foo=bar&source=termrest"), (spec.Method, spec.Url));
+        Assert.StartsWith("Imported from cURL: DELETE {{baseUrl}}/get", status, StringComparison.Ordinal);
+        Assert.Null(ui.Window.ResponsePane.Exchange);
+    }
+
+    [Fact]
+    public void Imported_curl_commands_open_as_new_requests()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+
+        ui.Window.ImportCurl("curl https://api.example.com/v1/users/42 -H 'Accept: application/json' -u ada:secret", intoCurrent: false);
+        var screen = ui.Screen();
+        ui.App.End(token!);
+
+        OnScreen("Request (imported) ●", screen);
+        OnScreen("https://api.example.com/v1/users/42", screen);
+        Assert.Equal("basic", ui.Window.Editor.Spec.Auth?.Type);
+        Assert.False(ui.Workspace.HasUnsavedChanges);
+    }
+
+    [Fact]
+    public void V3_yaml_collections_are_edited_and_saved_in_place()
+    {
+        var root = V3Fixture.Create();
+        using var ui = new Harness(root);
+        var token = ui.App.Begin(ui.Window);
+        var screen = ui.Screen();
+        OnScreen("Widget API", screen);
+        OnScreen("Widgets", screen);
+        OnScreen("Env: none", screen);
+
+        ui.Click("{{baseUrl}}/health");
+        ui.App.InjectKey(Key.End);
+        ui.Type("?probe=1");
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        var file = File.ReadAllText(Path.Combine(V3Fixture.CollectionPath(root), "Health.request.yaml"));
+        Assert.Equal("$kind: http-request\nurl: '{{baseUrl}}/health?probe=1'\nmethod: GET\nqueryParams:\n  - key: probe\n    value: '1'\nauth:\n  type: noauth\norder: 1000\n", file);
+        Assert.Contains("Saved Widget API", ui.Window.StatusMessage, StringComparison.Ordinal);
     }
 
     public void Dispose()

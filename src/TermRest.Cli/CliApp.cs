@@ -36,6 +36,9 @@ internal static class CliApp
 
         root.Subcommands.Add(SendCommand.Create(insecure));
         root.Subcommands.Add(RunCommand.Create(insecure));
+        root.Subcommands.Add(ImportCurlCommand.Create());
+        root.Subcommands.Add(HistoryCommand.Create());
+        root.Subcommands.Add(ConvertCommand.Create());
         root.Subcommands.Add(ValidateCommand.Create());
         root.Subcommands.Add(CertsCommand.Create());
         root.Subcommands.Add(CreateSnapshotCommand());

@@ -3,7 +3,9 @@ using Terminal.Gui.Drawing;
 using Terminal.Gui.Input;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
+using TermRest.Core.History;
 using TermRest.Core.Http;
+using TermRest.Core.Import;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Workspace;
@@ -25,6 +27,7 @@ internal sealed class MainWindow : Runnable
     private readonly FrameView _requestFrame;
     private readonly FrameView _responseFrame;
     private readonly CollectionTree _tree;
+    private readonly HistoryView _history;
     private readonly RequestEditor _editor;
     private readonly ResponseView _response;
     private readonly Shortcut _environmentShortcut;
@@ -36,6 +39,14 @@ internal sealed class MainWindow : Runnable
     private bool _closed;
     private PopoverMenu? _popover;
     private bool _quitConfirmed;
+    private bool _showingHistory;
+    private bool _historyLoaded;
+
+    /// <summary>The history entry shown in the editor (a detached request), if any.</summary>
+    private HistoryEntry? _historyEntry;
+
+    /// <summary>Name suggested when a detached request (cURL import, history) is added to a collection.</summary>
+    private string? _detachedName;
 
     public MainWindow(ApiWorkspace workspace, RequestRunner runner)
     {
@@ -57,7 +68,8 @@ internal sealed class MainWindow : Runnable
             Arrangement = ViewArrangement.RightResizable,
         };
         _tree = new CollectionTree(workspace);
-        _sidebar.Add(_tree);
+        _history = new HistoryView { Visible = false };
+        _sidebar.Add(_tree, _history);
 
         _requestFrame = new FrameView
         {
@@ -95,6 +107,7 @@ internal sealed class MainWindow : Runnable
             new Shortcut { Title = "New", Key = Key.N.WithCtrl, BindKeyToApplication = true, Action = NewRequest },
             _environmentShortcut,
             new Shortcut { Title = "Certs", Key = Key.F8, BindKeyToApplication = true, Action = ShowCertificates },
+            new Shortcut { Title = "History", Key = Key.F9, BindKeyToApplication = true, Action = ToggleHistory },
             new Shortcut { Title = "Menu", Key = Key.F10 },
             new Shortcut { Title = "Quit", Key = Key.Q.WithCtrl, BindKeyToApplication = true, Action = Quit },
             _message,
@@ -120,9 +133,18 @@ internal sealed class MainWindow : Runnable
         _tree.ContextMenuRequested += (_, position) => ShowContextMenu(position);
         _tree.DeleteRequested += (_, item) => DeleteItem(item);
         _tree.RenameRequested += (_, item) => RenameItem(item);
+        _history.EntrySelected += (_, entry) => OpenHistoryEntry(entry);
+        _history.EntryActivated += (_, entry) =>
+        {
+            OpenHistoryEntry(entry);
+            _editor.FocusUrl();
+        };
+        _history.ContextMenuRequested += (_, position) => ShowHistoryContextMenu(position);
+        _history.DeleteRequested += (_, entry) => DeleteHistoryEntry(entry);
         _editor.Modified += (_, _) => UpdateTitles();
         _editor.SendRequested += (_, _) => Send();
         _editor.ManageCertificatesRequested += (_, _) => ShowCertificates();
+        _editor.CurlPasted += (_, command) => ImportCurl(command, intoCurrent: true);
         _response.Notice += (_, message) => Notify(message);
 
         var first = workspace.Collections.SelectMany(c => c.AllRequests()).FirstOrDefault();
@@ -149,6 +171,10 @@ internal sealed class MainWindow : Runnable
     internal RequestEditor Editor => _editor;
 
     internal ResponseView ResponsePane => _response;
+
+    internal HistoryView HistoryPane => _history;
+
+    internal bool ShowingHistory => _showingHistory;
 
     internal string StatusMessage => _message.Title;
 
@@ -179,6 +205,7 @@ internal sealed class MainWindow : Runnable
             new MenuItem("_Open workspace folder…", "", OpenWorkspace),
             new MenuItem("_Import Postman collection…", "", ImportCollection),
             new MenuItem("Import Postman e_nvironment…", "", ImportEnvironment),
+            new MenuItem("Import c_URL command…", "", ShowCurlImport),
             new Line(),
             new MenuItem("_Save all", Key.S.WithCtrl, Save),
             new Line(),
@@ -194,6 +221,8 @@ internal sealed class MainWindow : Runnable
             new MenuItem("De_lete…", "", () => DeleteItem(_tree.SelectedItem)),
             new Line(),
             new MenuItem("Copy as c_URL", "", CopyAsCurl),
+            new MenuItem("_Import from cURL…", "", ShowCurlImport),
+            new MenuItem("_History", Key.F9, ToggleHistory),
             new MenuItem("Focus _URL bar", Key.L.WithCtrl, () => _editor.FocusUrl()),
         ]),
         new MenuBarItem("_Environment",
@@ -222,6 +251,8 @@ internal sealed class MainWindow : Runnable
         CommitEditor();
         _collection = node.Collection;
         _node = node;
+        _historyEntry = null;
+        _detachedName = null;
         _editor.Load(node.ReadSpec());
         _response.Clear();
         UpdateTitles();
@@ -232,6 +263,8 @@ internal sealed class MainWindow : Runnable
         _scratch ??= PostmanCollection.Create("Scratch");
         _collection = _scratch;
         _node = null;
+        _historyEntry = null;
+        _detachedName = null;
         _editor.Load(new HttpRequestSpec { Url = "https://postman-echo.com/get?hello=world" });
         _response.Clear();
         UpdateTitles();
@@ -260,6 +293,13 @@ internal sealed class MainWindow : Runnable
         if (_sending is not null)
         {
             _sending.Cancel();
+            return;
+        }
+
+        // A curl command typed (or pasted keystroke by keystroke) into the URL bar is imported rather than sent.
+        if (CurlImporter.LooksLikeCurl(_editor.Spec.Url))
+        {
+            ImportCurl(_editor.Spec.Url, intoCurrent: true);
             return;
         }
 
@@ -302,6 +342,11 @@ internal sealed class MainWindow : Runnable
         _editor.SetSending(false);
         _response.ShowExchange(exchange);
         Notify(exchange.Response is null ? "" : $"{exchange.Request.Method} {exchange.Request.Uri?.Host} → {exchange.Response.StatusCode}");
+        if (exchange.HistoryEntry is { } entry && _historyLoaded)
+        {
+            _history.Prepend(entry);
+            UpdateSidebarTitle();
+        }
     }
 
     private void Save()
@@ -334,9 +379,9 @@ internal sealed class MainWindow : Runnable
             Ui.Error(App!, "Save failed", ex.Message);
         }
 
-        if (_node is null && _collection == _scratch && _editor.IsModified)
+        if (_node is null && _editor.IsModified)
         {
-            Notify("This scratch request is not in a collection yet: use Request > New request to keep it.");
+            Notify("This request is not in a collection yet: press Ctrl+N (Request > New request) to add it to one.");
         }
         else
         {
@@ -373,15 +418,16 @@ internal sealed class MainWindow : Runnable
             folder = _workspace.Collections[^1].RootNode;
         }
 
-        if (Ui.PromptText(App!, "New request", $"Name (in {folder.Collection.Name}{(folder is CollectionRootNode ? "" : " / " + folder.PathInCollection)})", "New request") is not { Length: > 0 } name)
+        if (Ui.PromptText(App!, "New request", $"Name (in {folder.Collection.Name}{(folder is CollectionRootNode ? "" : " / " + folder.PathInCollection)})", _detachedName ?? "New request") is not { Length: > 0 } name)
         {
             return;
         }
 
         CommitEditor();
         HttpRequestSpec? spec = null;
-        if (_node is null && _collection == _scratch)
+        if (_node is null)
         {
+            // A scratch, imported or history request becomes the new request.
             spec = _editor.Spec.Clone();
         }
 
@@ -589,6 +635,13 @@ internal sealed class MainWindow : Runnable
     {
         if (SettingsDialog.Show(App!, _workspace))
         {
+            _runner.ConfigureHistory();
+            if (_historyLoaded)
+            {
+                LoadHistory();
+                UpdateSidebarTitle();
+            }
+
             Notify("Settings saved.");
         }
     }
@@ -698,7 +751,7 @@ internal sealed class MainWindow : Runnable
             var collection = _workspace.ImportCollection(path);
             _tree.Reload(_workspace);
             _tree.Select(collection);
-            Notify($"Imported '{collection.Name}' into {Path.GetFileName(collection.FilePath)}");
+            Notify($"Imported '{collection.Name}' into {Path.GetRelativePath(_workspace.RootPath, collection.FilePath!)}");
         }
         catch (Exception ex)
         {
@@ -778,28 +831,245 @@ internal sealed class MainWindow : Runnable
         }
     }
 
+    // ----- history -------------------------------------------------------------------------------
+
+    /// <summary>F9: the sidebar shows either the collections or the request history.</summary>
+    private void ToggleHistory() => ShowHistory(!_showingHistory);
+
+    internal void ShowHistory(bool show)
+    {
+        if (show && !_historyLoaded)
+        {
+            LoadHistory();
+        }
+
+        _showingHistory = show;
+        _tree.Visible = !show;
+        _history.Visible = show;
+        UpdateSidebarTitle();
+        if (show)
+        {
+            _history.FocusList();
+        }
+        else
+        {
+            _tree.SetFocus();
+        }
+    }
+
+    private void LoadHistory()
+    {
+        _historyLoaded = true;
+        List<HistoryEntry> entries = [];
+        try
+        {
+            entries = _runner.History?.Load() ?? [];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Notify($"History could not be read: {ex.Message}");
+        }
+
+        _history.SetEntries(entries, _runner.History is null ? "History is off (Tools > Settings)." : "No requests yet: send one with F5.");
+    }
+
+    /// <summary>Shows a sent request and its recorded response; it can be edited and re-sent, or saved with Ctrl+N.</summary>
+    internal void OpenHistoryEntry(HistoryEntry entry)
+    {
+        CommitEditor();
+        _node = null;
+
+        // Variables keep resolving against the request's collection while it is still in the workspace.
+        _collection = _workspace.Collections.FirstOrDefault(c => c.Name == entry.Collection) ?? (_scratch ??= PostmanCollection.Create("Scratch"));
+        _historyEntry = entry;
+        _detachedName = entry.RequestPath is null ? null : entry.Name;
+        _editor.Load(entry.ReadSpec());
+        byte[]? body = null;
+        try
+        {
+            body = _runner.History?.ReadBody(entry);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The entry is still useful without its body.
+        }
+
+        _response.ShowExchange(entry.ToExchange(body));
+        UpdateTitles();
+    }
+
+    private void ShowHistoryContextMenu(System.Drawing.Point? position)
+    {
+        if (_history.Selected is not { } entry)
+        {
+            return;
+        }
+
+        var items = new List<View>
+        {
+            new MenuItem("_Open", "", () => OpenHistoryEntry(entry)),
+            new MenuItem("_Send again", "", () =>
+            {
+                OpenHistoryEntry(entry);
+                Send();
+            }),
+            new MenuItem("Save to _collection…", "", () =>
+            {
+                OpenHistoryEntry(entry);
+                NewRequest();
+            }),
+            new MenuItem("Copy as c_URL", "", () =>
+            {
+                OpenHistoryEntry(entry);
+                CopyAsCurl();
+            }),
+        };
+        if (OriginalRequest(entry) is { } original)
+        {
+            items.Add(new MenuItem("Go to _request in collection", "", () =>
+            {
+                ShowHistory(false);
+                ShowRequest(original);
+            }));
+        }
+
+        items.Add(new Line());
+        items.Add(new MenuItem("_Delete entry", "", () => DeleteHistoryEntry(entry)));
+        items.Add(new MenuItem("C_lear history…", "", ClearHistory));
+        ShowPopover(items, position);
+    }
+
+    private RequestNode? OriginalRequest(HistoryEntry entry) =>
+        entry.RequestPath is { } path ? _workspace.Collections.FirstOrDefault(c => c.Name == entry.Collection)?.FindRequest(path) : null;
+
+    private void DeleteHistoryEntry(HistoryEntry entry)
+    {
+        try
+        {
+            _runner.History?.Delete(entry.Id);
+            _history.Remove(entry);
+            UpdateSidebarTitle();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Ui.Error(App!, "History", ex.Message);
+        }
+    }
+
+    private void ClearHistory()
+    {
+        if (_runner.History is not { } store || !Ui.Confirm(App!, "Clear history", $"Delete all {_history.Count} entries of this workspace's history?", "Clear", "Cancel"))
+        {
+            return;
+        }
+
+        try
+        {
+            store.Clear();
+            _history.SetEntries([], "History cleared.");
+            UpdateSidebarTitle();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Ui.Error(App!, "History", ex.Message);
+        }
+    }
+
+    // ----- cURL import ---------------------------------------------------------------------------
+
+    private void ShowCurlImport()
+    {
+        if (CurlImportDialog.Show(App!) is { } imported)
+        {
+            ApplyImportedCurl(imported, intoCurrent: false);
+        }
+    }
+
+    /// <summary>
+    /// Imports a curl command: pasted into the URL bar it replaces the current request (like Postman); from the menu
+    /// it opens as a new request that Ctrl+N adds to a collection.
+    /// </summary>
+    internal void ImportCurl(string command, bool intoCurrent)
+    {
+        try
+        {
+            ApplyImportedCurl(CurlImporter.Import(command), intoCurrent);
+        }
+        catch (FormatException ex) when (intoCurrent)
+        {
+            Notify($"Not imported: {ex.Message}");
+        }
+        catch (FormatException ex)
+        {
+            Ui.Error(App!, "Not a curl command", ex.Message);
+        }
+    }
+
+    private void ApplyImportedCurl(CurlImportResult imported, bool intoCurrent)
+    {
+        var spec = imported.Spec;
+        if (intoCurrent)
+        {
+            spec.Description = _editor.Spec.Description;
+            spec.PreRequestScript = _editor.Spec.PreRequestScript;
+            spec.TestScript = _editor.Spec.TestScript;
+            _editor.Replace(spec);
+        }
+        else
+        {
+            CommitEditor();
+            _node = null;
+            _historyEntry = null;
+            _collection = _scratch ??= PostmanCollection.Create("Scratch");
+            _detachedName = imported.SuggestedName;
+            _editor.Replace(spec);
+            _response.Clear();
+        }
+
+        UpdateTitles();
+        var next = _node is null ? "Ctrl+N adds it to a collection." : "Ctrl+S saves it.";
+        if (imported.Warnings.Count == 0)
+        {
+            Notify($"Imported from cURL: {spec.Method} {spec.Url}. {next}");
+        }
+        else if (intoCurrent)
+        {
+            // Pasting should not interrupt with a dialog; the notes are short enough for the status bar.
+            Notify($"Imported from cURL ({imported.Warnings.Count} note(s): {string.Join(" ", imported.Warnings)}) {next}");
+        }
+        else
+        {
+            Notify($"Imported from cURL: {spec.Method} {spec.Url}. {next}");
+            Ui.Info(App!, "cURL import notes", string.Join('\n', imported.Warnings.Select(w => "• " + w)));
+        }
+    }
+
     // ----- help ----------------------------------------------------------------------------------
 
     private void ShowKeys() => Ui.Info(App!, "Keyboard & mouse",
         """
-        Mouse: click anything; drag pane borders to resize; right-click the tree for actions;
+        Mouse: click anything; drag pane borders to resize; right-click the tree or history for actions;
         double-click a table row to edit it; click the checkbox column to enable/disable a row.
 
         F5 / Enter in URL   Send (again to cancel)      Esc          Cancel a running request
-        Ctrl+S              Save all changes            Ctrl+N       New request
-        F2                  Rename tree item            Del          Delete tree item
+        Ctrl+S              Save all changes            Ctrl+N       New request (keeps an imported one)
+        F2                  Rename tree item            Del          Delete tree item / history entry
         F7                  Switch environment          F8           Client certificates
-        F6 / Shift+F6       Next / previous pane        Tab          Next field
+        F9                  Collections ⇄ History       F6 / Shift+F6  Next / previous pane
         F10                 Menu                        Shift+F10    Context menu
         Ctrl+L              Focus the URL bar           Ctrl+Q       Quit
+        Paste a curl command into the URL bar to import it (also File > Import cURL command).
         """);
 
     private void ShowWorkspaceInfo()
     {
+        var formats = string.Join(", ", _workspace.Collections.GroupBy(c => c.FormatName).Select(g => $"{g.Count()} {g.Key}"));
         var info = $"Folder: {_workspace.RootPath}\n" +
-                   $"Collections: {_workspace.Collections.Count} · Environments: {_workspace.Environments.Count} · Globals: {(_workspace.Globals is null ? "no" : "yes")}\n" +
+                   $"Collections: {_workspace.Collections.Count}{(formats.Length > 0 ? $" ({formats})" : "")} · Environments: {_workspace.Environments.Count} · Globals: {(_workspace.Globals is null ? "no" : "yes")}\n" +
+                   $"New collections: {(_workspace.UsesV3Layout ? "Postman v3 YAML folders (postman/collections)" : "Postman v2.1 JSON files")}\n" +
                    $"Certificates: {_workspace.Certificates.Entries.Count} ({Path.GetRelativePath(_workspace.RootPath, _workspace.CertificatesPath)})\n" +
-                   $"SSL verification: {(_workspace.Settings.StrictSsl ? "on" : "off")} · CA bundle: {_workspace.Settings.CaBundle ?? "none"}";
+                   $"SSL verification: {(_workspace.Settings.StrictSsl ? "on" : "off")} · CA bundle: {_workspace.Settings.CaBundle ?? "none"}\n" +
+                   $"History: {(_runner.History is { } history ? history.Folder : "off")}";
         if (_workspace.LoadErrors.Count > 0)
         {
             info += "\n\nCould not load:\n" + string.Join('\n', _workspace.LoadErrors);
@@ -836,11 +1106,19 @@ internal sealed class MainWindow : Runnable
     private void UpdateTitles()
     {
         var dirty = _editor.IsModified || _collection?.IsDirty == true ? " ●" : "";
-        _requestFrame.Title = _node is null
-            ? $"Request (scratch){dirty}"
-            : $"Request — {_node.Collection.Name} / {_node.PathInCollection}{dirty}";
+        _requestFrame.Title = _node is not null
+            ? $"Request — {_node.Collection.Name} / {_node.PathInCollection}{dirty}"
+            : _historyEntry is { } entry
+                ? $"Request (from history · {entry.Time.ToLocalTime():yyyy-MM-dd HH:mm:ss}){dirty}"
+                : $"Request ({(_detachedName is null ? "scratch" : "imported")}){dirty}";
         _requestFrame.SetNeedsDraw();
         _tree.RefreshItem(_collection ?? (object)_workspace);
+    }
+
+    private void UpdateSidebarTitle()
+    {
+        _sidebar.Title = _showingHistory ? $"History ({_history.Count})" : "Collections";
+        _sidebar.SetNeedsDraw();
     }
 
     private void Notify(string message)

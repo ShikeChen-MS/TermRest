@@ -9,7 +9,7 @@ internal static class SendCommand
     public static Command Create(Option<bool> insecure)
     {
         var command = new Command("send", "Send one request from a collection and print the response body (status and diagnostics go to stderr).");
-        var collection = new Argument<string>("collection") { Description = "Collection file, or a workspace folder" };
+        var collection = new Argument<string>("collection") { Description = "Collection file or v3 collection folder, or a workspace folder" };
         var request = new Argument<string>("request") { Description = "Request path such as \"Users/Get user\", or a unique request name" };
         var include = new Option<bool>("--include", "-i") { Description = "Also print the response status line and headers to stdout" };
         var verbose = new Option<bool>("--verbose", "-v") { Description = "Print the request, timing and TLS details to stderr" };
@@ -17,6 +17,7 @@ internal static class SendCommand
         var raw = new Option<bool>("--raw") { Description = "Print the body as received (no JSON/XML pretty printing)" };
         var fail = new Option<bool>("--fail", "-f") { Description = "Exit with code 22 when the HTTP status is 400 or higher" };
         var curl = new Option<bool>("--curl") { Description = "Print the request as a cURL command instead of sending it" };
+        var noHistory = new Option<bool>("--no-history") { Description = "Do not record this request in the workspace history" };
         var options = new RequestOptions();
         command.Arguments.Add(collection);
         command.Arguments.Add(request);
@@ -27,6 +28,7 @@ internal static class SendCommand
         command.Options.Add(raw);
         command.Options.Add(fail);
         command.Options.Add(curl);
+        command.Options.Add(noHistory);
 
         command.SetAction(async (parseResult, cancellationToken) =>
         {
@@ -36,6 +38,10 @@ internal static class SendCommand
             }
 
             using var runner = opened.Runner;
+            if (!parseResult.GetValue(noHistory))
+            {
+                runner.ConfigureHistory();
+            }
             var requestPath = parseResult.GetValue(request)!;
             var candidates = opened.Collection is { } single ? [single] : opened.Workspace.Collections;
             var match = candidates.Select(c => (Collection: c, Node: c.FindRequest(requestPath))).FirstOrDefault(m => m.Node is not null);

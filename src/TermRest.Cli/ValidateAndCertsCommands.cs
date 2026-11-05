@@ -12,14 +12,22 @@ internal static class ValidateCommand
 {
     public static Command Create()
     {
-        var command = new Command("validate", "Check that Postman collection/environment files load and round-trip byte-for-byte.");
-        var files = new Argument<string[]>("files") { Description = "Collection or environment JSON files", Arity = ArgumentArity.OneOrMore };
+        var command = new Command("validate",
+            "Check that Postman files load and that TermRest saves them unchanged: JSON collections/environments round-trip " +
+            "byte-for-byte; v3 collection folders and YAML environments convert losslessly.");
+        var files = new Argument<string[]>("files") { Description = "Collection or environment files, or v3 collection folders", Arity = ArgumentArity.OneOrMore };
         command.Arguments.Add(files);
         command.SetAction(parseResult =>
         {
             var failures = 0;
             foreach (var file in parseResult.GetValue(files)!)
             {
+                if (Directory.Exists(file) || PostmanEnvironment.IsYamlPath(file))
+                {
+                    failures += ValidateV3(file) ? 0 : 1;
+                    continue;
+                }
+
                 try
                 {
                     var (original, info) = TextFile.Read(file);
@@ -70,6 +78,49 @@ internal static class ValidateCommand
     {
         var normalized = info.UsesCrLf ? text.Replace("\r\n", "\n", StringComparison.Ordinal) : text;
         return info.HasTrailingNewline ? normalized[..^1] : normalized;
+    }
+
+    /// <summary>v3 collection folder or YAML environment: loads, and checks that editing would not change other details.</summary>
+    private static bool ValidateV3(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                var collection = PostmanCollection.Load(path);
+                var problems = collection.Verify();
+                var summary = $"v3 collection '{collection.Name}', {collection.AllRequests().Count()} request(s)";
+                foreach (var warning in collection.LoadWarnings)
+                {
+                    Output.Warning($"  {warning}");
+                }
+
+                if (problems.Count == 0)
+                {
+                    Output.Status($"✓ {path}: {summary}; every file converts losslessly", true);
+
+                    // Unreadable files are reported as load warnings; hidden non-HTTP requests are fine.
+                    return collection.LoadWarnings.All(w => w.Contains("non-HTTP", StringComparison.Ordinal));
+                }
+
+                Output.Status($"✗ {path}: {summary}; {problems.Count} file(s) would change when edited", false);
+                foreach (var problem in problems)
+                {
+                    Output.Info($"    {problem}");
+                }
+
+                return false;
+            }
+
+            var environment = PostmanEnvironment.Load(path);
+            Output.Status($"✓ {path}: v3 environment '{environment.Name}', {environment.Values.Count} value(s)", true);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or FormatException or UnauthorizedAccessException)
+        {
+            Output.Status($"✗ {path}: {ex.Message}", false);
+            return false;
+        }
     }
 
     private static (int Line, string Before, string After) FirstDifference(string a, string b)

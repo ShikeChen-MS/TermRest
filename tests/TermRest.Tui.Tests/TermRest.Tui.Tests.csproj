@@ -24,9 +24,12 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Shared test PKI and HTTPS echo server. -->
+    <!-- Shared test PKI, HTTPS echo server, temp files and the Postman v3 workspace fixture. -->
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestPki.cs" Link="Infrastructure\Shared\TestPki.cs" />
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\EchoServer.cs" Link="Infrastructure\Shared\EchoServer.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestFiles.cs" Link="Infrastructure\Shared\TestFiles.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\TempDirectoryCleanup.cs" Link="Infrastructure\Shared\TempDirectoryCleanup.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\V3Fixture.cs" Link="Infrastructure\Shared\V3Fixture.cs" />
   </ItemGroup>
 
 </Project>

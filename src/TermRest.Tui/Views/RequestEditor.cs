@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using Terminal.Gui.Input;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
+using TermRest.Core.Import;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 
@@ -53,8 +54,17 @@ internal sealed class RequestEditor : View
         _send = new Button { Text = "Send", X = Pos.AnchorEnd(10), Y = 0, IsDefault = false };
         _send.Accepted += (_, _) => SendRequested?.Invoke(this, EventArgs.Empty);
 
-        _url = new TextField { X = Pos.Right(_method) + 1, Y = 0, Width = Dim.Fill(11) };
+        _url = new UrlField { X = Pos.Right(_method) + 1, Y = 0, Width = Dim.Fill(11) };
         _url.TextChanged += (_, _) => OnUrlEdited();
+        _url.Pasting += (_, e) =>
+        {
+            // Pasting a curl command into the URL bar imports it (like Postman).
+            if (CurlImporter.LooksLikeCurl(e.Text))
+            {
+                e.Handled = true;
+                CurlPasted?.Invoke(this, e.Text);
+            }
+        };
         _url.KeyDown += (_, key) =>
         {
             if (key == Key.Enter)
@@ -180,6 +190,9 @@ internal sealed class RequestEditor : View
 
     public event EventHandler? ManageCertificatesRequested;
 
+    /// <summary>A curl command was pasted into the URL bar.</summary>
+    public event EventHandler<string>? CurlPasted;
+
     /// <summary>Describes which client certificate the current URL would use (supplied by the main window).</summary>
     public Func<HttpRequestSpec, string>? DescribeCertificate { get; set; }
 
@@ -219,6 +232,13 @@ internal sealed class RequestEditor : View
 
     public void MarkClean() => IsModified = false;
 
+    /// <summary>Loads a request that replaces the current one (e.g. from a pasted curl command): marked as modified.</summary>
+    public void Replace(HttpRequestSpec spec)
+    {
+        Load(spec);
+        MarkModified();
+    }
+
     public void SetSending(bool sending)
     {
         _send.Text = sending ? "Cancel" : "Send";
@@ -233,6 +253,22 @@ internal sealed class RequestEditor : View
     {
         if (_loading || _syncing)
         {
+            return;
+        }
+
+        // Some terminals deliver a paste as typed text: a whole curl command appearing at once is imported too.
+        var text = _url.Text;
+        if (text.Length - Spec.Url.Length > 8 && CurlImporter.LooksLikeCurl(text) && !CurlImporter.LooksLikeCurl(Spec.Url))
+        {
+            if (App is { } app)
+            {
+                app.Invoke(() => CurlPasted?.Invoke(this, text));
+            }
+            else
+            {
+                CurlPasted?.Invoke(this, text);
+            }
+
             return;
         }
 
@@ -293,5 +329,20 @@ internal sealed class RequestEditor : View
 
         IsModified = true;
         Modified?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// The URL bar. <see cref="TextField"/> keeps only the first line of a paste; a pasted curl command is kept whole so
+    /// the <see cref="View.Pasting"/> handler can import it (anything else is still reduced to one line before insertion).
+    /// </summary>
+    private sealed class UrlField : TextField
+    {
+        protected override string OnSanitizingPaste(string raw) =>
+            CurlImporter.LooksLikeCurl(raw)
+                ? string.Concat(raw.Where(c => !char.IsControl(c) || c is '\t' or '\r' or '\n'))
+                : base.OnSanitizingPaste(raw);
+
+        protected override bool OnPaste(string text) =>
+            base.OnPaste(text.AsSpan().ContainsAny('\r', '\n') ? base.OnSanitizingPaste(text) : text);
     }
 }
