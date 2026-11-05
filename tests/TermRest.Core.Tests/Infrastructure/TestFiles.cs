@@ -19,11 +19,30 @@ internal static class TestFiles
         return target;
     }
 
+    private static readonly System.Collections.Concurrent.ConcurrentBag<string> CreatedDirectories = [];
+
     public static string NewTempDirectory()
     {
         var directory = Path.Combine(Path.GetTempPath(), "termrest-tests", Guid.NewGuid().ToString("N")[..12]);
         Directory.CreateDirectory(directory);
+        CreatedDirectories.Add(directory);
         return directory;
+    }
+
+    /// <summary>Removes every directory handed out by <see cref="NewTempDirectory"/> (called once after the run).</summary>
+    internal static void DeleteCreatedDirectories()
+    {
+        while (CreatedDirectories.TryTake(out var directory))
+        {
+            try
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                // Best effort: a file may still be held open by a just-finished test.
+            }
+        }
     }
 
     /// <summary>Lines that differ between two texts, for asserting that an edit touched only what it should.</summary>
