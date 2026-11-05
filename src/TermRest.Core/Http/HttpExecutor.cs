@@ -5,6 +5,7 @@ using System.Net.Http.Headers;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using TermRest.Core.Certificates;
 
@@ -27,6 +28,12 @@ public sealed class HttpExecutor
 
     public CookieContainer Cookies { get; }
 
+    /// <summary>
+    /// Limit for establishing a connection (TCP connect plus TLS handshake), so an unreachable host fails even when
+    /// the request itself has no timeout. A shorter request timeout still applies.
+    /// </summary>
+    public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
     public async Task<HttpExchange> SendAsync(PreparedRequest request, CancellationToken cancellationToken = default)
     {
         var exchange = new HttpExchange(request) { StartedAt = DateTimeOffset.Now };
@@ -38,13 +45,14 @@ public sealed class HttpExecutor
 
         var clock = Stopwatch.StartNew();
         var capture = new ConnectionCapture(clock);
-        using var handler = CreateHandler(request, capture);
-        using var client = new HttpClient(handler, disposeHandler: false) { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
         using var timeoutSource = request.Timeout is { } timeout && timeout > TimeSpan.Zero ? new CancellationTokenSource(timeout) : null;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource?.Token ?? CancellationToken.None);
         TimeSpan? headersAt = null;
+        SocketsHttpHandler? handler = null;
         try
         {
+            handler = CreateHandler(request, capture);
+            using var client = new HttpClient(handler, disposeHandler: false) { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
             using var message = CreateMessage(request, exchange);
             using var response = await client.SendAsync(message, HttpCompletionOption.ResponseHeadersRead, linked.Token).ConfigureAwait(false);
             headersAt = clock.Elapsed;
@@ -64,8 +72,19 @@ public sealed class HttpExecutor
         {
             exchange.ErrorMessage = $"Request timed out after {HttpExchange.Format(request.Timeout)}.";
         }
+        catch (OperationCanceledException ex)
+        {
+            // Neither the caller nor the request timeout cancelled: the handler gave up establishing the connection.
+            exchange.Exception = ex;
+            exchange.ErrorMessage = ex.InnerException is TimeoutException
+                ? capture.IsConnected
+                    ? $"The TLS handshake with {request.Uri.Authority} did not complete within {HttpExchange.Format(ConnectTimeout)}."
+                    : $"Could not connect to {request.Uri.Authority} within {HttpExchange.Format(ConnectTimeout)}."
+                : DescribeError(ex, capture);
+        }
         catch (Exception ex) when (ex is HttpRequestException or IOException or AuthenticationException or SocketException
-                                       or InvalidOperationException or NotSupportedException or UnauthorizedAccessException)
+                                       or InvalidOperationException or NotSupportedException or UnauthorizedAccessException
+                                       or FormatException or ArgumentException or CryptographicException)
         {
             exchange.Exception = ex;
             exchange.ErrorMessage = DescribeError(ex, capture);
@@ -74,6 +93,9 @@ public sealed class HttpExecutor
         {
             exchange.Timing = capture.BuildTiming(headersAt, clock.Elapsed);
             exchange.Tls.AddRange(capture.CollectTls(request));
+
+            // Disposed last: closing the connections first would hide the TLS details read above.
+            handler?.Dispose();
         }
 
         return exchange;
@@ -81,6 +103,7 @@ public sealed class HttpExecutor
 
     private SocketsHttpHandler CreateHandler(PreparedRequest request, ConnectionCapture capture)
     {
+        var connectTimeout = ConnectTimeout;
         var handler = new SocketsHttpHandler
         {
             AllowAutoRedirect = request.FollowRedirects,
@@ -88,7 +111,7 @@ public sealed class HttpExecutor
             AutomaticDecompression = DecompressionMethods.All,
             UseCookies = request.UseCookies,
             CookieContainer = Cookies,
-            ConnectTimeout = TimeSpan.FromSeconds(30),
+            ConnectTimeout = connectTimeout,
             Credentials = request.Credential,
             ConnectCallback = capture.ConnectAsync,
         };
@@ -320,6 +343,17 @@ public sealed class HttpExecutor
         private ClientCertificateSelection? _presented;
         private bool _presentedViaContext;
 
+        public bool IsConnected
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _connectEnd is not null;
+                }
+            }
+        }
+
         public X509Certificate2? SelectClientCertificate(ClientCertificateSelection? selection, X509Certificate? remoteCertificate, string[] acceptableIssuers)
         {
             // The platform calls this once before the handshake (no remote certificate yet) and again when the
@@ -501,14 +535,14 @@ public sealed class HttpExecutor
                             }
                         }
                     }
-                    catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+                    catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException or CryptographicException)
                     {
-                        // The connection was torn down; keep what the callbacks recorded.
+                        // The connection (or a certificate reloaded meanwhile) was torn down; keep what the callbacks recorded.
                     }
 
                     if (info.ClientCertificate is null && _presented is { } presented && (_clientCertificateRequested || _presentedViaContext))
                     {
-                        info.ClientCertificate = presented.Certificate.Summary;
+                        info.ClientCertificate = presented.Summary;
                         info.ClientCertificateOrigin = info.Protocol == SslProtocols.None
                             ? $"{presented.Origin}; handshake did not complete"
                             : presented.Origin;

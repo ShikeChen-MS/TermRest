@@ -60,6 +60,30 @@ public class PostmanUrlTests
     }
 
     [Fact]
+    public void Syncing_params_keeps_metadata_with_its_key_when_params_are_removed_reordered_or_edited()
+    {
+        var limitSource = new System.Text.Json.Nodes.JsonObject { ["x-custom"] = "keep me" };
+        List<KeyValueEntry> current =
+        [
+            new() { Key = "page", Value = "1", Description = "Page number" },
+            new() { Key = "limit", Value = "10", Description = "Max items", Source = limitSource },
+        ];
+        static IEnumerable<string> Rows(List<KeyValueEntry> rows) => rows.Select(e => $"{e.Key}={e.Value}:{e.Description}");
+
+        var removed = PostmanUrl.SyncQueryFromRaw("https://x/api?limit=10", current);
+        Assert.Equal(["limit=10:Max items"], Rows(removed));
+        Assert.Same(limitSource, removed[0].Source);
+
+        Assert.Equal(["limit=10:Max items", "page=1:Page number"], Rows(PostmanUrl.SyncQueryFromRaw("https://x/api?limit=10&page=1", current)));
+        Assert.Equal(["page=2:Page number", "limit=10:Max items"], Rows(PostmanUrl.SyncQueryFromRaw("https://x/api?page=2&limit=10", current)));
+        Assert.Equal(["pg=1:Page number", "limit=10:Max items"], Rows(PostmanUrl.SyncQueryFromRaw("https://x/api?pg=1&limit=10", current)));
+        Assert.Equal(["page=1:Page number", "limit=10:Max items", "q=x:"], Rows(PostmanUrl.SyncQueryFromRaw("https://x/api?page=1&limit=10&q=x", current)));
+
+        List<KeyValueEntry> duplicates = [new() { Key = "tag", Value = "a", Description = "first" }, new() { Key = "tag", Value = "b", Description = "second" }];
+        Assert.Equal(["tag=b:second"], Rows(PostmanUrl.SyncQueryFromRaw("https://x/api?tag=b", duplicates)));
+    }
+
+    [Fact]
     public void Syncing_url_from_params_rebuilds_the_query_and_keeps_the_fragment()
     {
         List<KeyValueEntry> query =

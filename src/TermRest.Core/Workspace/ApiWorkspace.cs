@@ -153,8 +153,15 @@ public sealed class ApiWorkspace
     }
 
     /// <summary>Copies an exported Postman collection into the workspace and loads it.</summary>
+    /// <remarks>A file that is already loaded is reloaded from disk; that is refused while it has unsaved changes.</remarks>
     public PostmanCollection ImportCollection(string sourcePath)
     {
+        if (FindCollection(sourcePath) is { } loaded)
+        {
+            ThrowIfDirty(loaded.IsDirty, loaded.Name);
+            return ReloadCollection(loaded);
+        }
+
         var collection = PostmanCollection.Load(sourcePath);
         var target = IsInside(sourcePath) ? Path.GetFullPath(sourcePath) : UniquePath(collection.Name, PostmanCollection.FileSuffix);
         if (!string.Equals(Path.GetFullPath(sourcePath), target, StringComparison.OrdinalIgnoreCase))
@@ -163,24 +170,60 @@ public sealed class ApiWorkspace
             collection = PostmanCollection.Load(target);
         }
 
-        Collections.RemoveAll(c => string.Equals(c.FilePath, target, StringComparison.OrdinalIgnoreCase));
         Collections.Add(collection);
         return collection;
     }
 
+    /// <summary>The loaded collection stored in <paramref name="path"/>, if any.</summary>
+    public PostmanCollection? FindCollection(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        return Collections.FirstOrDefault(c => c.FilePath is { } file && string.Equals(Path.GetFullPath(file), fullPath, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>Re-reads a collection from disk in place of the loaded copy, discarding its unsaved changes.</summary>
+    public PostmanCollection ReloadCollection(PostmanCollection collection)
+    {
+        var index = Collections.IndexOf(collection);
+        if (index < 0 || collection.FilePath is null)
+        {
+            throw new ArgumentException($"'{collection.Name}' is not a saved collection of this workspace.", nameof(collection));
+        }
+
+        var reloaded = PostmanCollection.Load(collection.FilePath);
+        Collections[index] = reloaded;
+        return reloaded;
+    }
+
+    /// <remarks>A file that is already loaded is reloaded from disk; that is refused while it has unsaved changes.</remarks>
     public PostmanEnvironment ImportEnvironment(string sourcePath)
     {
+        var fullSource = Path.GetFullPath(sourcePath);
+        var loadedIndex = Environments.FindIndex(e => e.FilePath is { } file && string.Equals(Path.GetFullPath(file), fullSource, StringComparison.OrdinalIgnoreCase));
+        if (loadedIndex >= 0)
+        {
+            ThrowIfDirty(Environments[loadedIndex].IsDirty, Environments[loadedIndex].Name);
+            return Environments[loadedIndex] = PostmanEnvironment.Load(fullSource);
+        }
+
         var environment = PostmanEnvironment.Load(sourcePath);
-        var target = IsInside(sourcePath) ? Path.GetFullPath(sourcePath) : UniquePath(environment.Name, PostmanEnvironment.EnvironmentSuffix);
-        if (!string.Equals(Path.GetFullPath(sourcePath), target, StringComparison.OrdinalIgnoreCase))
+        var target = IsInside(sourcePath) ? fullSource : UniquePath(environment.Name, PostmanEnvironment.EnvironmentSuffix);
+        if (!string.Equals(fullSource, target, StringComparison.OrdinalIgnoreCase))
         {
             File.Copy(sourcePath, target);
             environment = PostmanEnvironment.Load(target);
         }
 
-        Environments.RemoveAll(e => string.Equals(e.FilePath, target, StringComparison.OrdinalIgnoreCase));
         Environments.Add(environment);
         return environment;
+    }
+
+    private static void ThrowIfDirty(bool isDirty, string name)
+    {
+        if (isDirty)
+        {
+            throw new InvalidOperationException($"'{name}' is already open and has unsaved changes. Save them first, or reload it to discard them.");
+        }
     }
 
     public void SaveSettings()

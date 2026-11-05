@@ -194,7 +194,7 @@ termrest send api.postman_collection.json "Users/Get user" --curl     # print an
 | `pm.*` scripts | Kept and editable, **not executed yet** |
 | Client certificates | `request.certificate` honoured; Newman certificate-list format for the registry |
 
-Run `termrest validate <your exports>` to check that TermRest would save your files without changing them.
+Run `termrest validate <your exports>` to check that TermRest would save your files without changing them. Saves are atomic, write through symbolic links, and keep file permissions (Unix mode / Windows ACL), so a `chmod 600` environment holding secrets stays private. Importing a collection that is already open reloads it from disk, and asks first if it has unsaved changes.
 
 ## Building native binaries
 

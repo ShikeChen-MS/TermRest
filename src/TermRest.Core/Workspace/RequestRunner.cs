@@ -12,6 +12,8 @@ namespace TermRest.Core.Workspace;
 /// </summary>
 public sealed class RequestRunner : IDisposable
 {
+    private readonly List<ClientCertificateProvider> _retiredProviders = [];
+
     public RequestRunner(ApiWorkspace workspace)
     {
         Workspace = workspace;
@@ -96,9 +98,19 @@ public sealed class RequestRunner : IDisposable
     /// <summary>Call after editing the certificate registry so changed entries are reloaded.</summary>
     public void ReloadCertificates()
     {
-        Certificates.Dispose();
+        // A request still in flight may be using the old certificates, so they are released with the runner.
+        _retiredProviders.Add(Certificates);
         Certificates = new ClientCertificateProvider(Workspace.Certificates);
     }
 
-    public void Dispose() => Certificates.Dispose();
+    public void Dispose()
+    {
+        Certificates.Dispose();
+        foreach (var provider in _retiredProviders)
+        {
+            provider.Dispose();
+        }
+
+        _retiredProviders.Clear();
+    }
 }

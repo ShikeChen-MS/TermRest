@@ -68,7 +68,7 @@ public static class CurlExporter
                     parts.Add($"--cert-type P12 --cert {Quote(entry.Pfx!.Src)}");
                     break;
                 default:
-                    parts.Add($"# client certificate from OS store: {selection.Certificate.Summary.Subject} ({selection.Certificate.Certificate.Thumbprint})");
+                    parts.Add($"# client certificate from OS store: {selection.Summary.Subject} ({selection.Summary.Thumbprint})");
                     break;
             }
         }

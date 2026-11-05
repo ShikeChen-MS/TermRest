@@ -190,7 +190,7 @@ internal sealed class ResponseView : View
         }
 
         builder.Append(CultureInfo.InvariantCulture, $"\nAuth: {request.AuthDescription}\n");
-        builder.Append(CultureInfo.InvariantCulture, $"Client certificate: {(request.ClientCertificate is { } c ? $"{c.Entry.Name} — {c.Certificate.Summary} ({c.Origin})" : "none")}\n");
+        builder.Append(CultureInfo.InvariantCulture, $"Client certificate: {(request.ClientCertificate is { } c ? $"{c.Entry.Name} — {c.Summary} ({c.Origin})" : "none")}\n");
         builder.Append(CultureInfo.InvariantCulture, $"SSL verification: {(request.StrictSsl ? "on" : "off")} · Redirects: {(request.FollowRedirects ? "follow" : "don't follow")}\n");
 
         if (exchange is not null)

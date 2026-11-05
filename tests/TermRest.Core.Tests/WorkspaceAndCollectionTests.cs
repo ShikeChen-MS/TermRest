@@ -136,4 +136,48 @@ public class WorkspaceAndCollectionTests
         Assert.Equal(["dev", "store"], reopened.Certificates.Entries.Select(e => e.Name));
         Assert.Equal(CertificateSourceKind.Store, reopened.Certificates.Entries[1].Kind);
     }
+
+    [Fact]
+    public void Importing_an_open_collection_reloads_it_but_never_drops_unsaved_changes()
+    {
+        var workspace = OpenSampleCopy();
+        var original = workspace.Collections[0];
+        var node = original.FindRequest("Basics/GET with query")!;
+        var spec = node.ReadSpec();
+        spec.Url += "&edited=1";
+        spec.QueryParams = PostmanUrl.SyncQueryFromRaw(spec.Url, spec.QueryParams);
+        original.UpdateRequest(node, spec);
+        Assert.True(original.IsDirty);
+
+        var error = Assert.Throws<InvalidOperationException>(() => workspace.ImportCollection(original.FilePath!));
+        Assert.Contains("unsaved changes", error.Message, StringComparison.Ordinal);
+        Assert.Same(original, Assert.Single(workspace.Collections));
+        Assert.True(workspace.HasUnsavedChanges);
+
+        var reloaded = workspace.ReloadCollection(original);
+        Assert.Same(reloaded, Assert.Single(workspace.Collections));
+        Assert.False(workspace.HasUnsavedChanges);
+        Assert.DoesNotContain("edited=1", reloaded.FindRequest("Basics/GET with query")!.ReadSpec().Url, StringComparison.Ordinal);
+
+        var again = workspace.ImportCollection(reloaded.FilePath!);
+        Assert.Same(again, Assert.Single(workspace.Collections));
+        Assert.Same(again, workspace.FindCollection(Path.Combine(workspace.RootPath, ".", Path.GetFileName(again.FilePath!))));
+    }
+
+    [Fact]
+    public void Importing_an_open_environment_refuses_to_drop_unsaved_changes()
+    {
+        var workspace = OpenSampleCopy();
+        var environment = workspace.Environments[0];
+        environment.SetValues([new KeyValueEntry { Key = "changed", Value = "1" }]);
+        Assert.True(environment.IsDirty);
+
+        Assert.Throws<InvalidOperationException>(() => workspace.ImportEnvironment(environment.FilePath!));
+        Assert.Same(environment, Assert.Single(workspace.Environments));
+
+        environment.Save();
+        var reloaded = workspace.ImportEnvironment(environment.FilePath!);
+        Assert.Same(reloaded, Assert.Single(workspace.Environments));
+        Assert.Equal("changed", Assert.Single(reloaded.Values).Key);
+    }
 }

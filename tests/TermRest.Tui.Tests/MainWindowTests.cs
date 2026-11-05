@@ -155,6 +155,28 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
+    public void Importing_the_open_collection_again_reloads_it_and_the_editor_stays_live()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        var before = Assert.Single(ui.Workspace.Collections);
+
+        ui.Window.ImportCollectionFrom(path);
+
+        Assert.NotSame(before, Assert.Single(ui.Workspace.Collections));
+        Assert.Contains("Reloaded 'TermRest Demo' from disk", ui.Window.StatusMessage, StringComparison.Ordinal);
+        ui.Click("{{baseUrl}}/get?foo=bar&source=termrest");
+        ui.App.InjectKey(Key.End);
+        ui.Type("&after=reload");
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        var saved = PostmanCollection.Load(path);
+        Assert.EndsWith("&after=reload", saved.FindRequest("Basics/GET with query")!.ReadSpec().Url, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task F5_sends_the_request_and_shows_the_response()
     {
         await using var server = await LocalEchoServer.StartAsync();

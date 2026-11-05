@@ -141,35 +141,62 @@ public static class PostmanUrl
     public static string BuildQueryString(IEnumerable<KeyValueEntry> entries) =>
         string.Join('&', entries.Where(e => e.Enabled).Select(e => e.Value is null ? e.Key : $"{e.Key}={e.Value}"));
 
-    /// <summary>Re-derives the parameter table after the URL text changed, keeping disabled rows in place.</summary>
+    /// <summary>
+    /// Re-derives the parameter table after the URL text changed. Existing rows are matched by key and value, then
+    /// by key, then in order (an edited key), so descriptions and unknown properties stay with their parameter when
+    /// parameters are removed or reordered. Disabled rows keep their places.
+    /// </summary>
     public static List<KeyValueEntry> SyncQueryFromRaw(string raw, IReadOnlyList<KeyValueEntry> current)
     {
         var parsed = Parse(raw).Query;
-        var result = new List<KeyValueEntry>(Math.Max(parsed.Count, current.Count));
+        var enabled = current.Where(e => e.Enabled).ToList();
+        var used = new bool[enabled.Count];
+        var matched = new KeyValueEntry?[parsed.Count];
+
+        void Match(Func<KeyValueEntry, (string Key, string? Value), bool> predicate)
+        {
+            for (var i = 0; i < parsed.Count; i++)
+            {
+                for (var j = 0; matched[i] is null && j < enabled.Count; j++)
+                {
+                    if (!used[j] && predicate(enabled[j], parsed[i]))
+                    {
+                        matched[i] = enabled[j];
+                        used[j] = true;
+                    }
+                }
+            }
+        }
+
+        Match((row, p) => row.Key == p.Key && row.Value == p.Value);
+        Match((row, p) => row.Key == p.Key);
+        Match((_, _) => true);
+
+        var rows = new List<KeyValueEntry>(parsed.Count);
+        for (var i = 0; i < parsed.Count; i++)
+        {
+            var row = matched[i]?.Clone() ?? new KeyValueEntry();
+            row.Key = parsed[i].Key;
+            row.Value = parsed[i].Value;
+            rows.Add(row);
+        }
+
+        // Enabled slots are filled in URL order around the disabled rows; extra parameters go at the end.
+        var result = new List<KeyValueEntry>(Math.Max(rows.Count, current.Count));
         var next = 0;
         foreach (var entry in current)
         {
             if (!entry.Enabled)
             {
                 result.Add(entry.Clone());
-                continue;
             }
-
-            if (next < parsed.Count)
+            else if (next < rows.Count)
             {
-                var updated = entry.Clone();
-                updated.Key = parsed[next].Key;
-                updated.Value = parsed[next].Value;
-                result.Add(updated);
-                next++;
+                result.Add(rows[next++]);
             }
         }
 
-        for (; next < parsed.Count; next++)
-        {
-            result.Add(new KeyValueEntry { Key = parsed[next].Key, Value = parsed[next].Value });
-        }
-
+        result.AddRange(rows.Skip(next));
         return result;
     }
 

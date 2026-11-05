@@ -108,7 +108,7 @@ internal static class SendCommand
         }
 
         Output.Info($"* Auth: {request.AuthDescription}");
-        Output.Info($"* Client certificate: {(request.ClientCertificate is { } c ? $"{c.Entry.Name} — {c.Certificate.Summary} ({c.Origin})" : "none")}");
+        Output.Info($"* Client certificate: {(request.ClientCertificate is { } c ? $"{c.Entry.Name} — {c.Summary} ({c.Origin})" : "none")}");
         foreach (var line in exchange.Timing.ToString().Split('\n'))
         {
             Output.Info("* " + line);

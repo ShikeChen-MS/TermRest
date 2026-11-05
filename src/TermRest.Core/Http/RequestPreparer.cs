@@ -48,6 +48,10 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
 
         var method = R(spec.Method).Trim().ToUpperInvariant();
         prepared.Method = method.Length == 0 ? "GET" : method;
+        if (!IsHttpToken(prepared.Method))
+        {
+            prepared.Errors.Add($"'{prepared.Method}' is not a valid HTTP method.");
+        }
 
         // URL: resolve path variables first, then the rest, then rebuild the query from enabled parameters.
         var pathValues = spec.PathVariables.Where(p => p.Enabled).GroupBy(p => p.Key).ToDictionary(g => g.Key, g => R(g.Last().Value));
@@ -287,4 +291,8 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
                 return PreparedBody.None;
         }
     }
+
+    /// <summary>RFC 9110 token: what <see cref="System.Net.Http.HttpMethod"/> accepts (an unresolved {{variable}} is not).</summary>
+    private static bool IsHttpToken(string value) =>
+        value.Length > 0 && value.All(c => char.IsAsciiLetterOrDigit(c) || "!#$%&'*+-.^_`|~".Contains(c, StringComparison.Ordinal));
 }

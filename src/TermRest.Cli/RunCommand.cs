@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using TermRest.Core.Http;
 using TermRest.Core.Postman;
+using TermRest.Core.Workspace;
 
 namespace TermRest.Cli;
 
@@ -59,9 +60,16 @@ internal static class RunCommand
                         $"{(runner.Environment is { } env ? $" with environment '{env.Name}'" : "")}\n");
 
             var results = new List<(RequestNode Node, HttpExchange Exchange, bool Passed)>();
+            var cancelled = false;
             foreach (var node in requests)
             {
-                var exchange = await runner.SendAsync(target, node, node.ReadSpec(), cancellationToken);
+                var exchange = await SendSafelyAsync(runner, target, node, cancellationToken);
+                if (exchange.Cancelled || cancellationToken.IsCancellationRequested)
+                {
+                    cancelled = true;
+                    break;
+                }
+
                 var passed = exchange.Response is { } r && (parseResult.GetValue(allowHttpErrors) || r.StatusCode < 400);
                 results.Add((node, exchange, passed));
                 var status = exchange.Response is { } response ? response.StatusCode.ToString(System.Globalization.CultureInfo.InvariantCulture) : "ERR";
@@ -83,18 +91,39 @@ internal static class RunCommand
             }
 
             var failed = results.Count(r => !r.Passed);
-            Output.Info($"\n{results.Count - failed} passed, {failed} failed, {requests.Count - results.Count} skipped");
+            Output.Info($"\n{(cancelled ? "Run cancelled. " : "")}{results.Count - failed} passed, {failed} failed, {requests.Count - results.Count} skipped");
 
             if (parseResult.GetValue(json) is { } reportPath)
             {
-                await File.WriteAllTextAsync(reportPath, BuildReport(target, results), cancellationToken);
+                // Not tied to the cancellation token: a cancelled run still reports what it did.
+                await File.WriteAllTextAsync(reportPath, BuildReport(target, results), CancellationToken.None);
                 Output.Info($"Report written to {reportPath}");
             }
 
-            return failed == 0 ? 0 : 1;
+            return cancelled ? 130 : failed == 0 ? 0 : 1;
         });
 
         return command;
+    }
+
+    /// <summary>Sends one request; a request that cannot even be prepared is recorded as a failure instead of ending the run.</summary>
+    private static async Task<HttpExchange> SendSafelyAsync(RequestRunner runner, PostmanCollection collection, RequestNode node, CancellationToken cancellationToken)
+    {
+        PreparedRequest? prepared = null;
+        try
+        {
+            prepared = runner.Prepare(collection, node, node.ReadSpec());
+            return await runner.SendAsync(prepared, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            return new HttpExchange(prepared ?? new PreparedRequest { Url = node.PathInCollection })
+            {
+                Exception = ex,
+                Cancelled = cancellationToken.IsCancellationRequested,
+                ErrorMessage = ex.Message,
+            };
+        }
     }
 
     private static string BuildReport(PostmanCollection collection, List<(RequestNode Node, HttpExchange Exchange, bool Passed)> results)

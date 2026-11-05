@@ -33,6 +33,7 @@ internal sealed class MainWindow : Runnable
     private RequestNode? _node;
     private PostmanCollection? _scratch;
     private CancellationTokenSource? _sending;
+    private bool _closed;
     private PopoverMenu? _popover;
     private bool _quitConfirmed;
 
@@ -278,21 +279,29 @@ internal sealed class MainWindow : Runnable
         _editor.SetSending(true);
         using var cancellation = new CancellationTokenSource();
         _sending = cancellation;
+        HttpExchange exchange;
         try
         {
-            var exchange = await _runner.SendAsync(prepared, cancellation.Token);
-            _response.ShowExchange(exchange);
-            Notify(exchange.Response is null ? "" : $"{exchange.Request.Method} {exchange.Request.Uri?.Host} → {exchange.Response.StatusCode}");
+            exchange = await _runner.SendAsync(prepared, cancellation.Token);
         }
         catch (Exception ex)
         {
-            _response.ShowExchange(new HttpExchange(prepared) { ErrorMessage = ex.Message, Exception = ex });
+            exchange = new HttpExchange(prepared) { ErrorMessage = ex.Message, Exception = ex };
         }
         finally
         {
             _sending = null;
-            _editor.SetSending(false);
         }
+
+        // The window may have been closed (quit, workspace switch) while the request was in flight.
+        if (_closed)
+        {
+            return;
+        }
+
+        _editor.SetSending(false);
+        _response.ShowExchange(exchange);
+        Notify(exchange.Response is null ? "" : $"{exchange.Request.Method} {exchange.Request.Uri?.Host} → {exchange.Response.StatusCode}");
     }
 
     private void Save()
@@ -663,13 +672,29 @@ internal sealed class MainWindow : Runnable
 
     private void ImportCollection()
     {
-        if (Ui.PickFile(App!, "Import Postman collection (v2.0 / v2.1 JSON)", null, false, ("Postman collection", [".json"])) is not { } path)
+        if (Ui.PickFile(App!, "Import Postman collection (v2.0 / v2.1 JSON)", null, false, ("Postman collection", [".json"])) is { } path)
         {
-            return;
+            ImportCollectionFrom(path);
         }
+    }
 
+    internal void ImportCollectionFrom(string path)
+    {
         try
         {
+            CommitEditor();
+            if (_workspace.FindCollection(path) is { } loaded)
+            {
+                // Picking a file that is already open means "reload it from disk".
+                if (!loaded.IsDirty || Ui.Confirm(App!, "Reload collection",
+                        $"'{loaded.Name}' is already open and has unsaved changes.\nReload it from disk and discard them?", "Reload", "Cancel"))
+                {
+                    ReloadCollection(loaded);
+                }
+
+                return;
+            }
+
             var collection = _workspace.ImportCollection(path);
             _tree.Reload(_workspace);
             _tree.Select(collection);
@@ -679,6 +704,41 @@ internal sealed class MainWindow : Runnable
         {
             Ui.Error(App!, "Import failed", ex.Message);
         }
+    }
+
+    private void ReloadCollection(PostmanCollection loaded)
+    {
+        var reopen = _collection == loaded ? _node?.PathInCollection : null;
+        if (_collection == loaded)
+        {
+            // Detach the editor first so nothing is written into the copy being replaced.
+            _node = null;
+            _collection = null;
+            _editor.MarkClean();
+        }
+
+        var reloaded = _workspace.ReloadCollection(loaded);
+        _tree.Reload(_workspace);
+        if (reopen is not null && reloaded.FindRequest(reopen) is { } node)
+        {
+            _tree.Select(node);
+            if (_node != node)
+            {
+                OpenRequest(node);
+            }
+        }
+        else
+        {
+            _tree.Select(reloaded);
+            if (_collection is null)
+            {
+                _editor.Load(new HttpRequestSpec());
+                _response.Clear();
+            }
+        }
+
+        UpdateTitles();
+        Notify($"Reloaded '{reloaded.Name}' from disk.");
     }
 
     private void ImportEnvironment()
@@ -852,6 +912,7 @@ internal sealed class MainWindow : Runnable
     {
         if (disposing)
         {
+            _closed = true;
             _sending?.Cancel();
         }
 

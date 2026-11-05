@@ -4,7 +4,11 @@ using TermRest.Core.Model;
 
 namespace TermRest.Core.Certificates;
 
-public sealed record ClientCertificateSelection(CertificateEntry Entry, LoadedCertificate Certificate, string Origin);
+public sealed record ClientCertificateSelection(CertificateEntry Entry, LoadedCertificate Certificate, string Origin)
+{
+    /// <summary>Captured at selection time, so diagnostics never touch a certificate that was reloaded (disposed) meanwhile.</summary>
+    public CertificateSummary Summary { get; } = Certificate.Summary;
+}
 
 /// <summary>
 /// Chooses and loads the client certificate for a request: a certificate pinned on the request wins, then the most

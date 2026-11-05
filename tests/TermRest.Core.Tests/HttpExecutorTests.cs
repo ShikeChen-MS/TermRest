@@ -9,6 +9,7 @@ using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Tests.Infrastructure;
 using TermRest.Core.Variables;
+using TermRest.Core.Workspace;
 using Xunit;
 
 namespace TermRest.Core.Tests;
@@ -154,6 +155,61 @@ public sealed class HttpExecutorTests : IDisposable
         var invalid = await executor.SendAsync(Prepare(new HttpRequestSpec { Url = "{{undefinedBase}}/x" }), _ct);
         Assert.Contains("not a valid", invalid.ErrorMessage, StringComparison.Ordinal);
         Assert.Contains("undefinedBase", invalid.Request.UnresolvedVariables);
+    }
+
+    [Fact]
+    public async Task A_stalled_tls_handshake_is_reported_as_a_connect_timeout()
+    {
+        // The OS completes the TCP handshake for the listener's backlog, but nothing ever answers the TLS ClientHello.
+        using var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var executor = new HttpExecutor { ConnectTimeout = TimeSpan.FromSeconds(1) };
+
+        var exchange = await executor.SendAsync(Prepare(new HttpRequestSpec { Url = $"https://127.0.0.1:{port}/" }), _ct);
+
+        Assert.Null(exchange.Response);
+        Assert.False(exchange.Cancelled);
+        Assert.Contains($"TLS handshake with 127.0.0.1:{port} did not complete within", exchange.ErrorMessage, StringComparison.Ordinal);
+        Assert.NotNull(exchange.Timing.Connect);
+    }
+
+    [Fact]
+    public async Task Requests_that_cannot_be_built_report_an_error_instead_of_throwing()
+    {
+        var executor = new HttpExecutor();
+
+        var badMethod = await executor.SendAsync(Prepare(new HttpRequestSpec { Method = "{{verb}}", Url = "http://127.0.0.1:1/" }), _ct);
+        Assert.Contains("is not a valid HTTP method", badMethod.ErrorMessage, StringComparison.Ordinal);
+
+        var badProxy = await executor.SendAsync(Prepare(new HttpRequestSpec { Url = "http://127.0.0.1:1/" }, new ExecutionDefaults { Proxy = "http://bad proxy:x" }), _ct);
+        Assert.Null(badProxy.Response);
+        Assert.False(string.IsNullOrEmpty(badProxy.ErrorMessage));
+    }
+
+    [Fact]
+    public async Task Reloading_certificates_does_not_break_a_request_that_already_selected_one()
+    {
+        await using var server = await EchoServer.StartAsync(_pki.Server, requireClientCertificate: true);
+        var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        workspace.Settings.CaBundle = _pki.CaPemPath;
+        workspace.Certificates.Entries.Add(new CertificateEntry
+        {
+            Name = "client",
+            Matches = [$"https://localhost:{server.BaseUri.Port}/*"],
+            Pfx = new FileSource { Src = _pki.ClientPfxPath },
+            Passphrase = TestPki.Passphrase,
+        });
+        using var runner = new RequestRunner(workspace);
+        var prepared = runner.Prepare(PostmanCollection.Create("t"), null, new HttpRequestSpec { Url = server.Url("echo") });
+        Assert.NotNull(prepared.ClientCertificate);
+
+        runner.ReloadCertificates(); // the user edits certificates (F8) while this request is in flight
+
+        var exchange = await runner.SendAsync(prepared, _ct);
+        Assert.Equal(_pki.Client.Thumbprint, Json(exchange)["clientCertificateThumbprint"].GetString());
+        Assert.Equal(_pki.Client.Thumbprint, exchange.Tls.Single().ClientCertificate?.Thumbprint);
+        Assert.Equal(_pki.Client.Thumbprint, prepared.ClientCertificate.Summary.Thumbprint);
     }
 
     [Fact]
