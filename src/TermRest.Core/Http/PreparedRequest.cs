@@ -112,6 +112,13 @@ public sealed class PreparedBody
     }
 }
 
+/// <summary>Where a prepared request came from; recorded with the history entry.</summary>
+/// <param name="Spec">The request as edited when it was sent (variables unresolved).</param>
+/// <param name="CollectionName">The saved collection it belongs to (null for scratch requests).</param>
+/// <param name="RequestPath">Its path in the collection (null when not saved).</param>
+/// <param name="RequestName">Its name (null when not saved).</param>
+public sealed record RequestSource(Model.HttpRequestSpec Spec, string? CollectionName, string? RequestPath, string? RequestName);
+
 /// <summary>A request with all variables, auth, body and TLS choices resolved, ready to send.</summary>
 public sealed class PreparedRequest
 {
@@ -158,6 +165,23 @@ public sealed class PreparedRequest
 
     public SortedSet<string> UnresolvedVariables { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>Set by <see cref="Workspace.RequestRunner.Prepare"/>; requests built elsewhere are not recorded in the history.</summary>
+    public RequestSource? Source { get; set; }
+
+    /// <summary>Resolved values of secret variables and auth credentials, masked by <see cref="Redact"/>.</summary>
+    public HashSet<string> SecretValues { get; } = new(StringComparer.Ordinal);
+
     public string? GetHeader(string name) =>
         Headers.LastOrDefault(h => string.Equals(h.Key, name, StringComparison.OrdinalIgnoreCase)).Value;
+
+    /// <summary>Replaces every known secret value (4+ characters) in <paramref name="text"/> with <c>***</c>.</summary>
+    public string Redact(string text)
+    {
+        foreach (var secret in SecretValues.Where(s => s.Length >= 4).OrderByDescending(s => s.Length))
+        {
+            text = text.Replace(secret, "***", StringComparison.Ordinal);
+        }
+
+        return text;
+    }
 }

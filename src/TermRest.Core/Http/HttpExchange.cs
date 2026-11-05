@@ -29,6 +29,9 @@ public sealed class HttpExchange(PreparedRequest request)
     /// <summary>Request headers as sent (including generated ones such as User-Agent and Cookie).</summary>
     public List<KeyValuePair<string, string>> SentHeaders { get; } = [];
 
+    /// <summary>The history entry recorded for this exchange, if history is on.</summary>
+    public History.HistoryEntry? HistoryEntry { get; set; }
+
     public bool IsSuccess => Response is not null && ErrorMessage is null;
 
     public string Summary

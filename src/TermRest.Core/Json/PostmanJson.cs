@@ -36,6 +36,13 @@ public static class PostmanJson
         MaxDepth = 256,
     };
 
+    private static readonly JsonWriterOptions CompactWriterOptions = new()
+    {
+        Indented = false,
+        Encoder = MinimalJsonEncoder.Instance,
+        MaxDepth = 256,
+    };
+
     public static JsonNode Parse(string json) =>
         JsonNode.Parse(json, nodeOptions: default, DocumentOptions) ?? throw new JsonException("The JSON document is empty.");
 
@@ -44,6 +51,9 @@ public static class PostmanJson
 
     /// <summary>Pretty-prints a node for display (two-space indentation).</summary>
     public static string SerializeForDisplay(JsonNode node) => Write(node, DisplayWriterOptions);
+
+    /// <summary>Single-line JSON (line breaks inside strings are escaped), e.g. for JSON Lines files.</summary>
+    public static string SerializeCompact(JsonNode node) => Write(node, CompactWriterOptions);
 
     /// <summary>Pretty-prints arbitrary JSON text for display; returns null when the text is not valid JSON.</summary>
     public static string? TryPrettyPrint(string text)

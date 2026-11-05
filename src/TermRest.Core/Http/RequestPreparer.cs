@@ -71,6 +71,7 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
         prepared.AuthDescription = auth.Description;
         prepared.Credential = auth.Credential;
         prepared.Warnings.AddRange(auth.Warnings);
+        prepared.SecretValues.UnionWith(auth.Secrets.Where(s => s.Length > 0));
         query.AddRange(auth.QueryParameters.Select(q => (q.Key, (string?)q.Value)));
 
         var url = baseUrl;

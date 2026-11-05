@@ -18,6 +18,9 @@ public sealed class AppliedAuth
     public string Description { get; set; } = "No auth";
 
     public List<string> Warnings { get; } = [];
+
+    /// <summary>Resolved credentials (passwords, tokens, key values) that must not end up in history or logs.</summary>
+    public List<string> Secrets { get; } = [];
 }
 
 public static class AuthApplier
@@ -41,12 +44,15 @@ public static class AuthApplier
                 var token = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{user}:{password}"));
                 result.Headers.Add(new("Authorization", $"Basic {token}"));
                 result.Description = $"Basic ({user})";
+                result.Secrets.Add(password);
+                result.Secrets.Add(token);
                 break;
             }
 
             case "bearer":
             {
                 var token = Get("token");
+                result.Secrets.Add(token);
                 result.Headers.Add(new("Authorization", $"Bearer {token}"));
                 result.Description = "Bearer token";
                 if (token.Length == 0)
@@ -61,6 +67,7 @@ public static class AuthApplier
             {
                 var key = Get("key");
                 var value = Get("value");
+                result.Secrets.Add(value);
                 var location = auth.Get("in") ?? "header";
                 if (key.Length == 0)
                 {
@@ -85,6 +92,7 @@ public static class AuthApplier
                 var user = Get("username");
                 var password = Get("password");
                 var domain = auth.Type == "ntlm" ? Get("domain") : "";
+                result.Secrets.Add(password);
                 result.Credential = string.IsNullOrEmpty(domain) ? new NetworkCredential(user, password) : new NetworkCredential(user, password, domain);
                 result.Description = auth.Type == "ntlm" ? $"NTLM ({(domain.Length > 0 ? domain + "\\" : "")}{user})" : $"Digest ({user})";
                 break;
@@ -93,6 +101,7 @@ public static class AuthApplier
             case "oauth2":
             {
                 var token = Get("accessToken");
+                result.Secrets.Add(token);
                 if (token.Length == 0)
                 {
                     result.Warnings.Add("OAuth 2.0: no access token is set. Paste a token in the Auth tab (token acquisition is not implemented yet).");

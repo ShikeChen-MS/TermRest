@@ -1,4 +1,5 @@
 using TermRest.Core.Certificates;
+using TermRest.Core.History;
 using TermRest.Core.Http;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
@@ -37,7 +38,22 @@ public sealed class RequestRunner : IDisposable
 
     public int? TimeoutOverrideMs { get; set; }
 
+    /// <summary>Where sent requests are recorded; null turns recording off (see <see cref="ConfigureHistory"/>).</summary>
+    public HistoryStore? History { get; set; }
+
+    /// <summary>Largest response body kept with a history entry.</summary>
+    public int HistoryMaxBodyBytes { get; set; } = 256 * 1024;
+
     public PostmanEnvironment? Environment => EnvironmentOverride ?? Workspace.ActiveEnvironment;
+
+    /// <summary>Turns history recording on or off according to the workspace settings.</summary>
+    /// <param name="stateDirectory">Overrides the per-user state folder (tests, portable setups).</param>
+    public void ConfigureHistory(string? stateDirectory = null)
+    {
+        var settings = Workspace.Settings;
+        History = settings.HistoryEnabled ? HistoryStore.ForWorkspace(Workspace.RootPath, settings.HistoryLimit, stateDirectory) : null;
+        HistoryMaxBodyBytes = Math.Max(0, settings.HistoryResponseKb) * 1024;
+    }
 
     public VariableResolver CreateResolver(PostmanCollection? collection)
     {
@@ -86,14 +102,66 @@ public sealed class RequestRunner : IDisposable
     {
         var preparer = new RequestPreparer(CreateResolver(collection), Certificates, CreateDefaults());
         var auth = node is not null ? collection.GetEffectiveAuth(node, spec) : spec.Auth ?? collection.RootNode.Auth;
-        return preparer.Prepare(spec, auth, collection.BaseDirectory);
+        var prepared = preparer.Prepare(spec, auth, collection.BaseDirectory);
+        var saved = node is not null && node.Collection == collection && collection.FilePath is not null && node.Parent is not null;
+
+        // History keeps a self-contained copy: inherited auth is stored with the request so it can be re-sent on its own.
+        var snapshot = spec.Clone();
+        snapshot.Auth ??= auth?.Clone();
+        prepared.Source = new RequestSource(
+            snapshot,
+            collection.FilePath is null ? null : collection.Name,
+            saved ? node!.PathInCollection : null,
+            saved ? node!.Name : null);
+        prepared.SecretValues.UnionWith(SecretVariableValues(collection));
+        return prepared;
     }
 
-    public Task<HttpExchange> SendAsync(PreparedRequest prepared, CancellationToken cancellationToken = default) =>
-        Executor.SendAsync(prepared, cancellationToken);
+    /// <summary>Sends a prepared request and records it in <see cref="History"/> (when on).</summary>
+    public async Task<HttpExchange> SendAsync(PreparedRequest prepared, CancellationToken cancellationToken = default)
+    {
+        // No ConfigureAwait(false): UI callers resume on their own thread, which also records the entry.
+        var exchange = await Executor.SendAsync(prepared, cancellationToken).ConfigureAwait(true);
+        Record(exchange);
+        return exchange;
+    }
 
     public Task<HttpExchange> SendAsync(PostmanCollection collection, RequestNode? node, HttpRequestSpec spec, CancellationToken cancellationToken = default) =>
         SendAsync(Prepare(collection, node, spec), cancellationToken);
+
+    private void Record(HttpExchange exchange)
+    {
+        var request = exchange.Request;
+        if (History is not { } history || request.Source is not { } source || exchange.Cancelled
+            || (exchange.Response is null && (request.Errors.Count > 0 || request.Uri is null)))
+        {
+            return; // nothing was sent
+        }
+
+        try
+        {
+            var entry = HistoryEntry.Create(exchange, source, Environment?.Name, HistoryMaxBodyBytes, out var body);
+            history.Add(entry, body);
+            exchange.HistoryEntry = entry;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            request.Warnings.Add($"The request was not added to the history: {ex.Message}");
+        }
+    }
+
+    /// <summary>Values of variables typed "secret" in the environment, collection and globals.</summary>
+    private IEnumerable<string> SecretVariableValues(PostmanCollection collection)
+    {
+        IEnumerable<KeyValueEntry> entries = Environment?.Values ?? [];
+        entries = entries.Concat(collection.GetVariables());
+        if (Workspace.Globals is { } globals)
+        {
+            entries = entries.Concat(globals.Values);
+        }
+
+        return entries.Where(e => e.Enabled && e.IsSecret && !string.IsNullOrEmpty(e.Value)).Select(e => e.Value!);
+    }
 
     /// <summary>Call after editing the certificate registry so changed entries are reloaded.</summary>
     public void ReloadCertificates()

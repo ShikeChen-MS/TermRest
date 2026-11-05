@@ -31,6 +31,21 @@ public sealed class WorkspaceSettings
     /// <summary>"1.1" (default, like Postman) or "2" (HTTP/2 when the server supports it).</summary>
     public string HttpVersion { get; set; } = "1.1";
 
+    /// <summary>
+    /// Format of new collections and environments: "v3" (Postman v3 YAML folders under postman/), "v2.1" (JSON files),
+    /// or null to follow the workspace's existing layout.
+    /// </summary>
+    public string? CollectionFormat { get; set; }
+
+    /// <summary>Record sent requests in the history (kept per user, outside the workspace folder).</summary>
+    public bool HistoryEnabled { get; set; } = true;
+
+    /// <summary>Number of history entries kept for this workspace.</summary>
+    public int HistoryLimit { get; set; } = 500;
+
+    /// <summary>Response bodies up to this size (KB) are kept with each history entry; 0 keeps none.</summary>
+    public int HistoryResponseKb { get; set; } = 256;
+
     public WorkspaceSettings Clone() => (WorkspaceSettings)MemberwiseClone();
 }
 
