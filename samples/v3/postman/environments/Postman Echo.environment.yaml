@@ -1,0 +1,12 @@
+name: Postman Echo
+values:
+  - key: baseUrl
+    value: https://postman-echo.com
+    enabled: true
+  - key: token
+    value: env-token-123
+    enabled: true
+    type: secret
+  - key: unused
+    value: disabled values are ignored
+    enabled: false

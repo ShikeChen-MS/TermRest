@@ -8,12 +8,15 @@ This folder is a ready-to-use TermRest workspace:
 | `Postman Echo.postman_environment.json` | Sets `{{baseUrl}}` and `{{token}}` |
 | `.termrest/settings.json` | Selects the *Postman Echo* environment |
 | `.termrest/certificates.json` | Binds the badssl.com client certificate to `https://client.badssl.com/*` |
+| `v3/` | The same collection and environment as a Postman v3 (YAML) workspace: `postman/collections/TermRest Demo/` and `postman/environments/` |
 
-Both JSON files are ordinary Postman exports, so you can import them into Postman unchanged.
+The JSON files are ordinary Postman exports, so you can import them into Postman unchanged. `v3/` was created with `termrest convert` and is laid out the way Postman v12 stores a workspace in Git.
 
 ```sh
 termrest samples                     # open the UI
+termrest samples/v3                  # the v3 (YAML) version
 termrest run "samples/TermRest Demo.postman_collection.json" -e "Postman Echo"
+termrest run "samples/v3/postman/collections/TermRest Demo" -e "Postman Echo"
 ```
 
 ## Trying mutual TLS with badssl.com
@@ -29,4 +32,4 @@ termrest certs list samples                       # ✓ CN=BadSSL Client Certifi
 termrest send "samples/TermRest Demo.postman_collection.json" "badssl.com client certificate" -v
 ```
 
-With the certificate the response is `200 OK`, and the TLS details report "Client cert asked: yes" and "Client cert sent: CN=BadSSL Client Certificate". Without it, the server answers `400 No required SSL certificate was sent`. `samples/certs/` is git-ignored.
+With the certificate the response is `200 OK`, and the TLS details report "Client cert asked: yes" and "Client cert sent: CN=BadSSL Client Certificate". Without it, the server answers `400 No required SSL certificate was sent`. `samples/certs/` is git-ignored; the `v3/` workspace's registry uses the same file (`../certs/`).

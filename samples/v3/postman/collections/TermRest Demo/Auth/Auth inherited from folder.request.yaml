@@ -1,0 +1,5 @@
+$kind: http-request
+description: "No auth on the request: the folder's bearer token ({{token}}) is inherited."
+url: "{{baseUrl}}/headers"
+method: GET
+order: 2000

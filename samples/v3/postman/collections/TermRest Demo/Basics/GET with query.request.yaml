@@ -1,0 +1,15 @@
+$kind: http-request
+url: "{{baseUrl}}/get?foo=bar&source=termrest"
+method: GET
+headers:
+  Accept: application/json
+queryParams:
+  - key: foo
+    value: bar
+  - key: source
+    value: termrest
+  - key: debug
+    value: "1"
+    description: Disabled parameters are kept but not sent
+    disabled: true
+order: 1000

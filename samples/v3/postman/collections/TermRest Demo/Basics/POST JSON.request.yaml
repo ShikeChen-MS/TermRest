@@ -1,0 +1,12 @@
+$kind: http-request
+url: "{{baseUrl}}/post"
+method: POST
+body:
+  type: json
+  content: |-
+    {
+        "id": "{{$guid}}",
+        "name": "Ada Lovelace",
+        "sentAt": "{{$isoTimestamp}}"
+    }
+order: 2000

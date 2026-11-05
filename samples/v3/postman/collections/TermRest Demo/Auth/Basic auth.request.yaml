@@ -1,0 +1,9 @@
+$kind: http-request
+url: "{{baseUrl}}/basic-auth"
+method: GET
+auth:
+  type: basic
+  credentials:
+    password: password
+    username: postman
+order: 1000

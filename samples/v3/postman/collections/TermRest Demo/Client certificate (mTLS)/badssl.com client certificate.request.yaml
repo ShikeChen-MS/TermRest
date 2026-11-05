@@ -1,0 +1,5 @@
+$kind: http-request
+description: Requires the badssl.com client certificate. See samples/README.md; the workspace registry (.termrest/certificates.json) maps it to this host.
+url: https://client.badssl.com/
+method: GET
+order: 1000

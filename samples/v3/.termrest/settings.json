@@ -1,0 +1,9 @@
+{
+  "activeEnvironment": "Postman Echo",
+  "strictSsl": true,
+  "timeoutMs": 30000,
+  "followRedirects": true,
+  "maxRedirects": 10,
+  "maxResponseSizeMb": 50,
+  "httpVersion": "1.1"
+}

@@ -1,0 +1,11 @@
+$kind: http-request
+url: "{{baseUrl}}/post"
+method: POST
+body:
+  type: urlencoded
+  content:
+    - key: user
+      value: ada
+    - key: role
+      value: admin & owner
+order: 3000

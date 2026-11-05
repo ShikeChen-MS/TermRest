@@ -1,0 +1,8 @@
+$kind: http-request
+url: "{{baseUrl}}/status/:code"
+method: GET
+pathVariables:
+  - key: code
+    value: "418"
+    description: Any HTTP status code
+order: 4000

@@ -1,0 +1,5 @@
+$kind: collection
+description: Sample requests against Postman Echo (https://postman-echo.com). Select the 'Postman Echo' environment to set {{baseUrl}}.
+variables:
+  - key: token
+    value: collection-token
