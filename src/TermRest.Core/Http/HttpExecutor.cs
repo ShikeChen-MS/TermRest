@@ -320,7 +320,7 @@ public sealed class HttpExecutor
         private ClientCertificateSelection? _presented;
         private bool _presentedViaContext;
 
-        public X509Certificate? SelectClientCertificate(ClientCertificateSelection? selection, X509Certificate? remoteCertificate, string[] acceptableIssuers)
+        public X509Certificate2? SelectClientCertificate(ClientCertificateSelection? selection, X509Certificate? remoteCertificate, string[] acceptableIssuers)
         {
             // The platform calls this once before the handshake (no remote certificate yet) and again when the
             // server actually requests a client certificate.

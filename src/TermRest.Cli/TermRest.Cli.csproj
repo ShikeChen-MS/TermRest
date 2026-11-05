@@ -22,4 +22,14 @@
     <ProjectReference Include="..\TermRest.Tui\TermRest.Tui.csproj" />
   </ItemGroup>
 
+  <!--
+    Terminal.Gui depends on TextMateSharp, whose native Oniguruma library is only loaded by the syntax-highlighting
+    Code/Markdown views. TermRest does not use them, so keep the published app a single executable.
+  -->
+  <Target Name="RemoveUnusedNativeLibraries" AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="'%(Filename)' == 'libonigwrap' or '%(Filename)' == 'onigwrap'" />
+    </ItemGroup>
+  </Target>
+
 </Project>

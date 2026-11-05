@@ -50,7 +50,7 @@ internal static class Ui
         }
 
         app.Run(dialog);
-        return dialog.Canceled ? null : dialog.FilePaths.FirstOrDefault();
+        return dialog.Canceled || dialog.FilePaths.Count == 0 ? null : dialog.FilePaths[0];
     }
 
     /// <summary>Shows a save-file picker. Returns the chosen path or null.</summary>

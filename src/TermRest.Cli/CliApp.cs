@@ -38,7 +38,35 @@ internal static class CliApp
         root.Subcommands.Add(RunCommand.Create(insecure));
         root.Subcommands.Add(ValidateCommand.Create());
         root.Subcommands.Add(CertsCommand.Create());
+        root.Subcommands.Add(CreateSnapshotCommand());
 
         return await root.Parse(args).InvokeAsync();
+    }
+
+    private static Command CreateSnapshotCommand()
+    {
+        var command = new Command("snapshot", "Render the UI once without a terminal and print it (smoke test for builds and CI).");
+        var workspace = new Argument<string?>("workspace") { Description = "Workspace folder or collection file", Arity = ArgumentArity.ZeroOrOne };
+        var width = new Option<int>("--width") { Description = "Screen width in columns", DefaultValueFactory = _ => 120 };
+        var height = new Option<int>("--height") { Description = "Screen height in rows", DefaultValueFactory = _ => 36 };
+        var request = new Option<string?>("--request") { Description = "Open this request (path or unique name) before rendering" };
+        var send = new Option<bool>("--send") { Description = "Send the request and render the response too" };
+        command.Arguments.Add(workspace);
+        command.Options.Add(width);
+        command.Options.Add(height);
+        command.Options.Add(request);
+        command.Options.Add(send);
+        command.SetAction(parseResult =>
+        {
+            var screen = TuiApp.Snapshot(
+                parseResult.GetValue(workspace) ?? Environment.CurrentDirectory,
+                parseResult.GetValue(width),
+                parseResult.GetValue(height),
+                parseResult.GetValue(request),
+                parseResult.GetValue(send));
+            Console.Out.WriteLine(screen.TrimEnd());
+            return 0;
+        });
+        return command;
     }
 }

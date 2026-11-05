@@ -151,6 +151,21 @@ internal sealed class MainWindow : Runnable
 
     internal string StatusMessage => _message.Title;
 
+    /// <summary>Selects and opens a request (used by snapshots and tests).</summary>
+    internal void ShowRequest(RequestNode node)
+    {
+        _tree.Select(node);
+        OpenRequest(node);
+    }
+
+    /// <summary>Sends the current request and shows the result without an event loop (used by snapshots).</summary>
+    internal async Task SendAndShowAsync(CancellationToken cancellationToken = default)
+    {
+        var prepared = _runner.Prepare(_collection ?? (_scratch ??= PostmanCollection.Create("Scratch")), _node, _editor.Spec);
+        var exchange = await _runner.SendAsync(prepared, cancellationToken).ConfigureAwait(false);
+        _response.ShowExchange(exchange);
+    }
+
     // ----- menu ------------------------------------------------------------------------------
 
     private MenuBar BuildMenu() => new(

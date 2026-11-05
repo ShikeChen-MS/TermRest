@@ -28,7 +28,7 @@ internal sealed class CollectionTree : View
             Y = 0,
             Width = Dim.Fill(),
             Height = Dim.Fill(),
-            TreeBuilder = new DelegateTreeBuilder<object>(GetChildren, CanExpand),
+            TreeBuilder = new DelegateTreeBuilder<object>(item => GetChildren(item), CanExpand),
             AspectGetter = Describe,
         };
         _tree.SelectionChanged += (_, e) => SelectionChanged?.Invoke(this, e.NewValue);
@@ -150,7 +150,8 @@ internal sealed class CollectionTree : View
 
     public new bool SetFocus() => _tree.SetFocus();
 
-    private IEnumerable<object> GetChildren(object item) => item switch
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1859", Justification = "Tree-builder delegate returns mixed node types.")]
+    private static IEnumerable<object> GetChildren(object item) => item switch
     {
         PostmanCollection collection => collection.RootNode.Children,
         FolderNode folder => folder.Children,
