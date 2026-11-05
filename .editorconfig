@@ -1,0 +1,59 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml,props,targets,csproj,slnx,xml}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+# Postman exports use tab indentation; keep samples byte-identical to Postman output.
+[samples/**.json]
+indent_style = tab
+insert_final_newline = false
+
+[*.cs]
+csharp_style_namespace_declarations = file_scoped:warning
+csharp_using_directive_placement = outside_namespace:warning
+dotnet_sort_system_directives_first = true
+csharp_style_var_for_built_in_types = true:silent
+csharp_style_var_when_type_is_apparent = true:silent
+csharp_style_var_elsewhere = true:silent
+csharp_prefer_braces = when_multiline:silent
+dotnet_style_qualification_for_field = false:silent
+
+# Private fields: _camelCase
+dotnet_naming_rule.private_fields_underscore.symbols = private_fields
+dotnet_naming_rule.private_fields_underscore.style = underscore_camel
+dotnet_naming_rule.private_fields_underscore.severity = suggestion
+dotnet_naming_symbols.private_fields.applicable_kinds = field
+dotnet_naming_symbols.private_fields.applicable_accessibilities = private
+dotnet_naming_style.underscore_camel.required_prefix = _
+dotnet_naming_style.underscore_camel.capitalization = camel_case
+
+# Allowed for a CLI/TUI app
+dotnet_diagnostic.CA1031.severity = none   # catch general exceptions (UI must not crash)
+dotnet_diagnostic.CA1062.severity = none   # nullable reference types cover this
+dotnet_diagnostic.CA1305.severity = suggestion
+dotnet_diagnostic.CA1307.severity = suggestion
+dotnet_diagnostic.CA1310.severity = suggestion
+dotnet_diagnostic.CA1002.severity = none   # List<T> in public API is fine for app models
+dotnet_diagnostic.CA2227.severity = none   # settable collections in DTOs
+dotnet_diagnostic.CA1054.severity = none   # URLs are strings with {{variables}}
+dotnet_diagnostic.CA1055.severity = none
+dotnet_diagnostic.CA1056.severity = none
+dotnet_diagnostic.CA2234.severity = none
+
+[tests/**.cs]
+dotnet_diagnostic.CA1707.severity = none   # underscores in test names
+dotnet_diagnostic.CA2007.severity = none
+
+[src/**.cs]
+dotnet_diagnostic.CA1711.severity = none   # PostmanCollection is the domain name

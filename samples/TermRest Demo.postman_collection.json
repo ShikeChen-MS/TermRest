@@ -1,0 +1,235 @@
+{
+	"info": {
+		"_postman_id": "6d1a1f4e-8a2b-4c43-9f7e-2c1b5f0e9a11",
+		"name": "TermRest Demo",
+		"description": "Sample requests against Postman Echo (https://postman-echo.com). Select the 'Postman Echo' environment to set {{baseUrl}}.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Basics",
+			"item": [
+				{
+					"name": "GET with query",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/get?foo=bar&source=termrest",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"get"
+							],
+							"query": [
+								{
+									"key": "foo",
+									"value": "bar"
+								},
+								{
+									"key": "source",
+									"value": "termrest"
+								},
+								{
+									"key": "debug",
+									"value": "1",
+									"description": "Disabled parameters are kept but not sent",
+									"disabled": true
+								}
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "POST JSON",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"id\": \"{{$guid}}\",\n    \"name\": \"Ada Lovelace\",\n    \"sentAt\": \"{{$isoTimestamp}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/post",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"post"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Form URL-encoded",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{
+									"key": "user",
+									"value": "ada",
+									"type": "text"
+								},
+								{
+									"key": "role",
+									"value": "admin & owner",
+									"type": "text"
+								}
+							]
+						},
+						"url": {
+							"raw": "{{baseUrl}}/post",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"post"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Status by path variable",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/status/:code",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"status",
+								":code"
+							],
+							"variable": [
+								{
+									"key": "code",
+									"value": "418",
+									"description": "Any HTTP status code"
+								}
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Auth",
+			"item": [
+				{
+					"name": "Basic auth",
+					"request": {
+						"auth": {
+							"type": "basic",
+							"basic": [
+								{
+									"key": "password",
+									"value": "password",
+									"type": "string"
+								},
+								{
+									"key": "username",
+									"value": "postman",
+									"type": "string"
+								}
+							]
+						},
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/basic-auth",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"basic-auth"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Bearer inherited from folder",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/headers",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"headers"
+							]
+						},
+						"description": "No auth on the request: the folder's bearer token ({{token}}) is inherited."
+					},
+					"response": []
+				}
+			],
+			"auth": {
+				"type": "bearer",
+				"bearer": [
+					{
+						"key": "token",
+						"value": "{{token}}",
+						"type": "string"
+					}
+				]
+			}
+		},
+		{
+			"name": "Client certificate (mTLS)",
+			"item": [
+				{
+					"name": "badssl.com client certificate",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "https://client.badssl.com/",
+							"protocol": "https",
+							"host": [
+								"client",
+								"badssl",
+								"com"
+							],
+							"path": [
+								""
+							]
+						},
+						"description": "Requires the badssl.com client certificate. See samples/README.md; the workspace registry (.termrest/certificates.json) maps it to this host."
+					},
+					"response": []
+				}
+			]
+		}
+	],
+	"variable": [
+		{
+			"key": "token",
+			"value": "collection-token",
+			"type": "string"
+		}
+	]
+}

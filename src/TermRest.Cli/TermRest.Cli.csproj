@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>termrest</AssemblyName>
+    <RootNamespace>TermRest.Cli</RootNamespace>
+    <!-- Native AOT single-file executable per RID: dotnet publish -r win-x64 -c Release -->
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>false</UseSystemResourceKeys>
+    <StripSymbols>true</StripSymbols>
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TermRest.Core\TermRest.Core.csproj" />
+    <ProjectReference Include="..\TermRest.Tui\TermRest.Tui.csproj" />
+  </ItemGroup>
+
+</Project>

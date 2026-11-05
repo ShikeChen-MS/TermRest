@@ -1,0 +1,19 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <Deterministic>true</Deterministic>
+    <Version>0.1.0</Version>
+    <Product>TermRest</Product>
+    <Description>A lightweight, mouse-friendly terminal REST client with Postman-compatible collections.</Description>
+    <NeutralLanguage>en</NeutralLanguage>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Collections and sources use LF; keep build output deterministic across OSes. -->
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <!-- CA1303 (localization) and CA1848 (LoggerMessage) are noise for a CLI tool. -->
+    <NoWarn>$(NoWarn);CA1303;CA1848</NoWarn>
+  </PropertyGroup>
+</Project>

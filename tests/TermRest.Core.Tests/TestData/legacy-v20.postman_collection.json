@@ -1,0 +1,37 @@
+{
+	"variables": [],
+	"info": {
+		"name": "Legacy v2.0",
+		"_postman_id": "9b1c0d2e-1111-2222-3333-444444444444",
+		"description": "",
+		"schema": "https://schema.getpostman.com/json/collection/v2.0.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Basic v2.0",
+			"request": {
+				"auth": {
+					"type": "basic",
+					"basic": {
+						"username": "ada",
+						"password": "secret",
+						"saveHelperData": true,
+						"showPassword": false
+					}
+				},
+				"url": "https://example.com/basic",
+				"method": "GET",
+				"header": [
+					{
+						"key": "Accept",
+						"value": "*/*",
+						"description": ""
+					}
+				],
+				"body": {},
+				"description": ""
+			},
+			"response": []
+		}
+	]
+}

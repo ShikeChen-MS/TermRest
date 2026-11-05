@@ -1,0 +1,410 @@
+{
+	"info": {
+		"_postman_id": "11111111-2222-3333-4444-555555555555",
+		"name": "Complex – ünïcödé ✓ 😀",
+		"description": {
+			"content": "Markdown **description** with <html> & 'quotes' + plus",
+			"type": "text/markdown"
+		},
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "1234567",
+		"_collection_link": "https://example.postman.co/collection/1234567"
+	},
+	"item": [
+		{
+			"name": "Folder A",
+			"description": "folder description",
+			"item": [
+				{
+					"name": "Nested folder",
+					"item": [
+						{
+							"name": "Deep request",
+							"event": [
+								{
+									"listen": "prerequest",
+									"script": {
+										"id": "aaaaaaaa-0000-0000-0000-000000000001",
+										"exec": [
+											"pm.variables.set('x', 1);",
+											"// comment with \"quotes\" and \\backslash"
+										],
+										"type": "text/javascript",
+										"packages": {}
+									}
+								},
+								{
+									"listen": "test",
+									"script": {
+										"exec": [
+											"pm.test(\"Status code is 200\", function () {",
+											"    pm.response.to.have.status(200);",
+											"});"
+										],
+										"type": "text/javascript",
+										"packages": {}
+									}
+								}
+							],
+							"protocolProfileBehavior": {
+								"disableBodyPruning": true,
+								"strictSSL": false,
+								"followRedirects": false
+							},
+							"request": {
+								"method": "PATCH",
+								"header": [
+									{
+										"key": "X-Disabled",
+										"value": "nope",
+										"type": "text",
+										"disabled": true
+									},
+									{
+										"key": "X-Desc",
+										"value": "{{token}}",
+										"description": "a header with a description",
+										"type": "text"
+									},
+									{
+										"key": "X-Unknown-Props",
+										"value": "1",
+										"type": "text",
+										"x-custom": {
+											"keep": [
+												"me",
+												1,
+												true,
+												null
+											]
+										}
+									}
+								],
+								"body": {
+									"mode": "formdata",
+									"formdata": [
+										{
+											"key": "text",
+											"value": "hello\tworld\u001b",
+											"type": "text"
+										},
+										{
+											"key": "single",
+											"type": "file",
+											"src": "files/a.txt"
+										},
+										{
+											"key": "multi",
+											"type": "file",
+											"src": [
+												"files/a.txt",
+												"files/b.bin"
+											]
+										},
+										{
+											"key": "json part",
+											"value": "{\"a\":1}",
+											"contentType": "application/json",
+											"type": "text",
+											"disabled": true
+										}
+									]
+								},
+								"url": {
+									"raw": "https://user:pw@api.example.com:8443/v1/:tenant/items/{{itemId}}/?flag&empty=&enc=%20a%2Fb#frag",
+									"protocol": "https",
+									"auth": {
+										"user": "user",
+										"password": "pw"
+									},
+									"host": [
+										"api",
+										"example",
+										"com"
+									],
+									"port": "8443",
+									"path": [
+										"v1",
+										":tenant",
+										"items",
+										"{{itemId}}",
+										""
+									],
+									"query": [
+										{
+											"key": "flag",
+											"value": null
+										},
+										{
+											"key": "empty",
+											"value": ""
+										},
+										{
+											"key": "enc",
+											"value": "%20a%2Fb"
+										},
+										{
+											"key": "off",
+											"value": "1",
+											"disabled": true
+										}
+									],
+									"hash": "frag",
+									"variable": [
+										{
+											"key": "tenant",
+											"value": "contoso",
+											"description": {
+												"content": "tenant id",
+												"type": "text/plain"
+											}
+										}
+									]
+								},
+								"description": "Request description"
+							},
+							"response": [
+								{
+									"name": "Saved example",
+									"originalRequest": {
+										"method": "PATCH",
+										"header": [],
+										"url": {
+											"raw": "https://api.example.com/v1/x",
+											"protocol": "https",
+											"host": [
+												"api",
+												"example",
+												"com"
+											],
+											"path": [
+												"v1",
+												"x"
+											]
+										}
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "json",
+									"header": [
+										{
+											"key": "Content-Type",
+											"value": "application/json"
+										}
+									],
+									"cookie": [],
+									"body": "{\n  \"ok\": true,\n  \"n\": 12345678901234567890\n}"
+								}
+							]
+						}
+					]
+				},
+				{
+					"name": "GraphQL",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "graphql",
+							"graphql": {
+								"query": "query { viewer { login } }",
+								"variables": "{\"first\": 10}"
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/graphql",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"graphql"
+							]
+						}
+					},
+					"response": []
+				}
+			],
+			"auth": {
+				"type": "apikey",
+				"apikey": [
+					{
+						"key": "value",
+						"value": "{{apiKey}}",
+						"type": "string"
+					},
+					{
+						"key": "key",
+						"value": "X-API-Key",
+						"type": "string"
+					},
+					{
+						"key": "in",
+						"value": "header",
+						"type": "string"
+					}
+				]
+			},
+			"event": [
+				{
+					"listen": "prerequest",
+					"script": {
+						"type": "text/javascript",
+						"exec": [
+							""
+						]
+					}
+				}
+			]
+		},
+		{
+			"name": "Short form url",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": "https://example.com/plain?x=1"
+			},
+			"response": []
+		},
+		{
+			"name": "String request",
+			"request": "https://example.com/string-request"
+		},
+		{
+			"name": "OAuth2 with token",
+			"request": {
+				"auth": {
+					"type": "oauth2",
+					"oauth2": [
+						{
+							"key": "accessToken",
+							"value": "abc.def.ghi",
+							"type": "string"
+						},
+						{
+							"key": "addTokenTo",
+							"value": "header",
+							"type": "string"
+						},
+						{
+							"key": "useBrowser",
+							"value": false,
+							"type": "boolean"
+						},
+						{
+							"key": "tokenOptions",
+							"value": {
+								"scope": "read"
+							},
+							"type": "any"
+						}
+					]
+				},
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "https://example.com/oauth",
+					"protocol": "https",
+					"host": [
+						"example",
+						"com"
+					],
+					"path": [
+						"oauth"
+					]
+				},
+				"certificate": {
+					"name": "pinned",
+					"matches": [
+						"https://example.com/*"
+					],
+					"key": {
+						"src": "certs/client.key"
+					},
+					"cert": {
+						"src": "certs/client.pem"
+					},
+					"passphrase": "{{keyPass}}"
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Binary file body",
+			"request": {
+				"method": "PUT",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/octet-stream"
+					}
+				],
+				"body": {
+					"mode": "file",
+					"file": {
+						"src": "files/b.bin"
+					}
+				},
+				"url": {
+					"raw": "https://example.com/upload",
+					"protocol": "https",
+					"host": [
+						"example",
+						"com"
+					],
+					"path": [
+						"upload"
+					]
+				}
+			},
+			"response": []
+		}
+	],
+	"auth": {
+		"type": "bearer",
+		"bearer": [
+			{
+				"key": "token",
+				"value": "{{token}}",
+				"type": "string"
+			}
+		]
+	},
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "https://api.example.com",
+			"type": "string"
+		},
+		{
+			"key": "number",
+			"value": 42
+		},
+		{
+			"key": "flag",
+			"value": true,
+			"type": "boolean"
+		}
+	]
+}
