@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Build
+        run: dotnet build TermRest.slnx -c Release
+      - name: Test
+        run: dotnet test -c Release --no-build
+
+  publish:
+    name: Native AOT (${{ matrix.rid }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { rid: win-x64, os: windows-latest, run: true }
+          - { rid: win-arm64, os: windows-11-arm, run: true }
+          - { rid: linux-x64, os: ubuntu-24.04, run: true }
+          - { rid: linux-arm64, os: ubuntu-24.04-arm, run: true }
+          - { rid: osx-arm64, os: macos-15, run: true }
+          # Cross-architecture build on Apple silicon (Xcode ships both toolchains); not executed on the runner.
+          - { rid: osx-x64, os: macos-15, run: false }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Install native toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+      - name: Publish (Native AOT)
+        run: dotnet publish src/TermRest.Cli/TermRest.Cli.csproj -c Release -r ${{ matrix.rid }} -o out
+      - name: Smoke test
+        if: matrix.run
+        shell: bash
+        run: |
+          exe=./out/termrest; [ -f ./out/termrest.exe ] && exe=./out/termrest.exe
+          "$exe" --version
+          "$exe" validate "samples/TermRest Demo.postman_collection.json" "samples/Postman Echo.postman_environment.json"
+          "$exe" snapshot samples --width 110 --height 30
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp out/termrest* dist/ 2>/dev/null || true
+          rm -rf dist/*.pdb dist/*.dbg dist/*.dSYM
+          cp README.md dist/
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termrest-${{ matrix.rid }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Archive binaries
+        run: |
+          mkdir -p release
+          for dir in artifacts/termrest-*; do
+            rid="${dir#artifacts/termrest-}"
+            chmod +x "$dir"/termrest 2>/dev/null || true
+            tar -czf "release/termrest-${GITHUB_REF_NAME}-${rid}.tar.gz" -C "$dir" .
+          done
+          (cd release && sha256sum * > SHA256SUMS.txt)
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --title "TermRest $GITHUB_REF_NAME" --generate-notes

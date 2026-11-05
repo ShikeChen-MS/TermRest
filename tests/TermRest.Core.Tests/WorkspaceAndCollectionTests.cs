@@ -42,7 +42,7 @@ public class WorkspaceAndCollectionTests
         workspace.ActiveEnvironment = workspace.Environments[0];
         using var runner = new RequestRunner(workspace);
         var collection = workspace.Collections[0];
-        var node = collection.FindRequest("Auth/Bearer inherited from folder")!;
+        var node = collection.FindRequest("Auth/Auth inherited from folder")!;
 
         var prepared = runner.Prepare(collection, node, node.ReadSpec());
 

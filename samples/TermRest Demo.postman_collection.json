@@ -169,7 +169,7 @@
 					"response": []
 				},
 				{
-					"name": "Bearer inherited from folder",
+					"name": "Auth inherited from folder",
 					"request": {
 						"method": "GET",
 						"header": [],

@@ -1,0 +1,12 @@
+[
+  {
+    "name": "badssl.com client",
+    "matches": [
+      "https://client.badssl.com/*"
+    ],
+    "pfx": {
+      "src": "certs/badssl.com-client.p12"
+    },
+    "passphrase": "env:BADSSL_PFX_PASSPHRASE"
+  }
+]

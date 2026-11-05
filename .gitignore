@@ -480,3 +480,7 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# TermRest: downloaded sample certificates and local UI scratch files
+samples/certs/
+
