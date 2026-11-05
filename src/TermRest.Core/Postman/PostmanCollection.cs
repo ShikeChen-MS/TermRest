@@ -2,17 +2,21 @@ using System.Text.Json.Nodes;
 using TermRest.Core.IO;
 using TermRest.Core.Json;
 using TermRest.Core.Model;
+using TermRest.Core.Postman.V3;
 
 namespace TermRest.Core.Postman;
 
 /// <summary>
-/// A Postman collection (v2.1, with v2.0 read support) backed by its JSON DOM. All edits are made in place on the
-/// DOM so that anything TermRest does not understand is written back untouched.
+/// A Postman collection backed by its v2.1 JSON DOM: a v2.1/v2.0 JSON file, or a collection format v3 folder of YAML
+/// files (converted to the same model, see <see cref="V3CollectionStorage"/>). All edits are made in place on the DOM
+/// so that anything TermRest does not understand is written back untouched.
 /// </summary>
 public sealed class PostmanCollection
 {
     public const string SchemaV21 = "https://schema.getpostman.com/json/collection/v2.1.0/collection.json";
     public const string FileSuffix = ".postman_collection.json";
+
+    private ICollectionStorage? _storage;
 
     private PostmanCollection(JsonObject root, string? filePath, TextFileInfo fileInfo)
     {
@@ -27,11 +31,21 @@ public sealed class PostmanCollection
 
     public JsonObject Root { get; }
 
+    /// <summary>The collection file, or for a v3 collection its folder.</summary>
     public string? FilePath { get; set; }
 
     public TextFileInfo FileInfo { get; }
 
     public PostmanSchemaVersion SchemaVersion { get; }
+
+    /// <summary>True for a collection format v3 folder of YAML files.</summary>
+    public bool IsV3 => _storage is V3CollectionStorage;
+
+    /// <summary>Human-readable file format, e.g. "Postman v2.1 JSON".</summary>
+    public string FormatName => IsV3 ? "Postman v3 YAML" : SchemaVersion == PostmanSchemaVersion.V20 ? "Postman v2.0 JSON" : "Postman v2.1 JSON";
+
+    /// <summary>Problems found while loading (files that could not be read, items that are not shown).</summary>
+    public List<string> LoadWarnings { get; } = [];
 
     public CollectionRootNode RootNode { get; }
 
@@ -46,14 +60,21 @@ public sealed class PostmanCollection
     }
 
     /// <summary>Directory used to resolve relative file paths (body files, certificates).</summary>
-    public string BaseDirectory => FilePath is null ? Environment.CurrentDirectory : Path.GetDirectoryName(Path.GetFullPath(FilePath))!;
+    public string BaseDirectory => _storage?.BaseDirectory
+                                   ?? (FilePath is null ? Environment.CurrentDirectory : Path.GetDirectoryName(Path.GetFullPath(FilePath))!);
 
     public bool IsDirty { get; private set; }
 
     public event EventHandler? DirtyChanged;
 
+    /// <summary>Loads a v2.0/v2.1 JSON collection file, or a collection format v3 folder.</summary>
     public static PostmanCollection Load(string path)
     {
+        if (Directory.Exists(path))
+        {
+            return V3CollectionStorage.Load(path);
+        }
+
         var (text, info) = TextFile.Read(path);
         try
         {
@@ -64,6 +85,9 @@ public sealed class PostmanCollection
             throw new InvalidDataException($"'{path}' is not a valid Postman collection: {ex.Message}", ex);
         }
     }
+
+    internal static PostmanCollection FromStorage(JsonObject root, string path, ICollectionStorage storage) =>
+        new(root, path, TextFileInfo.PostmanDefault) { _storage = storage };
 
     public static PostmanCollection Parse(string json, string? filePath = null, TextFileInfo? info = null)
     {
@@ -94,8 +118,65 @@ public sealed class PostmanCollection
 
     public string Serialize() => PostmanJson.Serialize(Root);
 
+    /// <summary>
+    /// For a v3 collection: files TermRest could not edit without changing details (empty when every file is fully
+    /// supported). JSON collections are checked by comparing <see cref="Serialize"/> with the file.
+    /// </summary>
+    public IReadOnlyList<string> Verify() => _storage is V3CollectionStorage v3 ? v3.Verify() : [];
+
+    /// <summary>Writes this collection (any format) as a new Postman v3 YAML collection folder and returns it.</summary>
+    public PostmanCollection ConvertToV3(string directory) => V3CollectionStorage.ConvertFrom(this, directory);
+
+    /// <summary>The collection as a Postman v2.1 JSON document (for any source format).</summary>
+    public string ExportV21Json()
+    {
+        var copy = (JsonObject)Root.DeepClone();
+        if (copy["info"] is JsonObject info)
+        {
+            info.SetOrdered("_postman_id", info["_postman_id"]?.DeepClone() ?? Guid.NewGuid().ToString(), ["_postman_id", "name", "description", "schema"]);
+            info["schema"] = SchemaV21;
+        }
+
+        RemoveV3Markers(copy);
+        return PostmanJson.Serialize(copy);
+
+        static void RemoveV3Markers(JsonNode? node)
+        {
+            switch (node)
+            {
+                case JsonObject obj:
+                    obj.Remove("x-v3-type");
+                    foreach (var (_, value) in obj)
+                    {
+                        RemoveV3Markers(value);
+                    }
+
+                    break;
+                case JsonArray array:
+                    foreach (var value in array)
+                    {
+                        RemoveV3Markers(value);
+                    }
+
+                    break;
+            }
+        }
+    }
+
     public void Save(string? path = null)
     {
+        if (_storage is not null)
+        {
+            if (path is not null && !string.Equals(Path.GetFullPath(path), FilePath, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new NotSupportedException("A v3 collection folder is saved in place; use 'termrest convert' to write another format.");
+            }
+
+            _storage.Save(this);
+            SetDirty(false);
+            return;
+        }
+
         path ??= FilePath ?? throw new InvalidOperationException("The collection has no file path yet.");
         TextFile.WriteAtomic(path, Serialize(), FileInfo);
         FilePath = path;
@@ -127,26 +208,41 @@ public sealed class PostmanCollection
 
     public IEnumerable<RequestNode> AllRequests() => Descendants().OfType<RequestNode>();
 
-    /// <summary>Finds a request by path (<c>Folder/Sub/Name</c>) or, failing that, by unique name.</summary>
+    /// <summary>
+    /// Finds a request by path (<c>Folder/Sub/Name</c>) or, failing that, by unique name. Names may contain slashes
+    /// (Postman allows <c>/users/:id</c>), so the exact text is tried before surrounding slashes are ignored.
+    /// </summary>
     public RequestNode? FindRequest(string pathOrName)
     {
-        var trimmed = pathOrName.Trim('/');
-        var byPath = AllRequests().FirstOrDefault(r => string.Equals(r.PathInCollection, trimmed, StringComparison.OrdinalIgnoreCase));
-        if (byPath is not null)
+        var requests = AllRequests().ToList();
+        string[] candidates = [pathOrName, pathOrName.Trim('/')];
+        foreach (var candidate in candidates)
         {
-            return byPath;
+            if (requests.FirstOrDefault(r => string.Equals(r.PathInCollection, candidate, StringComparison.OrdinalIgnoreCase)) is { } byPath)
+            {
+                return byPath;
+            }
         }
 
-        var byName = AllRequests().Where(r => string.Equals(r.Name, trimmed, StringComparison.OrdinalIgnoreCase)).ToList();
-        return byName.Count == 1 ? byName[0] : null;
+        foreach (var candidate in candidates)
+        {
+            var byName = requests.Where(r => string.Equals(r.Name, candidate, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (byName.Count > 0)
+            {
+                return byName.Count == 1 ? byName[0] : null;
+            }
+        }
+
+        return null;
     }
 
     public FolderNode? FindFolder(string path)
     {
-        var trimmed = path.Trim('/');
-        return trimmed.Length == 0
-            ? RootNode
-            : Descendants().OfType<FolderNode>().FirstOrDefault(f => string.Equals(f.PathInCollection, trimmed, StringComparison.OrdinalIgnoreCase));
+        var folders = Descendants().OfType<FolderNode>().ToList();
+        return folders.FirstOrDefault(f => string.Equals(f.PathInCollection, path, StringComparison.OrdinalIgnoreCase))
+               ?? (path.Trim('/') is { Length: > 0 } trimmed
+                   ? folders.FirstOrDefault(f => string.Equals(f.PathInCollection, trimmed, StringComparison.OrdinalIgnoreCase))
+                   : RootNode);
     }
 
     /// <summary>Resolves "inherit" by walking up folders to the collection.</summary>

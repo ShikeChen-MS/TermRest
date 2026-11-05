@@ -7,6 +7,8 @@
     <PackageVersion Include="Terminal.Gui" Version="2.5.0" />
     <!-- CLI -->
     <PackageVersion Include="System.CommandLine" Version="2.0.14" />
+    <!-- Postman collection format v3 (YAML); only the parser is used, which is reflection-free -->
+    <PackageVersion Include="YamlDotNet" Version="18.1.0" />
     <!-- Tests -->
     <PackageVersion Include="xunit.v3" Version="4.0.2" />
   </ItemGroup>

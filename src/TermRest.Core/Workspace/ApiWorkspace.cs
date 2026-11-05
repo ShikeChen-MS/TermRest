@@ -2,6 +2,7 @@ using System.Text.Json;
 using TermRest.Core.Certificates;
 using TermRest.Core.IO;
 using TermRest.Core.Postman;
+using TermRest.Core.Postman.V3;
 
 namespace TermRest.Core.Workspace;
 
@@ -52,12 +53,17 @@ public sealed class ApiWorkspace
     public bool HasUnsavedChanges =>
         Collections.Any(c => c.IsDirty) || Environments.Any(e => e.IsDirty) || Globals?.IsDirty == true;
 
-    /// <summary>Opens a workspace folder, or the folder containing a collection file.</summary>
+    /// <summary>
+    /// Opens a workspace folder, the folder containing a collection file, or (for a v3 collection folder) the
+    /// workspace that holds it. Postman v3 projects are found under <c>postman/collections</c>,
+    /// <c>postman/environments</c> and <c>postman/globals</c>.
+    /// </summary>
     public static ApiWorkspace Open(string path)
     {
-        var fullPath = Path.GetFullPath(path);
+        var fullPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
         string root;
         string? explicitFile = null;
+        string? explicitFolder = null;
         if (File.Exists(fullPath))
         {
             root = Path.GetDirectoryName(fullPath)!;
@@ -66,6 +72,12 @@ public sealed class ApiWorkspace
         else if (Directory.Exists(fullPath))
         {
             root = fullPath;
+            if (!Directory.Exists(Path.Combine(fullPath, PostmanFolder)) && V3Names.IsCollectionDirectory(fullPath))
+            {
+                // A v3 collection folder: open the workspace around it (its settings, environments, certificates).
+                explicitFolder = fullPath;
+                root = V3Names.WorkspaceRootFor(fullPath);
+            }
         }
         else
         {
@@ -89,26 +101,43 @@ public sealed class ApiWorkspace
         var workspace = new ApiWorkspace(root, settings, certificates);
         workspace.LoadErrors.AddRange(errors);
 
-        var collectionFiles = Directory.EnumerateFiles(root, "*" + PostmanCollection.FileSuffix).ToList();
+        var collectionsFolder = Path.Combine(root, PostmanFolder, "collections");
+        var collectionFiles = Directory.EnumerateFiles(root, "*" + PostmanCollection.FileSuffix)
+            .Concat(EnumerateFiles(collectionsFolder, "*" + PostmanCollection.FileSuffix))
+            .ToList();
         if (explicitFile is not null && !collectionFiles.Contains(explicitFile, StringComparer.OrdinalIgnoreCase)
-            && !explicitFile.EndsWith(PostmanEnvironment.EnvironmentSuffix, StringComparison.OrdinalIgnoreCase))
+            && !explicitFile.EndsWith(PostmanEnvironment.EnvironmentSuffix, StringComparison.OrdinalIgnoreCase)
+            && !PostmanEnvironment.IsYamlPath(explicitFile))
         {
             collectionFiles.Insert(0, explicitFile);
         }
 
-        foreach (var file in collectionFiles.OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
+        // v3 collection folders: postman/collections/*, plus collection folders kept directly in the workspace.
+        var collectionFolders = EnumerateDirectories(collectionsFolder).Where(V3Names.IsCollectionDirectory)
+            .Concat(EnumerateDirectories(root).Where(d => !Path.GetFileName(d).Equals(PostmanFolder, StringComparison.OrdinalIgnoreCase)
+                                                         && File.Exists(V3Names.DefinitionPath(d))))
+            .Concat(explicitFolder is null ? [] : [explicitFolder])
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var source in collectionFiles.Concat(collectionFolders).OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
         {
             try
             {
-                workspace.Collections.Add(PostmanCollection.Load(file));
+                var collection = PostmanCollection.Load(source);
+                workspace.Collections.Add(collection);
+                workspace.LoadErrors.AddRange(collection.LoadWarnings.Select(w => $"{collection.Name}: {w}"));
             }
-            catch (Exception ex) when (ex is JsonException or InvalidDataException or IOException)
+            catch (Exception ex) when (ex is JsonException or InvalidDataException or IOException or FormatException or UnauthorizedAccessException)
             {
-                workspace.LoadErrors.Add($"{Path.GetFileName(file)}: {ex.Message}");
+                workspace.LoadErrors.Add($"{Path.GetFileName(source)}: {ex.Message}");
             }
         }
 
-        foreach (var file in Directory.EnumerateFiles(root, "*" + PostmanEnvironment.EnvironmentSuffix).Order(StringComparer.OrdinalIgnoreCase))
+        var environmentsFolder = Path.Combine(root, PostmanFolder, "environments");
+        var environmentFiles = Directory.EnumerateFiles(root, "*" + PostmanEnvironment.EnvironmentSuffix)
+            .Concat(EnumerateFiles(environmentsFolder, "*" + PostmanEnvironment.EnvironmentSuffix))
+            .Concat(EnumerateFiles(environmentsFolder, "*.y*ml").Where(PostmanEnvironment.IsYamlPath));
+        foreach (var file in environmentFiles.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
         {
             try
             {
@@ -120,7 +149,11 @@ public sealed class ApiWorkspace
             }
         }
 
-        var globalsFile = Directory.EnumerateFiles(root, "*" + PostmanEnvironment.GlobalsSuffix).FirstOrDefault();
+        var globalsFolder = Path.Combine(root, PostmanFolder, "globals");
+        var globalsFile = Directory.EnumerateFiles(root, "*" + PostmanEnvironment.GlobalsSuffix)
+            .Concat(EnumerateFiles(globalsFolder, "*.y*ml").Where(PostmanEnvironment.IsYamlPath))
+            .Concat(EnumerateFiles(globalsFolder, "*" + PostmanEnvironment.GlobalsSuffix))
+            .FirstOrDefault();
         if (globalsFile is not null)
         {
             try
@@ -136,8 +169,39 @@ public sealed class ApiWorkspace
         return workspace;
     }
 
-    public PostmanCollection CreateCollection(string name)
+    public const string PostmanFolder = "postman";
+
+    /// <summary>
+    /// Whether new collections and environments are created in the Postman v3 layout (<c>postman/…</c> YAML folders).
+    /// Follows the <see cref="WorkspaceSettings.CollectionFormat"/> setting, or the workspace's existing layout.
+    /// </summary>
+    public bool UsesV3Layout => Settings.CollectionFormat?.ToLowerInvariant() switch
     {
+        "v3" => true,
+        "v2.1" => false,
+        _ => Directory.Exists(Path.Combine(RootPath, PostmanFolder, "collections"))
+             || Directory.Exists(Path.Combine(RootPath, PostmanFolder, "environments"))
+             || File.Exists(Path.Combine(RootPath, ".postman", "resources.yaml")),
+    };
+
+    private static IEnumerable<string> EnumerateFiles(string directory, string pattern) =>
+        Directory.Exists(directory) ? Directory.EnumerateFiles(directory, pattern) : [];
+
+    private static IEnumerable<string> EnumerateDirectories(string directory) =>
+        Directory.Exists(directory) ? Directory.EnumerateDirectories(directory).Where(d => !Path.GetFileName(d).StartsWith('.')) : [];
+
+    /// <summary>Creates a collection: a v2.1 JSON file, or a v3 folder under <c>postman/collections</c> (see <see cref="UsesV3Layout"/>).</summary>
+    public PostmanCollection CreateCollection(string name, bool? v3 = null)
+    {
+        if (v3 ?? UsesV3Layout)
+        {
+            var parent = Path.Combine(RootPath, PostmanFolder, "collections");
+            var directory = UniqueFolder(parent, V3Names.Safe(name));
+            var created = V3CollectionStorage.Create(directory, name);
+            Collections.Add(created);
+            return created;
+        }
+
         var collection = PostmanCollection.Create(name, UniquePath(name, PostmanCollection.FileSuffix));
         collection.Save();
         Collections.Add(collection);
@@ -146,14 +210,32 @@ public sealed class ApiWorkspace
 
     public PostmanEnvironment CreateEnvironment(string name)
     {
-        var environment = PostmanEnvironment.Create(name, UniquePath(name, PostmanEnvironment.EnvironmentSuffix));
+        var environment = UsesV3Layout
+            ? PostmanEnvironment.CreateYaml(name, UniqueFile(Path.Combine(RootPath, PostmanFolder, "environments"), V3Names.Safe(name), V3Names.EnvironmentSuffix))
+            : PostmanEnvironment.Create(name, UniquePath(name, PostmanEnvironment.EnvironmentSuffix));
         environment.Save();
         Environments.Add(environment);
         return environment;
     }
 
+    private static string UniqueFolder(string parent, string safe)
+    {
+        var taken = new HashSet<string>(EnumerateDirectories(parent).Select(Path.GetFileName).OfType<string>(), StringComparer.OrdinalIgnoreCase);
+        return Path.Combine(parent, V3Names.Unique(safe, taken));
+    }
+
+    private static string UniqueFile(string folder, string safe, string suffix)
+    {
+        var taken = new HashSet<string>(EnumerateFiles(folder, "*" + suffix).Select(f => Path.GetFileName(f)[..^suffix.Length]), StringComparer.OrdinalIgnoreCase);
+        return Path.Combine(folder, V3Names.Unique(safe, taken) + suffix);
+    }
+
     /// <summary>Copies an exported Postman collection into the workspace and loads it.</summary>
-    /// <remarks>A file that is already loaded is reloaded from disk; that is refused while it has unsaved changes.</remarks>
+    /// <remarks>
+    /// A workspace that creates collections in the v3 layout gets a YAML folder under <c>postman/collections</c>, as
+    /// Postman's Git-connected workspaces do. A file that is already loaded is reloaded from disk; that is refused
+    /// while it has unsaved changes.
+    /// </remarks>
     public PostmanCollection ImportCollection(string sourcePath)
     {
         if (FindCollection(sourcePath) is { } loaded)
@@ -163,11 +245,18 @@ public sealed class ApiWorkspace
         }
 
         var collection = PostmanCollection.Load(sourcePath);
-        var target = IsInside(sourcePath) ? Path.GetFullPath(sourcePath) : UniquePath(collection.Name, PostmanCollection.FileSuffix);
-        if (!string.Equals(Path.GetFullPath(sourcePath), target, StringComparison.OrdinalIgnoreCase))
+        if (!IsInside(sourcePath))
         {
-            File.Copy(sourcePath, target);
-            collection = PostmanCollection.Load(target);
+            if (UsesV3Layout && !collection.IsV3)
+            {
+                collection = collection.ConvertToV3(UniqueFolder(Path.Combine(RootPath, PostmanFolder, "collections"), V3Names.Safe(collection.Name)));
+            }
+            else
+            {
+                var target = UniquePath(collection.Name, PostmanCollection.FileSuffix);
+                File.Copy(sourcePath, target);
+                collection = PostmanCollection.Load(target);
+            }
         }
 
         Collections.Add(collection);

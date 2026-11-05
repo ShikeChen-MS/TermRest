@@ -10,4 +10,8 @@
     <InternalsVisibleTo Include="TermRest.Core.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="YamlDotNet" />
+  </ItemGroup>
+
 </Project>

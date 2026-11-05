@@ -95,6 +95,23 @@ public class WorkspaceAndCollectionTests
     }
 
     [Fact]
+    public void Requests_named_like_url_paths_are_found_by_path_and_name()
+    {
+        var collection = PostmanCollection.Create("Paths");
+        var top = collection.AddRequest(collection.RootNode, "/users", new HttpRequestSpec { Url = "https://example.com/users" });
+        var folder = collection.AddFolder(collection.RootNode, "v1");
+        var nested = collection.AddRequest(folder, "users/:id", new HttpRequestSpec { Url = "https://example.com/v1/users/:id" });
+
+        Assert.Same(top, collection.FindRequest("/users"));
+        Assert.Same(nested, collection.FindRequest("v1/users/:id"));
+        Assert.Same(nested, collection.FindRequest("/v1/users/:id"));
+        Assert.Same(nested, collection.FindRequest("users/:id"));
+        Assert.Same(folder, collection.FindFolder("/v1/"));
+        Assert.Same(collection.RootNode, collection.FindFolder(""));
+        Assert.Null(collection.FindRequest("users"));
+    }
+
+    [Fact]
     public void New_collection_and_environment_files_use_postman_format()
     {
         var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
