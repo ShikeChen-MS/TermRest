@@ -15,8 +15,10 @@ internal static class CliApp
             "Run without a command to open the full-screen UI in the given folder (default: current directory).");
         var workspace = new Argument<string?>("workspace") { Description = "Workspace folder or Postman collection file", Arity = ArgumentArity.ZeroOrOne };
         var driver = new Option<string?>("--driver") { Description = "Terminal driver: windows, unix, dotnet or ansi (default: best for this OS)" };
+        var theme = new Option<string?>("--theme") { Description = "Color theme for this session (see 'termrest themes')" };
         root.Arguments.Add(workspace);
         root.Options.Add(driver);
+        root.Options.Add(theme);
         root.Options.Add(insecure);
         root.SetAction(parseResult =>
         {
@@ -31,6 +33,7 @@ internal static class CliApp
             {
                 Driver = parseResult.GetValue(driver),
                 StrictSslOverride = parseResult.GetValue(insecure) ? false : null,
+                Theme = parseResult.GetValue(theme),
             });
         });
 
@@ -41,6 +44,7 @@ internal static class CliApp
         root.Subcommands.Add(ConvertCommand.Create());
         root.Subcommands.Add(ValidateCommand.Create());
         root.Subcommands.Add(CertsCommand.Create());
+        root.Subcommands.Add(ThemesCommand.Create());
         root.Subcommands.Add(CreateSnapshotCommand());
 
         return await root.Parse(args).InvokeAsync();
@@ -54,19 +58,32 @@ internal static class CliApp
         var height = new Option<int>("--height") { Description = "Screen height in rows", DefaultValueFactory = _ => 36 };
         var request = new Option<string?>("--request") { Description = "Open this request (path or unique name) before rendering" };
         var send = new Option<bool>("--send") { Description = "Send the request and render the response too" };
+        var theme = new Option<string?>("--theme") { Description = "Color theme (checks that it loads; the text output has no colors)" };
         command.Arguments.Add(workspace);
         command.Options.Add(width);
         command.Options.Add(height);
         command.Options.Add(request);
         command.Options.Add(send);
+        command.Options.Add(theme);
         command.SetAction(parseResult =>
         {
-            var screen = TuiApp.Snapshot(
-                parseResult.GetValue(workspace) ?? Environment.CurrentDirectory,
-                parseResult.GetValue(width),
-                parseResult.GetValue(height),
-                parseResult.GetValue(request),
-                parseResult.GetValue(send));
+            string screen;
+            try
+            {
+                screen = TuiApp.Snapshot(
+                    parseResult.GetValue(workspace) ?? Environment.CurrentDirectory,
+                    parseResult.GetValue(width),
+                    parseResult.GetValue(height),
+                    parseResult.GetValue(request),
+                    parseResult.GetValue(send),
+                    parseResult.GetValue(theme));
+            }
+            catch (ArgumentException ex)
+            {
+                Output.Error(ex.Message.Split(" (Parameter", StringSplitOptions.None)[0]);
+                return 2;
+            }
+
             Console.Out.WriteLine(screen.TrimEnd());
             return 0;
         });

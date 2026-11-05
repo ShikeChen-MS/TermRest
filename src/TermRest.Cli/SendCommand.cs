@@ -64,44 +64,58 @@ internal static class SendCommand
                 return 0;
             }
 
+            if (!options.StartRecording(parseResult, opened.Workspace, runner, out var recorder))
+            {
+                return 2;
+            }
+
             var exchange = await runner.SendAsync(prepared, cancellationToken);
-            if (parseResult.GetValue(verbose))
-            {
-                PrintVerbose(exchange);
-            }
-
-            if (exchange.Response is not { } response)
-            {
-                Output.Error(exchange.ErrorMessage ?? "Request failed.");
-                return exchange.Cancelled ? 130 : 1;
-            }
-
-            Output.Status($"{response.StatusCode} {response.ReasonPhrase} · {HttpExchange.Format(exchange.Timing.Total)} · {HttpExchange.FormatSize(response.Body.LongLength)}", response.StatusCode < 400);
-            if (parseResult.GetValue(include))
-            {
-                Console.Out.WriteLine($"HTTP/{response.Version} {response.StatusCode} {response.ReasonPhrase}");
-                foreach (var (key, value) in response.Headers)
-                {
-                    Console.Out.WriteLine($"{key}: {value}");
-                }
-
-                Console.Out.WriteLine();
-            }
-
-            if (parseResult.GetValue(output) is { } file)
-            {
-                await File.WriteAllBytesAsync(file, response.Body, cancellationToken);
-                Output.Info($"Saved {HttpExchange.FormatSize(response.Body.LongLength)} to {file}");
-            }
-            else
-            {
-                Console.Out.WriteLine(BodyFormatter.Format(response.Body, response.ContentType, pretty: !parseResult.GetValue(raw)));
-            }
-
-            return parseResult.GetValue(fail) && response.StatusCode >= 400 ? 22 : 0;
+            var recorded = options.SaveRecording(parseResult, runner, recorder);
+            var code = await ReportAsync(parseResult, exchange, verbose, include, output, raw, fail, cancellationToken);
+            return recorded || code != 0 ? code : 1;
         });
 
         return command;
+    }
+
+    private static async Task<int> ReportAsync(
+        ParseResult parseResult, HttpExchange exchange, Option<bool> verbose, Option<bool> include, Option<string?> output, Option<bool> raw, Option<bool> fail,
+        CancellationToken cancellationToken)
+    {
+        if (parseResult.GetValue(verbose))
+        {
+            PrintVerbose(exchange);
+        }
+
+        if (exchange.Response is not { } response)
+        {
+            Output.Error(exchange.ErrorMessage ?? "Request failed.");
+            return exchange.Cancelled ? 130 : 1;
+        }
+
+        Output.Status($"{response.StatusCode} {response.ReasonPhrase} · {HttpExchange.Format(exchange.Timing.Total)} · {HttpExchange.FormatSize(response.Body.LongLength)}", response.StatusCode < 400);
+        if (parseResult.GetValue(include))
+        {
+            Console.Out.WriteLine($"HTTP/{response.Version} {response.StatusCode} {response.ReasonPhrase}");
+            foreach (var (key, value) in response.Headers)
+            {
+                Console.Out.WriteLine($"{key}: {value}");
+            }
+
+            Console.Out.WriteLine();
+        }
+
+        if (parseResult.GetValue(output) is { } file)
+        {
+            await File.WriteAllBytesAsync(file, response.Body, cancellationToken);
+            Output.Info($"Saved {HttpExchange.FormatSize(response.Body.LongLength)} to {file}");
+        }
+        else
+        {
+            Console.Out.WriteLine(BodyFormatter.Format(response.Body, response.ContentType, pretty: !parseResult.GetValue(raw)));
+        }
+
+        return parseResult.GetValue(fail) && response.StatusCode >= 400 ? 22 : 0;
     }
 
     private static void PrintVerbose(HttpExchange exchange)

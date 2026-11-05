@@ -5,10 +5,14 @@ using Terminal.Gui.Input;
 using Terminal.Gui.Testing;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
+using TermRest.Core.Recording;
 using TermRest.Core.Tests.Infrastructure;
 using TermRest.Core.Workspace;
 using TermRest.Tui.Tests.Infrastructure;
+using TermRest.Tui.Theming;
 using Xunit;
+using Attribute = Terminal.Gui.Drawing.Attribute;
+using Color = Terminal.Gui.Drawing.Color;
 
 namespace TermRest.Tui.Tests;
 
@@ -20,6 +24,8 @@ namespace TermRest.Tui.Tests;
 public sealed class MainWindowTests : IDisposable
 {
     private readonly string _directory;
+    private readonly string _recordingTemp;
+    private readonly string? _previousRecordingTemp = Environment.GetEnvironmentVariable(RequestRecorder.TempDirectoryVariable);
 
     public MainWindowTests()
     {
@@ -30,6 +36,9 @@ public sealed class MainWindowTests : IDisposable
             File.Copy(file, Path.Combine(_directory, Path.GetFileName(file)));
         }
 
+        // Recordings (and the check for unsaved ones at startup) use a folder of their own.
+        _recordingTemp = _directory + "-recordings";
+        Environment.SetEnvironmentVariable(RequestRecorder.TempDirectoryVariable, _recordingTemp);
         TuiApp.ConfigureKeyBindings();
     }
 
@@ -459,14 +468,422 @@ public sealed class MainWindowTests : IDisposable
         Assert.Contains("Saved Widget API", ui.Window.StatusMessage, StringComparison.Ordinal);
     }
 
-    public void Dispose()
+    [Fact]
+    public void Switching_the_theme_recolors_the_open_window_and_the_request_methods()
     {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
         try
         {
-            Directory.Delete(_directory, recursive: true);
+            ThemeCatalog.Apply(ThemeCatalog.Find(ThemeCatalog.BuiltIn, "Dracula")!);
+            var post = ui.Find("POST POST JSON");
+            var (method, name) = (CellAt(ui, post.X, post.Y), CellAt(ui, post.X + 5, post.Y));
+            var menuBar = CellAt(ui, 149, 0);
+            ui.App.End(token!);
+
+            Assert.Equal(Color.Parse("#ffb86c"), method.Foreground);
+            Assert.Equal(name.Background, method.Background);
+            Assert.NotEqual(method.Foreground, name.Foreground);
+            Assert.Equal(Color.Parse("#21222c"), menuBar.Background);
         }
-        catch (IOException)
+        finally
         {
+            ThemeCatalog.Apply(ThemeCatalog.BuiltIn[0]);
+        }
+    }
+
+    [Fact]
+    public void Color_theme_dialog_previews_themes_live_and_saves_the_choice()
+    {
+        var userDirectory = Path.Combine(_directory, "user-config");
+        var workspaceThemes = ThemeCatalog.WorkspaceThemesDirectory(_directory);
+        Directory.CreateDirectory(workspaceThemes);
+        File.WriteAllText(Path.Combine(workspaceThemes, "team.json"), """{ "name": "Team Colors", "base": "Nord", "palette": { "bar": "#5c0000" } }""");
+        using var ui = new Harness(_directory);
+        ColorTheme? cancelled = null, chosen = null;
+        string dialogScreen = "", previewedBeforeCancel = "", afterCancel = "", previewed = "";
+        try
+        {
+            ui.App.AddTimeout(TimeSpan.FromMilliseconds(50), () =>
+            {
+                ui.App.AddTimeout(TimeSpan.FromMilliseconds(50), () =>
+                {
+                    ui.Click("Dracula");
+                    previewedBeforeCancel = ThemeCatalog.Current.Name;
+                    ui.Click("Cancel");
+                    return false;
+                });
+                cancelled = Dialogs.ThemeDialog.Show(ui.App, ui.Workspace, userDirectory);
+                afterCancel = ThemeCatalog.Current.Name;
+
+                ui.App.AddTimeout(TimeSpan.FromMilliseconds(50), () =>
+                {
+                    ui.App.InjectKey(Key.End); // custom themes come last
+                    previewed = ThemeCatalog.Current.Name;
+                    dialogScreen = ui.Screen();
+                    ui.Click("Use theme");
+                    return false;
+                });
+                chosen = Dialogs.ThemeDialog.Show(ui.App, ui.Workspace, userDirectory);
+                ui.App.RequestStop();
+                return false;
+            });
+            ui.App.AddTimeout(TimeSpan.FromSeconds(20), () =>
+            {
+                ui.App.RequestStop(); // never hang the test run when a click misses
+                return true;
+            });
+
+            ui.App.Run(ui.Window);
+
+            Assert.Equal(("Dracula", ThemeCatalog.DefaultName), (previewedBeforeCancel, afterCancel));
+            Assert.Null(cancelled);
+            OnScreen("Themes (* custom)", dialogScreen);
+            OnScreen("TurboPascal 5", dialogScreen);
+            OnScreen("Team Colors *", dialogScreen);
+            OnScreen("Custom theme based on Nord", dialogScreen);
+            OnScreen("200 OK", dialogScreen);
+            OnScreen("404 Not Found", dialogScreen);
+            OnScreen("500 Internal Server Error", dialogScreen);
+            OnScreen("Use only in this workspace", dialogScreen);
+            OnScreen("Custom themes:", dialogScreen);
+            var buttons = dialogScreen.Split('\n').Single(l => l.Contains("Reload theme files", StringComparison.Ordinal));
+            Assert.DoesNotContain("user-config", buttons, StringComparison.Ordinal); // a long folder path must not run into the buttons
+            Assert.Equal("Team Colors", previewed);
+            Assert.Equal("Team Colors", chosen?.Name);
+            Assert.Equal("Team Colors", ThemeCatalog.Current.Name);
+            Assert.Equal("Team Colors", UserSettings.Load(userDirectory).Theme);
+            Assert.Null(ApiWorkspace.ReadSettings(_directory).Theme);
+        }
+        finally
+        {
+            ThemeCatalog.Apply(ThemeCatalog.BuiltIn[0]);
+        }
+    }
+
+    [Fact]
+    public async Task Record_button_records_the_requests_sent_and_stop_asks_where_to_save_them()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo");
+        string idle = "", started = "", button = "", responseTitle = "", recorded = "", dialog = "", confirmation = "", stopped = "";
+        Attribute idleDot = default, badge = default, menuBar = default;
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(200), () =>
+        {
+            idle = ui.Screen();
+            var record = ui.Find("● Record F12");
+            idleDot = CellAt(ui, record.X, record.Y);
+            menuBar = CellAt(ui, 1, 0);
+            ui.Click("● Record F12");
+            started = ui.Screen();
+            var rec = ui.Find("REC 00:0");
+            badge = CellAt(ui, rec.X, rec.Y);
+            ui.App.InjectKey(Key.F5);
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            if (!ui.Window.RecordButton.Contains("1 request", StringComparison.Ordinal) && DateTime.UtcNow < deadline)
+            {
+                return true; // the request is still on its way
+            }
+
+            button = ui.Window.RecordButton;
+            responseTitle = ui.Window.ResponseTitle;
+            recorded = ui.Screen();
+            ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+            {
+                dialog = ui.Screen();
+                ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+                {
+                    confirmation = ui.Screen();
+                    ui.Click("► OK ◄");
+                    return false;
+                });
+                ui.Click("► Save ◄");
+                return false;
+            });
+            ui.Click("Stop F12"); // stops: the dialog runs until saved
+            stopped = ui.Screen();
+            ui.App.RequestStop();
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromSeconds(30), () =>
+        {
+            ui.Runner.Recorder?.Discard(); // never hang the test run
+            ui.Runner.Recorder = null;
+            ui.App.RequestStop();
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        // Idle: a button at the right end of the menu bar, with a red dot.
+        Assert.Equal(0, At(idle, "● Record F12").Y);
+        Assert.True(At(idle, "● Record F12").X > At(idle, "Help").X);
+        var red = ThemeCatalog.Current.Palette.Error is var error && !error.Equals(Color.None) && !error.Equals(menuBar.Background) ? error : Color.Red;
+        Assert.Equal(red, idleDot.Foreground);
+
+        // Recording: a red badge with the elapsed time and the number of requests recorded.
+        OnScreen("● REC 00:0", started);
+        OnScreen("0 requests · Stop F12", started);
+        Assert.Equal(red, badge.Background);
+        Assert.Contains(" REC 00:", button, StringComparison.Ordinal);
+        Assert.EndsWith("· 1 request · Stop F12  ", button, StringComparison.Ordinal);
+        Assert.Equal("Response · ● recorded #1", responseTitle);
+        OnScreen("Response · ● recorded #1", recorded);
+
+        OnScreen("Stop recording", dialog);
+        OnScreen("1 request recorded since", dialog);
+        OnScreen("HAR 1.2 format", dialog);
+        OnScreen("⟦ Keep recording ⟧", dialog);
+        var file = Assert.Single(Directory.GetFiles(_directory, "termrest-recording-*.har"));
+        OnScreen("Recording saved", confirmation);
+        OnScreen(Path.GetFileName(file), confirmation);
+        var entry = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(file))!["log"]!["entries"]![0]!;
+        Assert.Equal(server.BaseUrl + "/echo/get?foo=bar&source=termrest", entry["request"]!["url"]!.GetValue<string>());
+        Assert.Equal(200, entry["response"]!["status"]!.GetValue<int>());
+        Assert.Equal(("TermRest Demo", "Basics/GET with query"), (entry["_termrest"]!["collection"]!.GetValue<string>(), entry["_termrest"]!["request"]!.GetValue<string>()));
+        Assert.Null(ui.Runner.Recorder);
+        Assert.Equal(" ● Record F12 ", ui.Window.RecordButton);
+        Assert.Equal("Response", ui.Window.ResponseTitle);
+        Assert.StartsWith($"✓ Recording saved: {file} (1 request,", ui.Window.StatusMessage, StringComparison.Ordinal);
+        OnScreen("● Record F12", stopped);
+        Assert.Empty(Directory.Exists(_recordingTemp) ? Directory.GetDirectories(_recordingTemp) : []);
+    }
+
+    [Fact]
+    public void Quitting_while_recording_asks_about_the_recording_first()
+    {
+        using var ui = new Harness(_directory);
+        string dialog = "";
+        var stillRecording = false;
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            ui.App.InjectKey(Key.F12);
+            ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+            {
+                dialog = ui.Screen();
+                ui.Click("⟦ Cancel ⟧");
+                return false;
+            });
+            ui.App.InjectKey(Key.Q.WithCtrl); // asks; Cancel neither quits nor stops recording
+            stillRecording = ui.Runner.Recorder is { IsRecording: true };
+            ui.Runner.Recorder?.Discard();
+            ui.Runner.Recorder = null;
+            ui.App.RequestStop();
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromSeconds(20), () =>
+        {
+            ui.Runner.Recorder?.Discard();
+            ui.Runner.Recorder = null;
+            ui.App.RequestStop();
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("Save the recording first?", dialog);
+        OnScreen("Discard", dialog);
+        Assert.True(stillRecording);
+    }
+
+    [Fact]
+    public void Keyboard_help_shows_the_shortcuts_in_aligned_columns()
+    {
+        using var ui = new Harness(_directory);
+        var screen = "";
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            ui.Click("Help");
+            ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+            {
+                screen = ui.Screen();
+                ui.Click("► OK ◄");
+                return false;
+            });
+            ui.Click("Keyboard & mouse");
+            ui.App.RequestStop();
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromSeconds(20), () =>
+        {
+            ui.App.RequestStop();
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        // Each column starts at the same place on every row (a message box would center every line on its own).
+        int Column(params string[] texts) => Assert.Single(texts.Select(t => At(screen, t).X).Distinct());
+        var keys = Column("F5, Ctrl+Enter", "Esc ", "F2 ", "F8 ", "F9 ");
+        var actions = Column("Send (again to cancel)", "Cancel a running request", "Rename tree item", "Client certificates", "Collections ⇄ History");
+        var moreKeys = Column("F12  ", "Tab, Shift+Tab", "←, → (tab row)", "Shift+F10", "Ctrl+L");
+        var moreActions = Column("Start / stop recording", "Next / previous field", "Previous / next tab", "Focus the URL bar");
+        Assert.True(keys < actions && actions < moreKeys && moreKeys < moreActions, screen);
+        Assert.Equal(At(screen, "Esc ").Y + 1, At(screen, "Ctrl+S ").Y);
+        OnScreen("Right-click the tree or the history for actions", screen);
+    }
+
+    [Fact]
+    public void Keyboard_help_uses_one_column_on_narrow_screens()
+    {
+        var wide = MainWindow.KeysHelp(120).Split('\n');
+        var narrow = MainWindow.KeysHelp(80).Split('\n');
+
+        Assert.Equal(wide.Length + 8, narrow.Length);
+        Assert.Contains("  F12             Start / stop recording", narrow);
+        Assert.All(narrow.TakeWhile(l => l.Length > 0), l => Assert.True(l.Length <= 60, l));
+        Assert.All(wide, l => Assert.True(l.Length <= 92, l));
+    }
+
+    [Fact]
+    public void Text_dialogs_keep_lines_left_aligned_and_wrap_long_ones()
+    {
+        using var ui = new Harness(_directory);
+        var screen = "";
+        var path = "C:\\" + string.Join('\\', Enumerable.Repeat("folder_name", 20));
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+            {
+                screen = ui.Screen();
+                ui.Click("► OK ◄");
+                return false;
+            });
+            Dialogs.Ui.ShowText(ui.App, "Details", $"Short: 1\nA longer label: 2\nPath: {path}");
+            ui.App.RequestStop();
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromSeconds(20), () =>
+        {
+            ui.App.RequestStop();
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        Assert.Equal(At(screen, "Short: 1").X, At(screen, "A longer label: 2").X);
+        Assert.Equal(At(screen, "Short: 1").X, At(screen, "Path: C:\\folder_name").X);
+        Assert.Equal(20, System.Text.RegularExpressions.Regex.Count(screen, "folder_name")); // wrapped, not cut; underscores kept
+    }
+
+    [Fact]
+    public void Clicking_a_tab_opens_its_page_and_returns_to_the_control_last_focused_there()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        var paramsPage = ui.Screen();
+        var tabs = TabPanels(ui).Single(p => p.Pages[0].Title == "Params");
+        ui.Click("Headers");
+        var headersPage = Drawn(ui);
+        var headersFocused = tabs.Value!.HasFocus;
+        var bulkEdit = Descendants(tabs.Value).OfType<Terminal.Gui.Views.Button>().Single(b => b.Text == "Bulk edit");
+        bulkEdit.SetFocus();
+        ui.Click("Body");
+        var bodyPage = Drawn(ui);
+        var onlySelectedShown = tabs.Pages.All(page => page.Visible == (page == tabs.Value));
+        ui.Click("Headers");
+        var focusedOnReturn = ui.App.Navigation!.GetFocused();
+        ui.App.End(token!);
+
+        OnScreen("debug", paramsPage); // the disabled query parameter
+        Assert.DoesNotContain("application/json", paramsPage, StringComparison.Ordinal);
+
+        // Drawn like Terminal.Gui's tabs: the selected tab opens into its page.
+        OnScreen("╭──────╭───────╮────╮────╮───────╮────────╮", headersPage);
+        OnScreen("│Params│Headers│Auth│Body│Scripts│Settings│", headersPage);
+        OnScreen("├──────╯       ╰────┴────┴───────┴────────┴──", headersPage);
+        OnScreen("application/json", headersPage);
+        Assert.DoesNotContain("debug", headersPage, StringComparison.Ordinal);
+        Assert.True(headersFocused);
+
+        OnScreen("├──────┴───────┴────╯    ╰───────┴────────┴──", bodyPage);
+        OnScreen("◉ none  ○ raw", bodyPage);
+        Assert.DoesNotContain("application/json", bodyPage, StringComparison.Ordinal);
+        Assert.True(onlySelectedShown); // the pages behind are neither laid out nor drawn
+        Assert.Same(bulkEdit, focusedOnReturn);
+    }
+
+    [Fact]
+    public void Arrow_keys_on_the_tab_row_switch_tabs()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.Screen();
+        var tabs = TabPanels(ui).Single(p => p.Pages[0].Title == "Params");
+        var tabRow = tabs.SubViews.Single(v => !tabs.Pages.Contains(v));
+        tabRow.SetFocus();
+        var selected = new List<string>();
+        foreach (var key in (Key[])[Key.CursorRight, Key.CursorRight, Key.CursorLeft, Key.CursorLeft, Key.CursorLeft, Key.Home, Key.End])
+        {
+            ui.App.InjectKey(key);
+            selected.Add(tabs.Value!.Title);
+        }
+
+        var titles = At(Drawn(ui), "│Params│Headers│Auth│Body│Scripts│Settings│");
+        var settingsWhileOnTabRow = CellAt(ui, titles.X + 34, titles.Y);
+        var paramsWhileOnTabRow = CellAt(ui, titles.X + 1, titles.Y);
+        ui.App.InjectKey(Key.CursorDown);
+        var inPage = tabs.Value!.HasFocus && !tabRow.HasFocus;
+        var screen = Drawn(ui);
+        var settingsInPage = CellAt(ui, titles.X + 34, titles.Y);
+        ui.App.End(token!);
+
+        Assert.Equal(["Headers", "Auth", "Headers", "Params", "Settings", "Params", "Settings"], selected);
+        Assert.NotEqual(paramsWhileOnTabRow, settingsWhileOnTabRow); // the selected tab is highlighted while the tab row has focus
+        Assert.Equal(paramsWhileOnTabRow, settingsInPage);
+        Assert.True(inPage);
+        OnScreen("SSL certificate verification", screen);
+    }
+
+    /// <summary>What the main loop would show: draws only what changed (<see cref="Harness.Screen"/> redraws everything).</summary>
+    private static string Drawn(Harness ui)
+    {
+        ui.App.LayoutAndDraw();
+        return ui.App.Driver!.ToString() ?? "";
+    }
+
+    private static IEnumerable<Terminal.Gui.ViewBase.View> Descendants(Terminal.Gui.ViewBase.View view) =>
+        view.SubViews.SelectMany(Descendants).Prepend(view);
+
+    private static IEnumerable<Views.TabPanel> TabPanels(Harness ui) => Descendants(ui.Window).OfType<Views.TabPanel>();
+
+    /// <summary>Position of the first occurrence of <paramref name="text"/> in a captured screen.</summary>
+    private static Point At(string screen, string text)
+    {
+        var lines = screen.Split('\n');
+        for (var y = 0; y < lines.Length; y++)
+        {
+            if (lines[y].IndexOf(text, StringComparison.Ordinal) is var x and >= 0)
+            {
+                return new Point(x, y);
+            }
+        }
+
+        throw new Xunit.Sdk.XunitException($"'{text}' is not on screen:\n{screen}");
+    }
+
+    private static Attribute CellAt(Harness ui, int x, int y) =>
+        ui.App.Driver!.Contents![y, x].Attribute ?? throw new Xunit.Sdk.XunitException($"No colors drawn at {x},{y}.");
+
+    public void Dispose()
+    {
+        Environment.SetEnvironmentVariable(RequestRecorder.TempDirectoryVariable, _previousRecordingTemp);
+        foreach (var directory in (string[])[_directory, _recordingTemp])
+        {
+            try
+            {
+                if (Directory.Exists(directory))
+                {
+                    Directory.Delete(directory, recursive: true);
+                }
+            }
+            catch (IOException)
+            {
+            }
         }
     }
 }

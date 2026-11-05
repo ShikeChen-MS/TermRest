@@ -89,7 +89,8 @@ internal static class ValidateCommand
             {
                 var collection = PostmanCollection.Load(path);
                 var problems = collection.Verify();
-                var summary = $"v3 collection '{collection.Name}', {collection.AllRequests().Count()} request(s)";
+                var wrapping = collection.EffectiveYamlLineWidth is > 0 and var width ? $", long values wrapped at {width} columns" : "";
+                var summary = $"v3 collection '{collection.Name}', {collection.AllRequests().Count()} request(s){wrapping}";
                 foreach (var warning in collection.LoadWarnings)
                 {
                     Output.Warning($"  {warning}");
@@ -113,7 +114,8 @@ internal static class ValidateCommand
             }
 
             var environment = PostmanEnvironment.Load(path);
-            Output.Status($"✓ {path}: v3 environment '{environment.Name}', {environment.Values.Count} value(s)", true);
+            var environmentWrapping = environment.EffectiveYamlLineWidth is > 0 and var columns ? $", long values wrapped at {columns} columns" : "";
+            Output.Status($"✓ {path}: v3 environment '{environment.Name}', {environment.Values.Count} value(s){environmentWrapping}", true);
             return true;
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or FormatException or UnauthorizedAccessException)

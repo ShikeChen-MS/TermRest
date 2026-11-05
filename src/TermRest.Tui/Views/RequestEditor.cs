@@ -17,7 +17,7 @@ internal sealed class RequestEditor : View
     private readonly DropDownList _method;
     private readonly TextField _url;
     private readonly Button _send;
-    private readonly Tabs _tabs;
+    private readonly TabPanel _tabs;
     private readonly View _paramsTab;
     private readonly KeyValueTable _query;
     private readonly Label _pathLabel;
@@ -74,7 +74,7 @@ internal sealed class RequestEditor : View
             }
         };
 
-        _tabs = new Tabs { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill() };
+        _tabs = new TabPanel { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill() };
 
         _paramsTab = new View { Title = "Params", Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
         _query = new KeyValueTable(KeyValueKind.QueryParams) { Height = Dim.Percent(65) };
@@ -166,8 +166,7 @@ internal sealed class RequestEditor : View
             new Label { Text = "Description (Markdown)", X = 0, Y = 7 },
             _description);
 
-        _tabs.Add(_paramsTab, headersTab, authTab, bodyTab, scriptsTab, settingsTab);
-        _tabs.Value = _paramsTab;
+        _tabs.AddTabs(_paramsTab, headersTab, authTab, bodyTab, scriptsTab, settingsTab);
         _tabs.ValueChanged += (_, e) =>
         {
             if (e.NewValue == settingsTab)

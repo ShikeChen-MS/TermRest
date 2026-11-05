@@ -63,6 +63,27 @@ internal static class SettingsDialog
             Orientation = Orientation.Horizontal,
             Value = settings.CollectionFormat switch { "v2.1" => 1, "v3" => 2, _ => 0 },
         }, y, 22);
+        y += 2;
+        var wrap = Ui.AddRow(dialog, "Wrap YAML lines", new OptionSelector
+        {
+            Labels = ["Like the files", "Never", "At column"],
+            Orientation = Orientation.Horizontal,
+            Value = settings.YamlLineWidth switch { null => 0, <= 0 => 1, _ => 2 },
+        }, y, 22);
+        var wrapWidth = new TextField
+        {
+            X = Pos.Right(wrap) + 1,
+            Y = y,
+            Width = 6,
+            Text = (settings.YamlLineWidth is > 0 and var width ? width : 80).ToString(CultureInfo.InvariantCulture),
+        };
+        dialog.Add(wrapWidth);
+        y += 1;
+        dialog.Add(new Label { Text = "Postman v3 YAML files: only new and changed values are wrapped. Older Postman versions wrapped at 80.", X = 24, Y = y });
+        y += 2;
+        var redact = Ui.AddRow(dialog, "Recordings redact", new TextField { Text = string.Join(", ", settings.RecordingRedact ?? []) }, y, 22);
+        y += 1;
+        dialog.Add(new Label { Text = "Extra header, parameter and field names, comma-separated (credentials, cookies and tokens always are).", X = 24, Y = y });
 
         dialog.AddButton(new Button { Text = "Cancel" });
         dialog.AddButton(new Button { Text = "Save" });
@@ -91,6 +112,15 @@ internal static class SettingsDialog
                 continue;
             }
 
+            var lineWidth = 0;
+            if (wrap.Value == 2
+                && (!int.TryParse(wrapWidth.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out lineWidth)
+                    || lineWidth is < WorkspaceSettings.MinYamlLineWidth or > WorkspaceSettings.MaxYamlLineWidth))
+            {
+                Ui.Error(app, "Invalid line width", $"Wrap YAML lines at a column from {WorkspaceSettings.MinYamlLineWidth} to {WorkspaceSettings.MaxYamlLineWidth} (80 is what Postman used).");
+                continue;
+            }
+
             settings.StrictSsl = strict.Value == CheckState.Checked;
             settings.CaBundle = string.IsNullOrWhiteSpace(caBundle.Text) ? null : caBundle.Text.Trim();
             settings.TimeoutMs = timeoutMs;
@@ -103,6 +133,9 @@ internal static class SettingsDialog
             settings.HistoryLimit = keep;
             settings.HistoryResponseKb = bodyKb;
             settings.CollectionFormat = format.Value switch { 1 => "v2.1", 2 => "v3", _ => null };
+            settings.YamlLineWidth = wrap.Value switch { 1 => 0, 2 => lineWidth, _ => null };
+            var names = redact.Text.Split([',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            settings.RecordingRedact = names.Count == 0 ? null : names;
             workspace.SaveSettings();
             return true;
         }

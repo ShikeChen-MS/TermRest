@@ -13,6 +13,49 @@ internal static class Ui
     public static void Info(IApplication app, string title, string message) =>
         MessageBox.Query(app, title, message, "OK");
 
+    /// <summary>
+    /// Shows text as written: left-aligned, line by line, so columns and "label: value" lists line up (a message box
+    /// centers each line). Lines wider than the screen wrap at a space or path separator, indented. Underscores are
+    /// shown as they are, not taken as hotkey markers.
+    /// </summary>
+    public static void ShowText(IApplication app, string title, string text)
+    {
+        var width = Math.Max(20, (app.Driver?.Cols ?? 120) - 8);
+        var lines = text.ReplaceLineEndings("\n").TrimEnd('\n').Split('\n').SelectMany(line => Wrap(line, width));
+        using var dialog = new Dialog { Title = title };
+        dialog.Add(new Label
+        {
+            Text = string.Join('\n', lines),
+            X = 1,
+            Y = 1,
+            TextAlignment = Alignment.Start,
+            HotKeySpecifier = new System.Text.Rune(0xFFFF),
+        });
+        dialog.AddButton(new Button { Text = "OK" });
+        app.Run(dialog);
+    }
+
+    /// <summary>Breaks <paramref name="line"/> into pieces of at most <paramref name="width"/> characters.</summary>
+    internal static IEnumerable<string> Wrap(string line, int width)
+    {
+        // Continuation lines are indented a little more than the line, but never so much that nothing fits.
+        var indent = new string(' ', Math.Min(line.Length - line.TrimStart(' ').Length + 2, width / 4));
+        while (line.Length > width)
+        {
+            // After the last space or path separator that fits; a hard cut when there is none in the second half.
+            var cut = line.LastIndexOfAny([' ', '\\', '/'], width - 1) + 1;
+            if (cut <= width / 2)
+            {
+                cut = width;
+            }
+
+            yield return line[..cut].TrimEnd();
+            line = indent + line[cut..].TrimStart();
+        }
+
+        yield return line;
+    }
+
     public static bool Confirm(IApplication app, string title, string message, string yes = "Yes", string no = "No") =>
         MessageBox.Query(app, title, message, no, yes) == 1;
 

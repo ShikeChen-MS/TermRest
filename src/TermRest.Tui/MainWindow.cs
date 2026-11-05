@@ -1,3 +1,4 @@
+using System.Text;
 using Terminal.Gui.App;
 using Terminal.Gui.Drawing;
 using Terminal.Gui.Input;
@@ -8,8 +9,10 @@ using TermRest.Core.Http;
 using TermRest.Core.Import;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
+using TermRest.Core.Recording;
 using TermRest.Core.Workspace;
 using TermRest.Tui.Dialogs;
+using TermRest.Tui.Theming;
 using TermRest.Tui.Views;
 
 namespace TermRest.Tui;
@@ -31,7 +34,9 @@ internal sealed class MainWindow : Runnable
     private readonly RequestEditor _editor;
     private readonly ResponseView _response;
     private readonly Shortcut _environmentShortcut;
+    private readonly RecordingIndicator _recordIndicator;
     private readonly Shortcut _message;
+    private MenuItem? _recordMenuItem;
     private PostmanCollection? _collection;
     private RequestNode? _node;
     private PostmanCollection? _scratch;
@@ -48,8 +53,15 @@ internal sealed class MainWindow : Runnable
     /// <summary>Name suggested when a detached request (cURL import, history) is added to a collection.</summary>
     private string? _detachedName;
 
+    /// <summary>Where the last recording was saved this session (the next one is suggested there).</summary>
+    private string? _recordingFolder;
+
+    /// <summary>What the tree showed for the current collection when <see cref="UpdateTitles"/> last refreshed it.</summary>
+    private (object? Item, bool Dirty, string? Name) _treeTitleState;
+
     public MainWindow(ApiWorkspace workspace, RequestRunner runner)
     {
+        ThemeCatalog.EnsureApplied();
         _workspace = workspace;
         _runner = runner;
         Title = "TermRest";
@@ -113,7 +125,12 @@ internal sealed class MainWindow : Runnable
             _message,
         ]);
 
-        Add(_menu, _sidebar, _requestFrame, _responseFrame, statusBar);
+        // Top right, on the menu bar row: always in view, and a red badge with a running clock while recording.
+        _recordIndicator = new RecordingIndicator();
+        _recordIndicator.Clicked += (_, _) => ToggleRecording();
+        ThemeCatalog.Changed += OnThemeChanged;
+
+        Add(_menu, _sidebar, _requestFrame, _responseFrame, statusBar, _recordIndicator);
 
         _tree.SelectionChanged += (_, item) =>
         {
@@ -160,7 +177,13 @@ internal sealed class MainWindow : Runnable
 
         if (workspace.LoadErrors.Count > 0)
         {
-            Notify($"⚠ {workspace.LoadErrors.Count} file(s) could not be loaded (Help > Workspace info)");
+            Notify($"⚠ {workspace.LoadErrors.Count} problem(s) loading files or the color theme (Help > Workspace info)");
+        }
+
+        if (RequestRecorder.FindUnsaved().Count is > 0 and var unsaved)
+        {
+            var notice = $"{unsaved} unsaved recording(s) found: Tools > Recover unsaved recordings";
+            Notify(_message.Title.Length > 0 ? $"{_message.Title} · {notice}" : $"⚠ {notice}");
         }
     }
 
@@ -177,6 +200,12 @@ internal sealed class MainWindow : Runnable
     internal bool ShowingHistory => _showingHistory;
 
     internal string StatusMessage => _message.Title;
+
+    /// <summary>The text of the record button at the top right.</summary>
+    internal string RecordButton => _recordIndicator.Caption;
+
+    /// <summary>The title of the response pane (it says when the response shown was recorded).</summary>
+    internal string ResponseTitle => _responseFrame.Title;
 
     /// <summary>Selects and opens a request (used by snapshots and tests).</summary>
     internal void ShowRequest(RequestNode node)
@@ -234,7 +263,11 @@ internal sealed class MainWindow : Runnable
         [
             new MenuItem("Client _certificates…", Key.F8, ShowCertificates),
             new MenuItem("_Settings…", "", ShowSettings),
+            new MenuItem("Color _theme…", "", ShowThemes),
             new MenuItem("Clear _cookies", "", ClearCookies),
+            new Line(),
+            _recordMenuItem = new MenuItem("Start _recording", Key.F12, ToggleRecording),
+            new MenuItem("Recover _unsaved recordings…", "", RecoverRecordings),
         ]),
         new MenuBarItem("_Help",
         [
@@ -254,7 +287,7 @@ internal sealed class MainWindow : Runnable
         _historyEntry = null;
         _detachedName = null;
         _editor.Load(node.ReadSpec());
-        _response.Clear();
+        ClearResponse();
         UpdateTitles();
     }
 
@@ -266,7 +299,7 @@ internal sealed class MainWindow : Runnable
         _historyEntry = null;
         _detachedName = null;
         _editor.Load(new HttpRequestSpec { Url = "https://postman-echo.com/get?hello=world" });
-        _response.Clear();
+        ClearResponse();
         UpdateTitles();
         Notify("No collections yet: this is a scratch request. Use Ctrl+N or File > New collection to save requests.");
     }
@@ -316,9 +349,12 @@ internal sealed class MainWindow : Runnable
         }
 
         _response.ShowSending(prepared);
+        SetResponseTitle(null);
         _editor.SetSending(true);
         using var cancellation = new CancellationTokenSource();
         _sending = cancellation;
+        var recorder = _runner.Recorder;
+        var recordedBefore = recorder?.Count ?? 0;
         HttpExchange exchange;
         try
         {
@@ -341,7 +377,9 @@ internal sealed class MainWindow : Runnable
 
         _editor.SetSending(false);
         _response.ShowExchange(exchange);
+        SetResponseTitle(recorder is not null && ReferenceEquals(recorder, _runner.Recorder) && recorder.Count > recordedBefore ? recorder.Count : null);
         Notify(exchange.Response is null ? "" : $"{exchange.Request.Method} {exchange.Request.Uri?.Host} → {exchange.Response.StatusCode}");
+        UpdateRecording();
         if (exchange.HistoryEntry is { } entry && _historyLoaded)
         {
             _history.Prepend(entry);
@@ -544,7 +582,7 @@ internal sealed class MainWindow : Runnable
         {
             _collection = null;
             _editor.Load(new HttpRequestSpec());
-            _response.Clear();
+            ClearResponse();
         }
 
         UpdateTitles();
@@ -645,6 +683,185 @@ internal sealed class MainWindow : Runnable
             Notify("Settings saved.");
         }
     }
+
+    private void ShowThemes()
+    {
+        var theme = ThemeDialog.Show(App!, _workspace);
+        SetNeedsDraw();
+        if (theme is not null)
+        {
+            Notify($"Color theme: {theme.Name}{(_workspace.Settings.Theme is null ? "" : " (this workspace)")}");
+        }
+    }
+
+    // ----- recording -------------------------------------------------------------------------
+
+    /// <summary>Starts recording, or stops it and asks where to save it.</summary>
+    private void ToggleRecording()
+    {
+        if (_runner.Recorder is { } active)
+        {
+            StopRecording(active, RecordingDialogPurpose.Stop);
+            return;
+        }
+
+        RequestRecorder recorder;
+        try
+        {
+            recorder = RequestRecorder.Start(new RecordingOptions
+            {
+                WorkspaceName = Path.GetFileName(Path.TrimEndingDirectorySeparator(_workspace.RootPath)),
+                WorkspaceRoot = _workspace.RootPath,
+                RedactNames = _workspace.Settings.RecordingRedact ?? [],
+            });
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Ui.Error(App!, "Recording", $"The recording could not start: {ex.Message}");
+            return;
+        }
+
+        recorder.Changed += OnRecordingChanged;
+        _runner.Recorder = recorder;
+        UpdateRecording();
+        App?.AddTimeout(TimeSpan.FromMilliseconds(500), () => TickRecording(recorder));
+        Notify("● Recording the requests you send (secrets redacted). F12 or the REC badge stops it and saves a HAR file.");
+    }
+
+    /// <summary>Asks where to save the recording. Returns false when the user goes on recording (or does not close after all).</summary>
+    private bool StopRecording(RequestRecorder recorder, RecordingDialogPurpose purpose)
+    {
+        var path = RecordingDialog.DefaultPath(_recordingFolder ?? _workspace.RootPath, recorder.StartedAt);
+        var (result, saved) = RecordingDialog.Show(App!, recorder, path, purpose);
+        if (result == RecordingDialogResult.Kept)
+        {
+            UpdateRecording();
+            return false;
+        }
+
+        recorder.Changed -= OnRecordingChanged;
+        if (ReferenceEquals(_runner.Recorder, recorder))
+        {
+            _runner.Recorder = null;
+        }
+
+        UpdateRecording();
+        Notify(saved is null ? "Recording discarded." : SavedMessage(saved));
+        return true;
+    }
+
+    private void RecoverRecordings()
+    {
+        var unsaved = RequestRecorder.FindUnsaved();
+        if (unsaved.Count == 0)
+        {
+            Ui.Info(App!, "Unsaved recordings", "There are no unsaved recordings.\n\nRecordings that TermRest could not save (it was closed or crashed while recording) are offered here.");
+            return;
+        }
+
+        foreach (var item in unsaved)
+        {
+            RequestRecorder recovered;
+            try
+            {
+                recovered = RequestRecorder.Recover(item);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Ui.Error(App!, "Unsaved recording", $"The recording in {item.TempDirectory} could not be opened: {ex.Message}");
+                continue;
+            }
+
+            var folder = _recordingFolder ?? (Directory.Exists(item.WorkspaceRoot) ? item.WorkspaceRoot : _workspace.RootPath);
+            var (result, saved) = RecordingDialog.Show(App!, recovered, RecordingDialog.DefaultPath(folder, item.StartedAt), RecordingDialogPurpose.Recover);
+            if (result == RecordingDialogResult.Kept)
+            {
+                recovered.Dispose(); // kept for next time
+                Notify("Unsaved recordings are kept: Tools > Recover unsaved recordings.");
+                return;
+            }
+
+            Notify(saved is null ? "Unsaved recording discarded." : SavedMessage(saved));
+        }
+    }
+
+    private string SavedMessage(RecordingResult saved)
+    {
+        _recordingFolder = Path.GetDirectoryName(saved.Path);
+        var requests = saved.Requests == 1 ? "1 request" : $"{saved.Requests} requests";
+        Ui.ShowText(App!, "Recording saved",
+            $"{saved.Path}\n\n{requests}, {HttpExchange.FormatSize(saved.Bytes)}{(saved.Redactions > 0 ? $", {saved.Redactions} secret value(s) redacted" : "")}.\n" +
+            "Open it in browser dev tools (Network > Import HAR), any HAR viewer, or a text editor.");
+        return $"✓ Recording saved: {saved.Path} ({requests}, {HttpExchange.FormatSize(saved.Bytes)})";
+    }
+
+    /// <summary>Raised on any thread when the recorder wrote (or failed to write) a request.</summary>
+    private void OnRecordingChanged(object? sender, EventArgs e)
+    {
+        // Not Invoke: from another thread it waits for the UI thread, which may itself be waiting for the recorder.
+        if (!_closed)
+        {
+            App?.AddTimeout(TimeSpan.Zero, () =>
+            {
+                UpdateRecording();
+                return false;
+            });
+        }
+    }
+
+    private void UpdateRecording()
+    {
+        if (_closed)
+        {
+            return;
+        }
+
+        if (_runner.Recorder is { } recorder)
+        {
+            _recordIndicator.ShowRecording(recorder.StartedAt, recorder.Count);
+            _recordMenuItem?.Title = "Stop _recording and save…";
+            if (recorder.LastError is { } error && _message.Title != "⚠ " + error)
+            {
+                Notify("⚠ " + error);
+            }
+        }
+        else
+        {
+            _recordIndicator.ShowIdle();
+            _recordMenuItem?.Title = "Start _recording";
+            SetResponseTitle(null);
+        }
+    }
+
+    /// <summary>Blinks the recording badge and advances its clock; stops by itself when that recording ends.</summary>
+    private bool TickRecording(RequestRecorder recorder)
+    {
+        if (_closed || !ReferenceEquals(_runner.Recorder, recorder))
+        {
+            return false;
+        }
+
+        _recordIndicator.Tick();
+        return true;
+    }
+
+    /// <summary>The response pane's title: says whether (and as which request) the response shown was recorded.</summary>
+    private void SetResponseTitle(int? recordedAs)
+    {
+        var title = recordedAs is { } number ? $"Response · ● recorded #{number}" : "Response";
+        if (_responseFrame.Title != title)
+        {
+            _responseFrame.Title = title;
+        }
+    }
+
+    private void ClearResponse()
+    {
+        _response.Clear();
+        SetResponseTitle(null);
+    }
+
+    private void OnThemeChanged(object? sender, EventArgs e) => _recordIndicator.SetNeedsDraw();
 
     private void ClearCookies()
     {
@@ -786,7 +1003,7 @@ internal sealed class MainWindow : Runnable
             if (_collection is null)
             {
                 _editor.Load(new HttpRequestSpec());
-                _response.Clear();
+                ClearResponse();
             }
         }
 
@@ -895,6 +1112,7 @@ internal sealed class MainWindow : Runnable
         }
 
         _response.ShowExchange(entry.ToExchange(body));
+        SetResponseTitle(null);
         UpdateTitles();
     }
 
@@ -1023,7 +1241,7 @@ internal sealed class MainWindow : Runnable
             _collection = _scratch ??= PostmanCollection.Create("Scratch");
             _detachedName = imported.SuggestedName;
             _editor.Replace(spec);
-            _response.Clear();
+            ClearResponse();
         }
 
         UpdateTitles();
@@ -1046,20 +1264,64 @@ internal sealed class MainWindow : Runnable
 
     // ----- help ----------------------------------------------------------------------------------
 
-    private void ShowKeys() => Ui.Info(App!, "Keyboard & mouse",
-        """
-        Mouse: click anything; drag pane borders to resize; right-click the tree or history for actions;
-        double-click a table row to edit it; click the checkbox column to enable/disable a row.
+    /// <summary>The keyboard shortcuts in Help › Keyboard &amp; mouse (two columns: the first half, then the second).</summary>
+    private static readonly (string Keys, string Action)[] Shortcuts =
+    [
+        ("F5, Ctrl+Enter", "Send (again to cancel)"),
+        ("Esc", "Cancel a running request"),
+        ("Ctrl+S", "Save all changes"),
+        ("Ctrl+N", "New request"),
+        ("F2", "Rename tree item"),
+        ("Del", "Delete item, row or entry"),
+        ("F7", "Switch environment"),
+        ("F8", "Client certificates"),
+        ("F9", "Collections ⇄ History"),
+        ("F12", "Start / stop recording"),
+        ("F6, Shift+F6", "Next / previous pane"),
+        ("Tab, Shift+Tab", "Next / previous field"),
+        ("←, → (tab row)", "Previous / next tab"),
+        ("F10", "Menu"),
+        ("Shift+F10", "Context menu"),
+        ("Ctrl+L", "Focus the URL bar"),
+        ("Ctrl+Q", "Quit"),
+    ];
 
-        F5 / Enter in URL   Send (again to cancel)      Esc          Cancel a running request
-        Ctrl+S              Save all changes            Ctrl+N       New request (keeps an imported one)
-        F2                  Rename tree item            Del          Delete tree item / history entry
-        F7                  Switch environment          F8           Client certificates
-        F9                  Collections ⇄ History       F6 / Shift+F6  Next / previous pane
-        F10                 Menu                        Shift+F10    Context menu
-        Ctrl+L              Focus the URL bar           Ctrl+Q       Quit
-        Paste a curl command into the URL bar to import it (also File > Import cURL command).
-        """);
+    private void ShowKeys() => Ui.ShowText(App!, "Keyboard & mouse", KeysHelp(App?.Driver?.Cols ?? 120));
+
+    /// <summary>The help text, with the shortcuts in aligned columns: two, or one when two do not fit the screen.</summary>
+    internal static string KeysHelp(int screenColumns)
+    {
+        var keyWidth = Shortcuts.Max(s => s.Keys.Length) + 2;
+        var half = (Shortcuts.Length + 1) / 2;
+        var twoColumns = 2 + keyWidth + Shortcuts.Take(half).Max(s => s.Action.Length) + 4 + keyWidth + Shortcuts.Skip(half).Max(s => s.Action.Length);
+        var columns = screenColumns >= twoColumns + 8 ? 2 : 1; // + the dialog's frame and margins
+        var rows = (Shortcuts.Length + columns - 1) / columns;
+        var actionWidth = Shortcuts.Take(rows).Max(s => s.Action.Length) + 4;
+        var builder = new StringBuilder("Keyboard\n");
+        for (var row = 0; row < rows; row++)
+        {
+            var line = new StringBuilder("  ");
+            for (var column = 0; column < columns && (column * rows) + row < Shortcuts.Length; column++)
+            {
+                var (keys, action) = Shortcuts[(column * rows) + row];
+                line.Append(keys.PadRight(keyWidth)).Append(action.PadRight(actionWidth));
+            }
+
+            builder.Append(line.ToString().TrimEnd()).Append('\n');
+        }
+
+        builder.Append("""
+
+            Mouse
+              Click anything; drag pane borders to resize.
+              Right-click the tree or the history for actions; double-click a table row to edit it.
+              Click the checkbox of a row to turn it on or off.
+
+            Enter in the URL bar sends too. Paste a curl command into it to import the command.
+            F12 records the requests you send into a HAR file, with secrets redacted.
+            """);
+        return builder.ToString().ReplaceLineEndings("\n");
+    }
 
     private void ShowWorkspaceInfo()
     {
@@ -1067,15 +1329,30 @@ internal sealed class MainWindow : Runnable
         var info = $"Folder: {_workspace.RootPath}\n" +
                    $"Collections: {_workspace.Collections.Count}{(formats.Length > 0 ? $" ({formats})" : "")} · Environments: {_workspace.Environments.Count} · Globals: {(_workspace.Globals is null ? "no" : "yes")}\n" +
                    $"New collections: {(_workspace.UsesV3Layout ? "Postman v3 YAML folders (postman/collections)" : "Postman v2.1 JSON files")}\n" +
+                   $"Long YAML lines: {WorkspaceSettings.DescribeYamlLineWidth(_workspace.Settings.YamlLineWidth)}{DescribeDetectedWrapping()}\n" +
+                   $"Color theme: {ThemeCatalog.Current.Name} ({(ThemeCatalog.Current.FilePath ?? "built in")}){(_workspace.Settings.Theme is null ? "" : ", chosen for this workspace")}\n" +
                    $"Certificates: {_workspace.Certificates.Entries.Count} ({Path.GetRelativePath(_workspace.RootPath, _workspace.CertificatesPath)})\n" +
                    $"SSL verification: {(_workspace.Settings.StrictSsl ? "on" : "off")} · CA bundle: {_workspace.Settings.CaBundle ?? "none"}\n" +
-                   $"History: {(_runner.History is { } history ? history.Folder : "off")}";
+                   $"History: {(_runner.History is { } history ? history.Folder : "off")}\n" +
+                   $"Recording: {(_runner.Recorder is { } recorder ? $"on since {recorder.StartedAt:HH:mm:ss}, {recorder.Count} request(s), temporary files in {recorder.TempDirectory}" : $"off (temporary files go to {RequestRecorder.DefaultTempRoot()})")}";
         if (_workspace.LoadErrors.Count > 0)
         {
-            info += "\n\nCould not load:\n" + string.Join('\n', _workspace.LoadErrors);
+            info += "\n\nProblems while loading:\n" + string.Join('\n', _workspace.LoadErrors);
         }
 
-        Ui.Info(App!, "Workspace", info);
+        Ui.ShowText(App!, "Workspace", info);
+    }
+
+    /// <summary>When wrapping follows the files: the YAML collections whose files are wrapped.</summary>
+    private string DescribeDetectedWrapping()
+    {
+        if (_workspace.Settings.YamlLineWidth is not null)
+        {
+            return "";
+        }
+
+        var wrapped = _workspace.Collections.Where(c => c.EffectiveYamlLineWidth is > 0).Select(c => $"{c.Name} ({c.EffectiveYamlLineWidth} columns)").ToList();
+        return wrapped.Count == 0 ? "" : "; wrapped: " + string.Join(", ", wrapped);
     }
 
     private void ShowAbout() => Ui.Info(App!, "About TermRest",
@@ -1106,19 +1383,34 @@ internal sealed class MainWindow : Runnable
     private void UpdateTitles()
     {
         var dirty = _editor.IsModified || _collection?.IsDirty == true ? " ●" : "";
-        _requestFrame.Title = _node is not null
+        var title = _node is not null
             ? $"Request — {_node.Collection.Name} / {_node.PathInCollection}{dirty}"
             : _historyEntry is { } entry
                 ? $"Request (from history · {entry.Time.ToLocalTime():yyyy-MM-dd HH:mm:ss}){dirty}"
                 : $"Request ({(_detachedName is null ? "scratch" : "imported")}){dirty}";
-        _requestFrame.SetNeedsDraw();
-        _tree.RefreshItem(_collection ?? (object)_workspace);
+
+        // This runs on every keystroke in the editor: redraw only what changed.
+        if (_requestFrame.Title != title)
+        {
+            _requestFrame.Title = title;
+        }
+
+        var treeItem = _collection ?? (object)_workspace;
+        var treeState = (treeItem, _collection?.IsDirty == true, _collection?.Name);
+        if (treeState != _treeTitleState)
+        {
+            _treeTitleState = treeState;
+            _tree.RefreshItem(treeItem);
+        }
     }
 
     private void UpdateSidebarTitle()
     {
-        _sidebar.Title = _showingHistory ? $"History ({_history.Count})" : "Collections";
-        _sidebar.SetNeedsDraw();
+        var title = _showingHistory ? $"History ({_history.Count})" : "Collections";
+        if (_sidebar.Title != title)
+        {
+            _sidebar.Title = title;
+        }
     }
 
     private void Notify(string message)
@@ -1140,6 +1432,11 @@ internal sealed class MainWindow : Runnable
     private bool ConfirmUnsaved()
     {
         CommitEditor();
+        if (_runner.Recorder is { } recorder && !StopRecording(recorder, RecordingDialogPurpose.Close))
+        {
+            return false;
+        }
+
         if (!_workspace.HasUnsavedChanges)
         {
             return true;
@@ -1173,6 +1470,12 @@ internal sealed class MainWindow : Runnable
             return true;
         }
 
+        if (key == Key.F12)
+        {
+            ToggleRecording();
+            return true;
+        }
+
         return base.OnKeyDown(key);
     }
 
@@ -1192,6 +1495,15 @@ internal sealed class MainWindow : Runnable
         {
             _closed = true;
             _sending?.Cancel();
+            ThemeCatalog.Changed -= OnThemeChanged;
+
+            // Closed without saving (normally the user is asked first): the files stay for Tools > Recover.
+            if (_runner.Recorder is { } recorder)
+            {
+                recorder.Changed -= OnRecordingChanged;
+                _runner.Recorder = null;
+                recorder.Dispose();
+            }
         }
 
         base.Dispose(disposing);

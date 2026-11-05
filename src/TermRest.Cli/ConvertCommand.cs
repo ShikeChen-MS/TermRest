@@ -17,18 +17,32 @@ internal static class ConvertCommand
         {
             Description = "Target folder (v3) or file (v2.1). Default: postman/collections/<name> next to a v2.1 file; <name>.postman_collection.json in a v3 collection's workspace",
         };
+        var lineWidth = new Option<int?>("--line-width")
+        {
+            Description = "YAML output: wrap long values at this column, like Postman's YAML library (0: never). " +
+                          "Default: the workspace's yamlLineWidth setting, else no wrapping (like current Postman versions)",
+        };
         to.AcceptOnlyFromAmong("v3", "v2.1");
+        lineWidth.Validators.Add(result =>
+        {
+            if (result.GetValue(lineWidth) is int width && width != 0 && width is < WorkspaceSettings.MinYamlLineWidth or > WorkspaceSettings.MaxYamlLineWidth)
+            {
+                result.AddError($"--line-width must be 0 (no wrapping) or {WorkspaceSettings.MinYamlLineWidth} to {WorkspaceSettings.MaxYamlLineWidth}.");
+            }
+        });
         command.Arguments.Add(input);
         command.Options.Add(to);
         command.Options.Add(output);
+        command.Options.Add(lineWidth);
         command.SetAction(parseResult =>
         {
             var path = Path.GetFullPath(parseResult.GetValue(input)!);
+            var width = parseResult.GetValue(lineWidth) ?? WorkspaceLineWidth(path);
             try
             {
                 return IsEnvironment(path)
-                    ? ConvertEnvironment(path, parseResult.GetValue(to), parseResult.GetValue(output))
-                    : ConvertCollection(path, parseResult.GetValue(to), parseResult.GetValue(output));
+                    ? ConvertEnvironment(path, parseResult.GetValue(to), parseResult.GetValue(output), width)
+                    : ConvertCollection(path, parseResult.GetValue(to), parseResult.GetValue(output), width);
             }
             catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or FormatException or System.Text.Json.JsonException)
             {
@@ -39,12 +53,29 @@ internal static class ConvertCommand
         return command;
     }
 
+    /// <summary>The yamlLineWidth setting of the workspace that holds <paramref name="path"/> (its folder or a parent with a .termrest folder).</summary>
+    private static int? WorkspaceLineWidth(string path)
+    {
+        var directory = Path.GetDirectoryName(path);
+        for (var level = 0; directory is not null && level < 4; level++, directory = Path.GetDirectoryName(directory))
+        {
+            if (Directory.Exists(Path.Combine(directory, ApiWorkspace.ConfigDirectoryName)))
+            {
+                return ApiWorkspace.ReadSettings(directory).YamlLineWidth;
+            }
+        }
+
+        return null;
+    }
+
+    private static string Wrapping(int? width) => width is > 0 ? $" (long values wrapped at {width} columns)" : "";
+
     private static bool IsEnvironment(string path) =>
         File.Exists(path) && (path.EndsWith(PostmanEnvironment.EnvironmentSuffix, StringComparison.OrdinalIgnoreCase)
                               || path.EndsWith(PostmanEnvironment.GlobalsSuffix, StringComparison.OrdinalIgnoreCase)
                               || PostmanEnvironment.IsYamlPath(path));
 
-    private static int ConvertCollection(string path, string? to, string? output)
+    private static int ConvertCollection(string path, string? to, string? output, int? lineWidth)
     {
         if (!File.Exists(path) && !Directory.Exists(path))
         {
@@ -68,9 +99,9 @@ internal static class ConvertCommand
         if (toV3)
         {
             var target = output ?? Path.Combine(Path.GetDirectoryName(path)!, ApiWorkspace.PostmanFolder, "collections", SafeName(source.Name));
-            var converted = source.ConvertToV3(target);
+            var converted = source.ConvertToV3(target, lineWidth);
             var examples = Directory.EnumerateFiles(target, "*.example.yaml", SearchOption.AllDirectories).Count();
-            Output.Status($"✓ {converted.AllRequests().Count()} request(s){(examples > 0 ? $" and {examples} example(s)" : "")} written to {target}", true);
+            Output.Status($"✓ {converted.AllRequests().Count()} request(s){(examples > 0 ? $" and {examples} example(s)" : "")} written to {target}{Wrapping(lineWidth)}", true);
             return 0;
         }
 
@@ -91,7 +122,7 @@ internal static class ConvertCommand
         return 0;
     }
 
-    private static int ConvertEnvironment(string path, string? to, string? output)
+    private static int ConvertEnvironment(string path, string? to, string? output, int? lineWidth)
     {
         var environment = PostmanEnvironment.Load(path);
         var toV3 = (to ?? (environment.IsYaml ? "v2.1" : "v3")) == "v3";
@@ -113,8 +144,9 @@ internal static class ConvertCommand
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(target))!);
+        environment.YamlLineWidth = lineWidth;
         environment.Save(target);
-        Output.Status($"✓ {environment.Values.Count} value(s) written to {target}", true);
+        Output.Status($"✓ {environment.Values.Count} value(s) written to {target}{(toV3 ? Wrapping(lineWidth) : "")}", true);
         return 0;
     }
 

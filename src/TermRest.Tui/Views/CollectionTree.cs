@@ -1,8 +1,11 @@
+using Terminal.Gui.Drawing;
 using Terminal.Gui.Input;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using TermRest.Core.Postman;
 using TermRest.Core.Workspace;
+using TermRest.Tui.Theming;
+using Attribute = Terminal.Gui.Drawing.Attribute;
 
 namespace TermRest.Tui.Views;
 
@@ -31,6 +34,7 @@ internal sealed class CollectionTree : View
             TreeBuilder = new DelegateTreeBuilder<object>(item => GetChildren(item), CanExpand),
             AspectGetter = Describe,
         };
+        _tree.DrawLine += (_, line) => ColorMethod(line);
         _tree.SelectionChanged += (_, e) => SelectionChanged?.Invoke(this, e.NewValue);
         _tree.Accepted += (_, _) =>
         {
@@ -176,4 +180,26 @@ internal sealed class CollectionTree : View
         var m when m.Length > 4 => m[..4],
         var m => m,
     };
+
+    /// <summary>Shows a request's method label in its theme color (the selected row keeps the focus colors).</summary>
+    private static void ColorMethod(DrawTreeViewLineEventArgs<object> line)
+    {
+        if (line.Model is not RequestNode request || line.Cells is not { } cells
+            || (line.Tree is { HasFocus: true } tree && ReferenceEquals(tree.SelectedObject, request)))
+        {
+            return;
+        }
+
+        var color = ThemeCatalog.Current.Palette.MethodColor(request.Method);
+        var end = Math.Min(cells.Count, line.IndexOfModelText + ShortMethod(request.Method).Length);
+        for (var i = Math.Max(0, line.IndexOfModelText); i < end; i++)
+        {
+            var cell = cells[i];
+            if (cell.Attribute is { } attribute)
+            {
+                cell.Attribute = new Attribute(color, attribute.Background, attribute.Style);
+                cells[i] = cell;
+            }
+        }
+    }
 }

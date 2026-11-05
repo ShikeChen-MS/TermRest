@@ -3,6 +3,8 @@
   <PropertyGroup>
     <RootNamespace>TermRest.Tui</RootNamespace>
     <IsAotCompatible>true</IsAotCompatible>
+    <!-- LibraryImport (TimerResolution) -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>

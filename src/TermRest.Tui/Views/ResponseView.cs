@@ -4,6 +4,7 @@ using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using TermRest.Core.Http;
 using TermRest.Tui.Dialogs;
+using TermRest.Tui.Theming;
 
 namespace TermRest.Tui.Views;
 
@@ -11,7 +12,7 @@ namespace TermRest.Tui.Views;
 internal sealed class ResponseView : View
 {
     private readonly Label _status;
-    private readonly Tabs _tabs;
+    private readonly TabPanel _tabs;
     private readonly View _bodyTab;
     private readonly TextArea _body;
     private readonly Button _pretty;
@@ -30,7 +31,7 @@ internal sealed class ResponseView : View
 
         _status = new Label { X = 0, Y = 0, Width = Dim.Fill(), Text = "No response yet. Press F5 (or Enter in the URL bar) to send." };
 
-        _tabs = new Tabs { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill() };
+        _tabs = new TabPanel { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill() };
 
         _bodyTab = new View { Title = "Body", Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
         _pretty = new Button { Text = "Pretty: on", X = 0, Y = 0, NoDecorations = true, ShadowStyle = null };
@@ -72,8 +73,7 @@ internal sealed class ResponseView : View
         _tls = new TextArea { ReadOnly = true };
         tlsTab.Add(_tls);
 
-        _tabs.Add(_bodyTab, headersTab, timelineTab, tlsTab);
-        _tabs.Value = _bodyTab;
+        _tabs.AddTabs(_bodyTab, headersTab, timelineTab, tlsTab);
         Add(_status, _tabs);
         SetHeaders([]);
     }
@@ -119,7 +119,12 @@ internal sealed class ResponseView : View
             var http = $"HTTP/{response.Version.Major}{(response.Version.Major < 2 ? "." + response.Version.Minor : "")}";
             var warnings = exchange.Request.Warnings.Count > 0 ? $" · ⚠ {exchange.Request.Warnings.Count} warning(s), see Timeline" : "";
             _status.Text = $"{response.StatusCode} {response.ReasonPhrase} · {HttpExchange.Format(exchange.Timing.Total)} · {HttpExchange.FormatSize(response.Body.LongLength)} · {http}{warnings}";
-            _status.SchemeName = response.StatusCode >= 400 ? "Error" : "Accent";
+            _status.SchemeName = response.StatusCode switch
+            {
+                >= 500 => "Error",
+                >= 400 => ThemeCatalog.WarningScheme,
+                _ => ThemeCatalog.SuccessScheme,
+            };
             SetHeaders(response.Headers);
             RenderBody();
         }

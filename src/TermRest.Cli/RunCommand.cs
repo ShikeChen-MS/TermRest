@@ -61,6 +61,11 @@ internal static class RunCommand
             var requests = root is CollectionRootNode
                 ? target.AllRequests().ToList()
                 : target.AllRequests().Where(r => r.Ancestors().Contains(root)).ToList();
+            if (!options.StartRecording(parseResult, opened.Workspace, runner, out var recorder))
+            {
+                return 2;
+            }
+
             Output.Info($"Running {requests.Count} request(s) from '{target.Name}'{(root is CollectionRootNode ? "" : " / " + root.PathInCollection)}" +
                         $"{(runner.Environment is { } env ? $" with environment '{env.Name}'" : "")}\n");
 
@@ -98,6 +103,8 @@ internal static class RunCommand
             var failed = results.Count(r => !r.Passed);
             Output.Info($"\n{(cancelled ? "Run cancelled. " : "")}{results.Count - failed} passed, {failed} failed, {requests.Count - results.Count} skipped");
 
+            // A cancelled run still saves what it recorded.
+            var recorded = options.SaveRecording(parseResult, runner, recorder);
             if (parseResult.GetValue(json) is { } reportPath)
             {
                 // Not tied to the cancellation token: a cancelled run still reports what it did.
@@ -105,7 +112,7 @@ internal static class RunCommand
                 Output.Info($"Report written to {reportPath}");
             }
 
-            return cancelled ? 130 : failed == 0 ? 0 : 1;
+            return cancelled ? 130 : failed == 0 && recorded ? 0 : 1;
         });
 
         return command;
