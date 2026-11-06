@@ -3,6 +3,7 @@ using TermRest.Core.IO;
 using TermRest.Core.Json;
 using TermRest.Core.Model;
 using TermRest.Core.Postman.V3;
+using TermRest.Core.Scripting;
 
 namespace TermRest.Core.Postman;
 
@@ -225,6 +226,28 @@ public sealed class PostmanCollection
     {
         Root.SetOrdered("variable", PostmanRequestMapper.WriteKeyValues(variables, KeyValueStyle.CollectionVariable), PostmanRequestMapper.RootOrder);
         MarkDirty();
+    }
+
+    /// <summary>The scripts of the collection (<see cref="RootNode"/>) or of a folder: they run around every request inside.</summary>
+    public ScriptSet GetScripts(FolderNode folder)
+    {
+        EnsureOwned(folder);
+        return PostmanRequestMapper.ReadScripts(folder.Json["event"]);
+    }
+
+    /// <summary>Sets the scripts of the collection (<see cref="RootNode"/>) or of a folder; false when nothing changed.</summary>
+    public bool SetScripts(FolderNode folder, ScriptSet scripts)
+    {
+        var current = GetScripts(folder);
+        if (scripts.SameAs(current))
+        {
+            return false;
+        }
+
+        var order = folder is CollectionRootNode ? PostmanRequestMapper.RootOrder : PostmanRequestMapper.ItemOrder;
+        PostmanRequestMapper.ApplyScripts(folder.Json, scripts, current, order);
+        MarkDirty();
+        return true;
     }
 
     public IEnumerable<CollectionNode> Descendants() => Walk(RootNode);

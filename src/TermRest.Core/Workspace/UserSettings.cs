@@ -16,6 +16,50 @@ public sealed class UserSettings
     public string? Theme { get; set; }
 
     /// <summary>
+    /// The Python interpreter chosen for each workspace folder to run its scripts. It is kept with the user's settings,
+    /// not in the workspace, so a cloned repository cannot choose a program for TermRest to run.
+    /// </summary>
+    public Dictionary<string, string>? PythonInterpreters { get; set; }
+
+    /// <summary>The Python interpreter chosen for the workspace in <paramref name="workspaceRoot"/>, if any.</summary>
+    public string? GetPythonInterpreter(string workspaceRoot) =>
+        PythonInterpreters?.FirstOrDefault(p => SameFolder(p.Key, workspaceRoot)).Value is { Length: > 0 } interpreter ? interpreter : null;
+
+    /// <summary>Chooses the Python interpreter for the workspace in <paramref name="workspaceRoot"/>; null or empty forgets it.</summary>
+    public void SetPythonInterpreter(string workspaceRoot, string? interpreter)
+    {
+        foreach (var key in PythonInterpreters?.Keys.Where(k => SameFolder(k, workspaceRoot)).ToList() ?? [])
+        {
+            PythonInterpreters!.Remove(key);
+        }
+
+        if (!string.IsNullOrWhiteSpace(interpreter))
+        {
+            PythonInterpreters ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            PythonInterpreters[NormalizeFolder(workspaceRoot)] = interpreter.Trim();
+        }
+        else if (PythonInterpreters is { Count: 0 })
+        {
+            PythonInterpreters = null;
+        }
+    }
+
+    private static bool SameFolder(string a, string b) =>
+        string.Equals(NormalizeFolder(a), NormalizeFolder(b), OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+
+    private static string NormalizeFolder(string path)
+    {
+        try
+        {
+            return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return path; // an odd entry in a hand-edited file
+        }
+    }
+
+    /// <summary>
     /// The configuration folder: <c>$TERMREST_CONFIG_DIR</c>, else <c>%APPDATA%\TermRest</c> (Windows),
     /// <c>~/Library/Application Support/TermRest</c> (macOS) or <c>$XDG_CONFIG_HOME/termrest</c> (<c>~/.config/termrest</c>).
     /// </summary>

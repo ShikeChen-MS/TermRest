@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using TermRest.Core.Certificates;
 using TermRest.Core.Http;
+using TermRest.Core.Scripting;
 
 namespace TermRest.Core.Recording;
 
@@ -312,6 +313,11 @@ internal static class HarEntryWriter
             writer.WriteEndArray();
         }
 
+        if (exchange.Scripts is { } scripts)
+        {
+            WriteScripts(writer, scripts, redactor);
+        }
+
         var timing = exchange.Timing;
         writer.WriteStartObject("timing");
         WriteMs(writer, "dns", timing.Dns);
@@ -381,6 +387,61 @@ internal static class HarEntryWriter
         }
 
         writer.WriteEndArray();
+        writer.WriteEndObject();
+    }
+
+    /// <summary>
+    /// What the scripts did: tests, the error, the names of the variables they set (not the values) and what they
+    /// printed (the first lines), all redacted like the rest of the entry.
+    /// </summary>
+    private static void WriteScripts(Utf8JsonWriter writer, ScriptResults scripts, ExchangeRedactor redactor)
+    {
+        const string Location = "_termrest.scripts";
+        const int MaxOutputLines = 200;
+        writer.WriteStartObject("scripts");
+        writer.WriteNumber("ran", scripts.Ran);
+        writer.WriteStartArray("tests");
+        foreach (var test in scripts.Tests)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("name", redactor.Text(test.Name, Location));
+            writer.WriteBoolean("passed", test.Passed);
+            if (test.Error is { } error)
+            {
+                writer.WriteString("error", redactor.Text(error, Location));
+            }
+
+            writer.WriteString("script", test.Script);
+            writer.WriteEndObject();
+        }
+
+        writer.WriteEndArray();
+        if (scripts.Error is { } failure)
+        {
+            writer.WriteString("error", redactor.Text(failure.ToString(), Location));
+            if (failure.Traceback is { Length: > 0 } traceback)
+            {
+                writer.WriteString("traceback", redactor.Text(traceback, Location));
+            }
+        }
+
+        WriteStrings(writer, "variablesSet", scripts.VariablesSet.Distinct(StringComparer.Ordinal));
+        WriteStrings(writer, "output", scripts.Logs.Take(MaxOutputLines).Select(l => redactor.Text($"[{l.Phase} · {l.Script}] {l.Text}", Location)));
+        if (scripts.Logs.Count > MaxOutputLines)
+        {
+            writer.WriteNumber("outputLinesNotRecorded", scripts.Logs.Count - MaxOutputLines);
+        }
+
+        if (scripts.Notes.Count > 0)
+        {
+            WriteStrings(writer, "notes", scripts.Notes);
+        }
+
+        if (scripts.NotRun.Count > 0)
+        {
+            WriteStrings(writer, "notRun", scripts.NotRun); // JavaScript (Postman) scripts
+        }
+
         writer.WriteEndObject();
     }
 
@@ -597,7 +658,7 @@ internal static class HarEntryWriter
 
         public List<Part>? Parts { get; init; }
 
-        public (string Name, long Size)? File { get; init; }
+        public FileReference? File { get; init; }
 
         public string? Comment { get; init; }
 
@@ -632,21 +693,14 @@ internal static class HarEntryWriter
                     return new PostData
                     {
                         MimeType = mimeType,
-                        Parts = body.Parts.Select(p => p.FilePath is null ? TextPart(p, redactor) : FilePart(p, request.MaxResponseBytes, redactor)).ToList(),
+                        Parts = body.Parts.Select(p => p.FilePath is null ? TextPart(p, redactor) : FilePart(p, redactor)).ToList(),
                         Size = -1, // depends on the generated boundary
                     };
 
                 case PreparedBodyKind.File:
                 {
-                    var (content, size, comment) = ReadFile(body.FilePath!, request.MaxResponseBytes);
-                    var file = (Path.GetFileName(body.FilePath!), size);
-                    if (content is null)
-                    {
-                        return new PostData { MimeType = mimeType, File = file, Comment = comment, Size = size };
-                    }
-
-                    var (data, format) = Classify(content, mimeType);
-                    return new PostData { MimeType = mimeType, Data = data, Format = format, Spans = redactor.BodySpans(data, format, Location), File = file, Size = size };
+                    var file = FileReference.Create(body.FilePath!, redactor, Location);
+                    return new PostData { MimeType = mimeType, File = file, Comment = FileReference.Comment, Size = file.Size };
                 }
 
                 default:
@@ -682,14 +736,7 @@ internal static class HarEntryWriter
                 WriteBody(writer, "text", Data, Format, Spans, "_encoding");
             }
 
-            if (File is { } file)
-            {
-                writer.WriteStartObject("_file");
-                writer.WriteString("name", file.Name);
-                writer.WriteNumber("size", file.Size);
-                writer.WriteEndObject();
-            }
-
+            File?.Write(writer);
             if (Comment is not null)
             {
                 writer.WriteString("comment", Comment);
@@ -705,46 +752,58 @@ internal static class HarEntryWriter
             return new Part { Name = part.Name, Value = value, ContentType = part.ContentType };
         }
 
-        private static Part FilePart(MultipartPart part, long maxBytes, ExchangeRedactor redactor)
+        private static Part FilePart(MultipartPart part, ExchangeRedactor redactor) => new()
         {
-            var contentType = part.ContentType ?? "application/octet-stream";
-            var (content, size, comment) = ReadFile(part.FilePath!, maxBytes);
-            if (content is null)
-            {
-                return new Part { Name = part.Name, FileName = Path.GetFileName(part.FilePath), ContentType = contentType, Size = size, Comment = comment };
-            }
+            Name = part.Name,
+            FileName = Path.GetFileName(part.FilePath),
+            ContentType = part.ContentType ?? "application/octet-stream",
+            File = FileReference.Create(part.FilePath!, redactor, Location),
+            Comment = FileReference.Comment,
+        };
+    }
 
-            var (data, format) = Classify(content, contentType);
-            return new Part
+    /// <summary>
+    /// A file sent with a request: the body, or a form-data field. Recordings keep a reference to it, never its content
+    /// (it can be large, and it stays on disk): <c>_file</c> gives the path, size and modification time and says
+    /// <c>"contentRecorded": false</c>, and a comment says the same for HAR viewers.
+    /// </summary>
+    private sealed class FileReference
+    {
+        public const string Comment = "Sent from a file. The recording keeps the file's path, not its content.";
+
+        public required string Path { get; init; }
+
+        public long Size { get; init; } = -1;
+
+        public DateTimeOffset? Modified { get; init; }
+
+        public static FileReference Create(string path, ExchangeRedactor redactor, string location)
+        {
+            var info = new FileInfo(path);
+            return new FileReference
             {
-                Name = part.Name,
-                FileName = Path.GetFileName(part.FilePath),
-                ContentType = contentType,
-                Size = size,
-                Content = data,
-                Format = format,
-                Spans = redactor.BodySpans(data, format, Location),
+                Path = redactor.Text(path, location),
+                Size = info.Exists ? info.Length : -1,
+                Modified = info.Exists ? new DateTimeOffset(info.LastWriteTime) : null,
             };
         }
 
-        /// <summary>The file as sent, unless it is larger than the largest response the workspace accepts.</summary>
-        private static (byte[]? Content, long Size, string? Comment) ReadFile(string path, long maxBytes)
+        public void Write(Utf8JsonWriter writer)
         {
-            try
+            writer.WriteStartObject("_file");
+            writer.WriteString("path", Path);
+            writer.WriteNumber("size", Size);
+            if (Modified is { } modified)
             {
-                var size = new FileInfo(path).Length;
-                return size > maxBytes
-                    ? (null, size, $"The file ({HttpExchange.FormatSize(size)}) is larger than the maximum response size ({HttpExchange.FormatSize(maxBytes)}) and is not included.")
-                    : (System.IO.File.ReadAllBytes(path), size, null);
+                writer.WriteString("modified", FormatTime(modified));
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                return (null, -1, $"The file could not be read for the recording: {ex.Message}");
-            }
+
+            writer.WriteBoolean("contentRecorded", false);
+            writer.WriteEndObject();
         }
     }
 
-    /// <summary>A form-data part: a text field, or a file with its content.</summary>
+    /// <summary>A form-data part: a text field, or a reference to a file.</summary>
     private sealed class Part
     {
         public required string Name { get; init; }
@@ -755,13 +814,7 @@ internal static class HarEntryWriter
 
         public string? ContentType { get; init; }
 
-        public long? Size { get; init; }
-
-        public byte[]? Content { get; init; }
-
-        public BodyFormat Format { get; init; }
-
-        public List<RedactedSpan> Spans { get; init; } = [];
+        public FileReference? File { get; init; }
 
         public string? Comment { get; init; }
 
@@ -769,11 +822,7 @@ internal static class HarEntryWriter
         {
             writer.WriteStartObject();
             writer.WriteString("name", Name);
-            if (Content is not null)
-            {
-                WriteBody(writer, "value", Content, Format, Spans, "_encoding");
-            }
-            else if (Value is not null)
+            if (Value is not null)
             {
                 writer.WriteString("value", Value);
             }
@@ -788,11 +837,7 @@ internal static class HarEntryWriter
                 writer.WriteString("contentType", ContentType);
             }
 
-            if (Size is { } size)
-            {
-                writer.WriteNumber("_size", size);
-            }
-
+            File?.Write(writer);
             if (Comment is not null)
             {
                 writer.WriteString("comment", Comment);

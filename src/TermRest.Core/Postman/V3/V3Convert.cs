@@ -397,7 +397,7 @@ internal static class V3Convert
             "raw" => JsonValue.Create(body["raw"].GetString() ?? "")!,
             "urlencoded" => KeyValuesToV3(body["urlencoded"] as JsonArray ?? [], templateBody?["content"], mapWhenNew: false) ?? new JsonArray(),
             "formdata" => FormDataToV3(body["formdata"] as JsonArray ?? [], templateBody?["content"]),
-            "file" => new JsonObject { ["src"] = (body["file"] as JsonObject)?["src"]?.DeepClone() },
+            "file" => FileToV3(body["file"] as JsonObject),
             _ => GraphQLToV3(body["graphql"] as JsonObject ?? [], sameKind ? templateBody?["content"] as JsonObject : null),
         };
         if (!JsonNode.DeepEquals(result["content"], content))
@@ -415,6 +415,18 @@ internal static class V3Convert
         }
 
         return result;
+    }
+
+    /// <summary>A file body's content: where the file is, and its type when it has one (as in v2.1's <c>file</c> object).</summary>
+    private static JsonObject FileToV3(JsonObject? file)
+    {
+        var content = new JsonObject { ["src"] = file?["src"]?.DeepClone() };
+        if (file?["language"] is { } language)
+        {
+            content["language"] = language.DeepClone();
+        }
+
+        return content;
     }
 
     private static JsonObject GraphQLToV3(JsonObject graphql, JsonObject? previous)
@@ -534,7 +546,10 @@ internal static class V3Convert
             var result = previous is null ? new JsonObject() : (JsonObject)previous.DeepClone();
             result.SetOrdered("type", type, ScriptOrder);
             result.SetOrdered("code", code, ScriptOrder);
-            result.SetOrdered("language", previous?["language"]?.DeepClone() ?? script?["type"]?.DeepClone() ?? "text/javascript", ScriptOrder);
+
+            // A script's language comes with its code; an empty one keeps the language the file has (Postman's: JavaScript).
+            var language = code.Trim().Length == 0 && previous?["language"] is { } kept ? kept : script?["type"] ?? previous?["language"];
+            result.SetOrdered("language", language?.DeepClone() ?? "text/javascript", ScriptOrder);
             foreach (var extra in (string[])["packages", "requests"])
             {
                 if (script?[extra] is JsonObject { Count: > 0 } value)

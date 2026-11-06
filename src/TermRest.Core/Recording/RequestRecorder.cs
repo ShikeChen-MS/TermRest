@@ -74,6 +74,7 @@ public sealed class RequestRecorder : IDisposable
     private Task _tail = Task.CompletedTask;
     private int _pending;
     private int _redactions;
+    private int _withFiles;
     private long _bytes;
     private bool _accepting;
     private bool _finished;
@@ -150,6 +151,21 @@ public sealed class RequestRecorder : IDisposable
             lock (_gate)
             {
                 return _redactions;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Requests recorded that sent a file (the body, or a form-data field): the recording has the file's path, not its
+    /// content. Not known for recovered recordings.
+    /// </summary>
+    public int RequestsWithFiles
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _withFiles;
             }
         }
     }
@@ -291,6 +307,11 @@ public sealed class RequestRecorder : IDisposable
             }
 
             _pending++;
+            if (request.Body.HasFiles)
+            {
+                _withFiles++;
+            }
+
             _tail = _tail.ContinueWith(_ => Write(recorded), CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
         }
 
@@ -530,7 +551,7 @@ public sealed class RequestRecorder : IDisposable
             writer.WriteStartArray("pages");
             writer.WriteEndArray();
             writer.WriteString("comment", string.Create(CultureInfo.InvariantCulture,
-                $"Recorded with TermRest from {StartedAt:yyyy-MM-dd HH:mm:ss} to {stoppedAt:yyyy-MM-dd HH:mm:ss}. Credentials, cookies, tokens and secret variables are replaced with {Redactor.Placeholder}; each entry lists what was redacted in _termrest.redacted."));
+                $"Recorded with TermRest from {StartedAt:yyyy-MM-dd HH:mm:ss} to {stoppedAt:yyyy-MM-dd HH:mm:ss}. Credentials, cookies, tokens and secret variables are replaced with {Redactor.Placeholder}; each entry lists what was redacted in _termrest.redacted. Files sent with a request (a body file or a form-data file) are not included: their _file entry gives the path, size and modification time."));
             writer.WriteStartObject("_termrest");
             writer.WriteString("startedAt", HarEntryWriter.FormatTime(StartedAt));
             writer.WriteString("stoppedAt", HarEntryWriter.FormatTime(stoppedAt));

@@ -250,7 +250,7 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
             {
                 if (string.IsNullOrWhiteSpace(body.FileSrc))
                 {
-                    prepared.Errors.Add("Select a file for the binary body.");
+                    prepared.Errors.Add("Choose a file for the body.");
                     return PreparedBody.None;
                 }
 
@@ -261,7 +261,15 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
                     return PreparedBody.None;
                 }
 
-                return new PreparedBody { Kind = PreparedBodyKind.File, FilePath = path, ContentType = explicitType ?? "application/octet-stream" };
+                // The file is read (and, when typed, checked) only when the request is sent.
+                var language = BodyFile.Normalize(body.FileLanguage);
+                return new PreparedBody
+                {
+                    Kind = PreparedBodyKind.File,
+                    FilePath = path,
+                    FileLanguage = language,
+                    ContentType = explicitType ?? (language is null ? "application/octet-stream" : RequestBody.ContentTypeForLanguage(language)),
+                };
             }
 
             case BodyMode.GraphQL:

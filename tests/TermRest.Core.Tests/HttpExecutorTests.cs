@@ -93,6 +93,39 @@ public sealed class HttpExecutorTests : IDisposable
             Body = new RequestBody { Mode = BodyMode.File, FileSrc = file },
         }), _ct));
         Assert.Equal("file-content", binary["body"].GetString());
+        Assert.Equal("application/octet-stream", binary["headers"]!["content-type"].GetString());
+    }
+
+    [Fact]
+    public async Task Typed_body_files_are_checked_when_sent_and_get_their_content_type()
+    {
+        await using var server = await EchoServer.StartAsync();
+        var file = Path.Combine(_pki.Directory, "order.json");
+        await File.WriteAllTextAsync(file, "{\"item\": \"book\"}", _ct);
+        var executor = new HttpExecutor();
+        HttpRequestSpec Spec(params KeyValueEntry[] headers) => new()
+        {
+            Method = "POST",
+            Url = server.Url("echo"),
+            Headers = [.. headers],
+            Body = new RequestBody { Mode = BodyMode.File, FileSrc = file, FileLanguage = "json" },
+        };
+
+        var sent = Json(await executor.SendAsync(Prepare(Spec()), _ct));
+        Assert.Equal("{\"item\": \"book\"}", sent["body"].GetString());
+        Assert.Equal("application/json", sent["headers"]!["content-type"].GetString());
+        var patch = Json(await executor.SendAsync(Prepare(Spec(new KeyValueEntry { Key = "Content-Type", Value = "application/merge-patch+json" })), _ct));
+        Assert.Equal("application/merge-patch+json", patch["headers"]!["content-type"].GetString());
+        Assert.Contains("--data-binary '@" + file + "' \\\n  -H 'Content-Type: application/json'", CurlExporter.Export(Prepare(Spec())), StringComparison.Ordinal);
+
+        // Edited into invalid JSON after it was chosen: it is checked again when sent, and not sent.
+        await File.WriteAllTextAsync(file, "{\"item\": book}", _ct);
+        var prepared = Prepare(Spec());
+        var refused = await executor.SendAsync(prepared, _ct);
+        Assert.Null(refused.Response);
+        Assert.Null(refused.Timing.Connect);
+        Assert.Equal("Not sent: order.json is not valid JSON: 'b' is an invalid start of a value (line 1, column 10).", refused.ErrorMessage);
+        Assert.Single(prepared.Errors); // so history and recordings leave it out
     }
 
     [Fact]

@@ -46,6 +46,25 @@ public sealed class DictionaryScope(string name, IDictionary<string, string> val
 }
 
 /// <summary>
+/// A scope whose values are covered by values set in this session (by scripts). A value set to null hides the
+/// variable; lower scopes then apply, as in Postman when a script unsets a variable.
+/// </summary>
+public sealed class OverlayScope(IVariableScope inner, IReadOnlyDictionary<string, string?>? overlay) : IVariableScope
+{
+    public string Name => inner.Name;
+
+    public bool TryGetValue(string key, out string? value)
+    {
+        if (overlay is not null && overlay.TryGetValue(key, out value))
+        {
+            return value is not null;
+        }
+
+        return inner.TryGetValue(key, out value);
+    }
+}
+
+/// <summary>
 /// Resolves Postman <c>{{variable}}</c> references. Scopes are searched in order (highest precedence first:
 /// local/CLI overrides, environment, collection, globals). Values may reference other variables; resolution is
 /// repeated up to <see cref="MaxDepth"/> times. Unknown variables are left as-is, like Postman does.

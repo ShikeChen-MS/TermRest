@@ -41,6 +41,12 @@ public sealed class PreparedBody
 
     public string? FilePath { get; init; }
 
+    /// <summary>Type of a file body (json, xml…), checked when it is sent; null for a binary file.</summary>
+    public string? FileLanguage { get; init; }
+
+    /// <summary>Whether a file is sent: the body file, or a form-data file field.</summary>
+    public bool HasFiles => Kind == PreparedBodyKind.File || (Kind == PreparedBodyKind.Multipart && Parts.Any(p => p.FilePath is not null));
+
     public static PreparedBody None { get; } = new();
 
     public HttpContent? CreateContent()
@@ -69,7 +75,7 @@ public sealed class PreparedBody
         PreparedBodyKind.None => "(no body)",
         PreparedBodyKind.Text => Text ?? "",
         PreparedBodyKind.FormUrlEncoded => EncodeForm(Fields),
-        PreparedBodyKind.File => $"<file {FilePath}>",
+        PreparedBodyKind.File => FileLanguage is null ? $"<file {FilePath}>" : $"<{FileLanguage} file {FilePath}>",
         _ => string.Join('\n', Parts.Select(p => p.FilePath is null ? $"{p.Name}={p.Value}" : $"{p.Name}=@{p.FilePath}")),
     };
 

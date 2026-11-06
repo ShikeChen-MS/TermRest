@@ -1,6 +1,8 @@
 using System.Text.Json.Nodes;
+using TermRest.Core.Http;
 using TermRest.Core.Json;
 using TermRest.Core.Model;
+using TermRest.Core.Scripting;
 
 namespace TermRest.Core.Postman;
 
@@ -67,7 +69,10 @@ public static class PostmanRequestMapper
         }
 
         spec.Settings = ReadSettings(item["protocolProfileBehavior"]);
-        ReadScripts(item["event"], spec);
+        var scripts = ReadScripts(item["event"]);
+        spec.PreRequestScript = scripts.PreRequest;
+        spec.TestScript = scripts.Test;
+        spec.ScriptLanguage = scripts.Language;
         return spec;
     }
 
@@ -197,6 +202,7 @@ public static class PostmanRequestMapper
         body.UrlEncoded = ReadKeyValues(obj["urlencoded"]);
         body.FormData = ReadKeyValues(obj["formdata"]);
         body.FileSrc = (obj["file"] as JsonObject)?["src"].GetString();
+        body.FileLanguage = BodyFile.Normalize((obj["file"] as JsonObject)?["language"].GetString());
         if (obj["graphql"] is JsonObject graphql)
         {
             body.GraphQLQuery = graphql["query"].GetString() ?? "";
@@ -285,27 +291,38 @@ public static class PostmanRequestMapper
         };
     }
 
-    private static void ReadScripts(JsonNode? node, HttpRequestSpec spec)
+    /// <summary>
+    /// Reads the pre-request and test scripts from the <c>event</c> array of a collection, folder or request. The
+    /// language is the type of the first script with code; without code it is Python, the language TermRest runs.
+    /// </summary>
+    public static ScriptSet ReadScripts(JsonNode? node)
     {
-        if (node is not JsonArray events)
+        string preRequest = "", test = "";
+        string? language = null;
+        foreach (var e in (node as JsonArray)?.OfType<JsonObject>() ?? [])
         {
-            return;
-        }
-
-        foreach (var e in events.OfType<JsonObject>())
-        {
-            var exec = (e["script"] as JsonObject)?["exec"];
+            var script = e["script"] as JsonObject;
+            var exec = script?["exec"];
             var text = exec is JsonArray lines ? string.Join('\n', lines.Select(l => l.GetString() ?? "")) : exec.GetString() ?? "";
             switch (e["listen"].GetString())
             {
                 case "prerequest":
-                    spec.PreRequestScript = text;
+                    preRequest = text;
                     break;
                 case "test":
-                    spec.TestScript = text;
+                    test = text;
                     break;
+                default:
+                    continue;
+            }
+
+            if (language is null && !string.IsNullOrWhiteSpace(text))
+            {
+                language = ScriptLanguage.FromType(script?["type"].GetString());
             }
         }
+
+        return new ScriptSet(preRequest, test, language ?? ScriptLanguage.Python);
     }
 
     // ----- writing ---------------------------------------------------------------------------
@@ -406,14 +423,24 @@ public static class PostmanRequestMapper
             }
         }
 
-        if (spec.PreRequestScript != baseline.PreRequestScript)
+        ApplyScripts(item, spec.Scripts, baseline.Scripts, ItemOrder);
+    }
+
+    /// <summary>
+    /// Writes the scripts that differ from <paramref name="baseline"/> into the <c>event</c> array of a collection
+    /// (<paramref name="order"/> = <see cref="RootOrder"/>), folder or request (<see cref="ItemOrder"/>).
+    /// </summary>
+    public static void ApplyScripts(JsonObject owner, ScriptSet scripts, ScriptSet baseline, string[] order)
+    {
+        var languageChanged = scripts.Language != baseline.Language;
+        if (languageChanged || scripts.PreRequest != baseline.PreRequest)
         {
-            WriteScript(item, "prerequest", spec.PreRequestScript);
+            WriteScript(owner, "prerequest", scripts.PreRequest, scripts.Language, order);
         }
 
-        if (spec.TestScript != baseline.TestScript)
+        if (languageChanged || scripts.Test != baseline.Test)
         {
-            WriteScript(item, "test", spec.TestScript);
+            WriteScript(owner, "test", scripts.Test, scripts.Language, order);
         }
     }
 
@@ -667,6 +694,20 @@ public static class PostmanRequestMapper
             case BodyMode.File:
                 var file = obj["file"] is JsonObject existingFile ? existingFile : new JsonObject();
                 file["src"] = body.FileSrc;
+
+                // Written only when the type changed, so a value TermRest does not know stays as it was.
+                if (BodyFile.Normalize(file["language"].GetString()) != body.FileLanguage)
+                {
+                    if (body.FileLanguage is null)
+                    {
+                        file.Remove("language");
+                    }
+                    else
+                    {
+                        file["language"] = body.FileLanguage;
+                    }
+                }
+
                 if (file.Parent is null)
                 {
                     obj.SetOrdered("file", file, BodyOrder);
@@ -802,10 +843,11 @@ public static class PostmanRequestMapper
         }
     }
 
-    private static void WriteScript(JsonObject item, string listen, string text)
+    /// <summary>Writes one script's code; its <c>type</c> follows <paramref name="language"/> (Postman's scripts are JavaScript).</summary>
+    private static void WriteScript(JsonObject owner, string listen, string text, string language, string[] order)
     {
-        var events = item["event"] as JsonArray;
-        var existing = events?.OfType<JsonObject>().FirstOrDefault(e => e["listen"].GetString() == listen);
+        var events = owner["event"] as JsonArray;
+        var existing = events?.OfType<JsonObject>().LastOrDefault(e => e["listen"].GetString() == listen);
         if (existing is null && text.Length == 0)
         {
             return;
@@ -814,31 +856,32 @@ public static class PostmanRequestMapper
         if (events is null)
         {
             events = [];
-            item.SetOrdered("event", events, ItemOrder);
+            owner.SetOrdered("event", events, order);
         }
 
         if (existing is null)
         {
-            existing = new JsonObject
+            var created = new JsonObject { ["exec"] = new JsonArray(), ["type"] = ScriptLanguage.ToType(language) };
+            if (language == ScriptLanguage.JavaScript)
             {
-                ["listen"] = listen,
-                ["script"] = new JsonObject
-                {
-                    ["exec"] = new JsonArray(),
-                    ["type"] = "text/javascript",
-                    ["packages"] = new JsonObject(),
-                },
-            };
+                created["packages"] = new JsonObject();
+            }
+
+            existing = new JsonObject { ["listen"] = listen, ["script"] = created };
             events.Add((JsonNode)existing);
         }
 
         if (existing["script"] is not JsonObject script)
         {
-            script = new JsonObject { ["type"] = "text/javascript" };
+            script = new JsonObject();
             existing.SetOrdered("script", script, EventOrder);
         }
 
         var lines = text.Length == 0 ? [""] : text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
         script.SetOrdered("exec", PostmanJson.ToJsonArray(lines.Select(l => (JsonNode?)JsonValue.Create(l))), ScriptOrder);
+        if (ScriptLanguage.FromType(script["type"].GetString()) != language)
+        {
+            script.SetOrdered("type", ScriptLanguage.ToType(language), ScriptOrder);
+        }
     }
 }

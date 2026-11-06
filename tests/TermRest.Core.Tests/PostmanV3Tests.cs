@@ -149,6 +149,23 @@ public class PostmanV3Tests
     }
 
     [Fact]
+    public void File_bodies_keep_their_type_in_yaml()
+    {
+        var root = V3Fixture.Create();
+        var (_, collection) = Open(root);
+        var node = collection.FindRequest("Create widget")!;
+        var spec = node.ReadSpec();
+        spec.Body = new RequestBody { Mode = BodyMode.File, FileSrc = "payloads/widget.json", FileLanguage = "json" };
+        collection.UpdateRequest(node, spec);
+        collection.Save();
+
+        var yaml = File.ReadAllText(Path.Combine(root, "postman/collections/Widget API/Widgets/Create widget.request.yaml")).ReplaceLineEndings("\n");
+        Assert.Contains("  type: file\n  content:\n    src: payloads/widget.json\n    language: json\n", yaml, StringComparison.Ordinal);
+        var reloaded = PostmanCollection.Load(V3Fixture.CollectionPath(root)).FindRequest("Create widget")!.ReadSpec();
+        Assert.Equal((BodyMode.File, "payloads/widget.json", "json"), (reloaded.Body.Mode, reloaded.Body.FileSrc, reloaded.Body.FileLanguage));
+    }
+
+    [Fact]
     public void Renames_moves_deletes_and_additions_update_the_folder_layout()
     {
         var root = V3Fixture.Create();

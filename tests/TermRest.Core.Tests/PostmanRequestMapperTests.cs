@@ -160,6 +160,33 @@ public class PostmanRequestMapperTests
     }
 
     [Fact]
+    public void File_body_type_is_kept_in_the_file_object()
+    {
+        var (collection, node, _) = Load(TestFiles.DemoCollection, "Basics/Form URL-encoded");
+        var spec = node.ReadSpec();
+        spec.Body.Mode = BodyMode.File;
+        spec.Body.FileSrc = "payloads/order.json";
+        spec.Body.FileLanguage = "json";
+
+        collection.UpdateRequest(node, spec);
+
+        Assert.Equal("{\n\t\"mode\": \"file\",\n\t\"file\": {\n\t\t\"src\": \"payloads/order.json\",\n\t\t\"language\": \"json\"\n\t}\n}", PostmanJson.Serialize(node.Json["request"]!["body"]!));
+        var binary = node.ReadSpec();
+        Assert.Equal("json", binary.Body.FileLanguage);
+        binary.Body.FileLanguage = null;
+        collection.UpdateRequest(node, binary);
+        Assert.Null(node.Json["request"]!["body"]!["file"]!["language"]);
+
+        // A type TermRest does not know is read as binary, and kept as it is unless the type is changed.
+        node.Json["request"]!["body"]!["file"]!["language"] = "yaml";
+        var unknown = node.ReadSpec();
+        Assert.Null(unknown.Body.FileLanguage);
+        unknown.Body.FileSrc = "payloads/order.yaml";
+        collection.UpdateRequest(node, unknown);
+        Assert.Equal(("payloads/order.yaml", "yaml"), (node.Json["request"]!["body"]!["file"]!["src"].GetString(), node.Json["request"]!["body"]!["file"]!["language"].GetString()));
+    }
+
+    [Fact]
     public void Setting_auth_to_inherit_removes_the_auth_block()
     {
         var (collection, node, _) = Load(TestFiles.DemoCollection, "Auth/Basic auth");

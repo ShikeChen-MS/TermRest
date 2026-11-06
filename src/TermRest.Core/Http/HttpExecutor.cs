@@ -43,6 +43,29 @@ public sealed class HttpExecutor
             return exchange;
         }
 
+        if (request.Body is { Kind: PreparedBodyKind.File, FileLanguage: not null } fileBody)
+        {
+            // Checked as it is now (it may have changed since it was chosen), off the caller's thread: it may be large.
+            string? problem;
+            try
+            {
+                problem = await Task.Run(() => BodyFile.Check(fileBody.FilePath!, fileBody.FileLanguage, cancellationToken), cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                exchange.Cancelled = true;
+                exchange.ErrorMessage = "Request cancelled.";
+                return exchange;
+            }
+
+            if (problem is not null)
+            {
+                request.Errors.Add(problem); // nothing was sent: not kept in history or recordings
+                exchange.ErrorMessage = "Not sent: " + problem;
+                return exchange;
+            }
+        }
+
         var clock = Stopwatch.StartNew();
         var capture = new ConnectionCapture(clock);
         using var timeoutSource = request.Timeout is { } timeout && timeout > TimeSpan.Zero ? new CancellationTokenSource(timeout) : null;

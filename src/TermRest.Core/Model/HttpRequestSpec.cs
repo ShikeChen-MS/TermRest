@@ -36,6 +36,14 @@ public sealed class HttpRequestSpec
 
     public string TestScript { get; set; } = "";
 
+    /// <summary>
+    /// The language of both scripts: <see cref="Scripting.ScriptLanguage.Python"/>, which TermRest runs, or
+    /// JavaScript (Postman's own scripts, kept but not run).
+    /// </summary>
+    public string ScriptLanguage { get; set; } = Scripting.ScriptLanguage.Python;
+
+    public Scripting.ScriptSet Scripts => new(PreRequestScript, TestScript, ScriptLanguage);
+
     /// <summary>True when the source used the short form <c>"url": "..."</c>.</summary>
     internal bool UrlWasString { get; set; }
 
@@ -53,6 +61,7 @@ public sealed class HttpRequestSpec
         Description = Description,
         PreRequestScript = PreRequestScript,
         TestScript = TestScript,
+        ScriptLanguage = ScriptLanguage,
         UrlWasString = UrlWasString,
     };
 
@@ -60,7 +69,7 @@ public sealed class HttpRequestSpec
         Method == other.Method && UrlEquals(other) && KeyValueEntry.ListEquals(Headers, other.Headers)
         && Body.ContentEquals(other.Body) && AuthSpec.AreEqual(Auth, other.Auth)
         && CertificateSpec.AreEqual(Certificate, other.Certificate) && Settings.ContentEquals(other.Settings)
-        && Description == other.Description && PreRequestScript == other.PreRequestScript && TestScript == other.TestScript;
+        && Description == other.Description && Scripts.SameAs(other.Scripts);
 
     internal bool UrlEquals(HttpRequestSpec other) =>
         Url == other.Url && KeyValueEntry.ListEquals(QueryParams, other.QueryParams)

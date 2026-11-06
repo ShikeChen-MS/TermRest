@@ -8,6 +8,7 @@ using TermRest.Core.Http;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Recording;
+using TermRest.Core.Scripting;
 using TermRest.Core.Tests.Infrastructure;
 using TermRest.Core.Variables;
 using TermRest.Core.Workspace;
@@ -151,10 +152,47 @@ public sealed class RecordingTests : IDisposable
         Assert.Equal("[REDACTED]", multipart.Single(p => p!["name"]!.GetValue<string>() == "password")!["value"]!.GetValue<string>());
         Assert.Equal("hello", multipart.Single(p => p!["name"]!.GetValue<string>() == "note")!["value"]!.GetValue<string>());
         var file = multipart.Single(p => p!["name"]!.GetValue<string>() == "doc")!;
-        Assert.Equal(("upload.txt", "file-content", 12), (file["fileName"]!.GetValue<string>(), file["value"]!.GetValue<string>(), file["_size"]!.GetValue<int>()));
+        Assert.Equal("upload.txt", file["fileName"]!.GetValue<string>());
+        Assert.Null(file["value"]); // files are recorded by reference, not content
+        Assert.Equal((upload, 12, false), (file["_file"]!["path"]!.GetValue<string>(), file["_file"]!["size"]!.GetValue<int>(), file["_file"]!["contentRecorded"]!.GetValue<bool>()));
+        Assert.DoesNotContain("file-content", entries[6]!["request"]!.ToJsonString(), StringComparison.Ordinal);
 
         Assert.Contains("Unresolved variables: {{undefined}}", entries[7]!["_termrest"]!["warnings"]![0]!.GetValue<string>(), StringComparison.Ordinal);
         Assert.False(Directory.Exists(recorder.TempDirectory));
+    }
+
+    [Fact]
+    public async Task Files_sent_with_a_request_are_recorded_by_path_never_by_content()
+    {
+        await using var server = await EchoServer.StartAsync();
+        var payload = Path.Combine(_root, "order.json");
+        await File.WriteAllTextAsync(payload, "{\"item\":\"book\",\"note\":\"Only-In-The-File\"}", _ct);
+        using var runner = new RequestRunner(ApiWorkspace.Open(TestFiles.NewTempDirectory()));
+        using var recorder = Start();
+        runner.Recorder = recorder;
+        var exchange = await runner.SendAsync(runner.Prepare(PostmanCollection.Create("Recorded"), null, new HttpRequestSpec
+        {
+            Method = "POST",
+            Url = server.Url("echo"),
+            Body = new RequestBody { Mode = BodyMode.File, FileSrc = payload, FileLanguage = "json" },
+        }), _ct);
+        Assert.True(exchange.IsSuccess, exchange.ErrorMessage);
+        Assert.Equal(1, recorder.RequestsWithFiles);
+
+        var har = ReadHar(recorder.Save(Path.Combine(_root, "files.har")).Path);
+
+        var request = Entries(har)[0]!["request"]!;
+        var postData = request["postData"]!;
+        Assert.Equal("application/json", postData["mimeType"]!.GetValue<string>());
+        Assert.Null(postData["text"]);
+        var file = postData["_file"]!;
+        var size = new FileInfo(payload).Length;
+        Assert.Equal((payload, size, false), (file["path"]!.GetValue<string>(), file["size"]!.GetValue<long>(), file["contentRecorded"]!.GetValue<bool>()));
+        Assert.False(string.IsNullOrEmpty(file["modified"]?.GetValue<string>()));
+        Assert.Equal("Sent from a file. The recording keeps the file's path, not its content.", postData["comment"]!.GetValue<string>());
+        Assert.Equal(size, request["bodySize"]!.GetValue<long>());
+        Assert.DoesNotContain("Only-In-The-File", request.ToJsonString(), StringComparison.Ordinal); // the echo in the response is the server's
+        Assert.Contains("Files sent with a request (a body file or a form-data file) are not included", har["log"]!["comment"]!.GetValue<string>(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -299,6 +337,32 @@ public sealed class RecordingTests : IDisposable
 
         Assert.Equal(1, recorder.Count);
         Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref changes) == 2, TimeSpan.FromSeconds(10)), $"{changes} change(s)"); // recorded, then written
+    }
+
+    [Fact]
+    public async Task What_scripts_did_is_recorded_with_secrets_redacted()
+    {
+        using var recorder = Start();
+        var exchange = Exchange("https://example.com/orders", "{\"id\":1}"u8.ToArray());
+        exchange.Request.SecretValues.Add("s3cr3t-value");
+        var scripts = new ScriptResults { Ran = 2, Error = new ScriptError("request 'Orders'", "KeyError: 's3cr3t-value'", "Traceback (most recent call last):\nKeyError: 's3cr3t-value'") };
+        scripts.Tests.Add(new ScriptTest("status is 200", true, null, "request 'Orders'"));
+        scripts.Tests.Add(new ScriptTest("has a name", false, "AssertionError: got s3cr3t-value", "request 'Orders'"));
+        scripts.Logs.Add(new ScriptLog("test", "request 'Orders'", "token is s3cr3t-value"));
+        scripts.VariablesSet.Add("environment.token");
+        exchange.Scripts = scripts;
+
+        recorder.Record(exchange);
+        await recorder.WhenWritten();
+        var recorded = Entries(ReadHar(recorder.Save(Path.Combine(_root, "scripts.har")).Path))[0]!["_termrest"]!["scripts"]!;
+
+        Assert.Equal(2, recorded["ran"]!.GetValue<int>());
+        Assert.Equal([("status is 200", true), ("has a name", false)], recorded["tests"]!.AsArray().Select(t => (t!["name"]!.GetValue<string>(), t["passed"]!.GetValue<bool>())));
+        Assert.Equal(["environment.token"], recorded["variablesSet"]!.AsArray().Select(v => v!.GetValue<string>()));
+        Assert.StartsWith("[test · request 'Orders'] token is ", recorded["output"]![0]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.StartsWith("request 'Orders': KeyError", recorded["error"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.StartsWith("Traceback", recorded["traceback"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.DoesNotContain("s3cr3t-value", recorded.ToJsonString(), StringComparison.Ordinal);
     }
 
     [Fact]

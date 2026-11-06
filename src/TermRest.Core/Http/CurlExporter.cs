@@ -38,6 +38,13 @@ public static class CurlExporter
                 break;
             case PreparedBodyKind.File:
                 parts.Add($"--data-binary {Quote("@" + request.Body.FilePath)}");
+
+                // curl would label the file application/x-www-form-urlencoded: name the type TermRest sends.
+                if (request.GetHeader("Content-Type") is null && request.Body.ContentType is { } fileType)
+                {
+                    parts.Add($"-H {Quote($"Content-Type: {fileType}")}");
+                }
+
                 break;
         }
 

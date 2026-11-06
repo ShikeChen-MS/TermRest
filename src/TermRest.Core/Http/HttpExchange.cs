@@ -32,6 +32,9 @@ public sealed class HttpExchange(PreparedRequest request)
     /// <summary>The history entry recorded for this exchange, if history is on.</summary>
     public History.HistoryEntry? HistoryEntry { get; set; }
 
+    /// <summary>What the scripts around this request did (tests, output, variables set); null when it has none.</summary>
+    public Scripting.ScriptResults? Scripts { get; set; }
+
     public bool IsSuccess => Response is not null && ErrorMessage is null;
 
     public string Summary
