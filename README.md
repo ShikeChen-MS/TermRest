@@ -3,9 +3,11 @@
 A lightweight terminal REST client for development and testing:
 
 - **Full-screen, mouse-friendly UI** in the style of Microsoft Edit: menu bar, resizable panes, tables with checkboxes, context menus. Every action also works from the keyboard. Color themes are built in (Dracula, Nord, Solarized, and more), or you can create your own.
-- **Postman-compatible storage.** Collections and environments are Postman files, edited in place: v2.1 JSON, or the v3 YAML folders that Postman v12 keeps in Git. TermRest writes them back as Postman would (untouched JSON byte-for-byte; in YAML only the lines you changed) and keeps everything it doesn't understand (scripts, examples, unknown fields).
+- **Postman-compatible storage.** Collections and environments are Postman files, edited in place: v2.1 JSON, or the v3 YAML folders that Postman v12 keeps in Git. TermRest writes them back as Postman would (untouched JSON byte-for-byte; in YAML only the lines you changed) and keeps everything it doesn't understand (Postman's JavaScript scripts, examples, unknown fields).
+- **Scripts in Python.** Pre-request and test scripts for collections, folders and requests, with variables, request changes and tests, like Postman's. They run in the Python you choose (your project's virtual environment, so its packages are there to use). TermRest carries no script engine: Python starts for the first script and stops when idle. See [Scripts (Python)](#scripts-python).
 - **Request history and cURL import.** Every request you send is kept per workspace, with credentials masked, ready to reopen, send again or save. Paste a curl command (for example from a browser's *Copy as cURL*) into the URL bar to import it.
-- **Recording.** Press Record (F12) and every request and response you send is recorded. On stop, TermRest asks where to save it as a HAR file (JSON, opens in browser dev tools). Credentials, cookies, tokens and secret variables are redacted, and a recording streams to a private temporary file instead of growing in memory.
+- **Recording.** Press Record (F12) and every request and response you send is recorded. On stop, TermRest asks where to save it as a HAR file (JSON, opens in browser dev tools). Credentials, cookies, tokens and secret variables are redacted, files sent with a request are recorded by path only, and a recording streams to a private temporary file instead of growing in memory.
+- **Large bodies from files.** Send a file as the body without loading it: it is streamed when the request is sent, and a JSON or XML file is checked first.
 - **Client certificates (mutual TLS)** are first-class: PEM (including encrypted keys and chains), PFX/PKCS#12, and OS certificate stores. That includes the Windows certificate store with non-exportable keys and the macOS keychain. Certificates bind to URL patterns via a Newman-compatible registry, and a TLS tab shows exactly what was negotiated and presented.
 - **One native executable** per platform: Windows, macOS and Linux on x64 and ARM64. Built with .NET 10 Native AOT: under 20 MB, starts in about 50 ms, no runtime to install.
 - **A headless CLI** (`send`, `run`, `validate`, `convert`, `history`, `import-curl`, `certs`) for scripts and CI, using the same engine.
@@ -115,8 +117,8 @@ Everything is clickable: menus, tree items, tabs, buttons, table rows, and check
 - **Params:** query parameters (kept in sync with the URL) and path variables (`:id` segments).
 - **Headers**
 - **Auth:** inherit, none, Basic, Bearer, API key, Digest, NTLM, or an OAuth 2.0 access token. Other Postman auth types are kept but not yet applied.
-- **Body:** none, raw (JSON, XML, text, HTML, JavaScript, with Beautify), form-data with files, x-www-form-urlencoded, binary file, or GraphQL.
-- **Scripts:** pre-request and test scripts are kept and editable.
+- **Body:** none, raw (JSON, XML, text, HTML, JavaScript, with Beautify), form-data with files, x-www-form-urlencoded, a file (see [Sending a file as the body](#sending-a-file-as-the-body)), or GraphQL.
+- **Scripts:** pre-request and post-response (test) scripts in Python (see [Scripts (Python)](#scripts-python)). Postman's JavaScript scripts are kept and editable, but not run.
 - **Settings:** per-request SSL verification and redirects, which client certificate applies, and the description.
 
 **Response tabs**
@@ -125,6 +127,96 @@ Everything is clickable: menus, tree items, tabs, buttons, table rows, and check
 - **Headers**
 - **Timeline:** the exact request sent, DNS/connect/TLS/TTFB/download timing, and warnings.
 - **TLS:** protocol and cipher, the client certificate sent and whether the server asked for one, and the server chain with validation details.
+- **Scripts:** what the scripts did: tests, printed output, errors with their traceback, and the variables they set.
+
+### Sending a file as the body
+
+For a large payload, choose **file** in the Body tab instead of pasting it into the editor. TermRest keeps only the file's path and reads the file each time the request is sent, streaming it: it is never loaded into memory, and you can keep editing it in another program.
+
+- **Type:** *Binary* sends the file as it is (`application/octet-stream`). *JSON*, *XML*, *Text*, *HTML* and *JavaScript* set the matching Content-Type and check the file first:
+  - **JSON** must be valid, UTF-8 JSON. A byte order mark is fine; UTF-16 is not, and is named as the problem.
+  - **XML** must be well-formed. Its DTD is never processed, so entities never read other files.
+  - **Text, HTML and JavaScript** must look like text (no NUL bytes, no UTF-16).
+- **When it is checked:** when you choose the file (a file that does not fit the type is turned down, with the line and column of the problem) and again each time the request is sent, since the file may have changed. A file that no longer fits is not sent. Checking streams through a 64 KB buffer: only a single value larger than that, such as a long base64 string, needs more.
+- **Content-Type:** a `Content-Type` header on the request wins, for example `application/merge-patch+json` with the JSON type. To send deliberately broken JSON, choose *Binary* and set the header yourself.
+- **Paths:** a relative path starts at the collection's folder, and `{{variables}}` work. The file is sent byte for byte: `{{variables}}` inside it are not replaced.
+- **Postman:** the body is Postman's binary body (`"mode": "file"`); the type is stored as `"language"` in its `file` object, which Postman ignores.
+- **Recordings** keep the file's path, not its content (see [Recording requests](#recording-requests)). While recording, the Body tab says so.
+
+## Scripts (Python)
+
+Scripts run around each request, as in Postman: **pre-request** scripts before it is sent (set variables, sign it, fetch a token), **post-response** scripts once the response is in (tests, keep a value for the next request). They are written in **Python** and run by **a Python you choose**, typically your project's virtual environment, so scripts can `import` its packages (`requests`, `jwt`, `boto3` …).
+
+TermRest itself carries no script engine. Until a request has a script, nothing extra runs. Then one Python process runs every script of the session, and it stops after 5 idle minutes. Measured on the same machine, an embedded engine would always cost more:
+
+| Option | Added to TermRest | Memory while scripting |
+|---|---|---|
+| **Your Python, one process per session (TermRest)** | nothing | about 20 MB, only while scripts are in use |
+| Jint (JavaScript interpreter) | +7.6 MB per binary | +16–19 MB |
+| V8 (ClearScript) | +28.5 MB native library per platform | +50 MB |
+| Roslyn (C# scripting) | +23 MB, and no Native AOT | +190 MB |
+
+**Choosing Python**
+
+- **In the UI:** *Tools › Scripts (Python)…*. Type a command (`python3`) or a path, which may be relative to the workspace (`.venv/bin/python`, `.venv\Scripts\python.exe`). Or press **Find**: it looks for `.venv`, `venv` and `env` in the workspace, then `python3` and `python` on PATH. **Check** shows the version. Python 3.8 or later is needed.
+- **Your choice is kept per workspace folder in your user settings**, never in the workspace. A cloned repository cannot choose a program for TermRest to run.
+- **On the command line:** `--python <path>` on `send` and `run`; without it, the UI's choice for that workspace applies. `--no-scripts` turns scripts off.
+
+**Writing scripts**
+
+- **A request's scripts** are in its *Scripts* tab, with the language set to *Python*.
+- **A collection's or folder's scripts:** right-click it in the tree › *Scripts…* (or *Request › Collection or folder scripts…*). They run for every request inside.
+- **Order:** each phase runs the scripts of the collection, then the folders (outermost first), then the request.
+- **A failing pre-request script stops the request.** This covers an exception, a syntax error, a timeout, and no Python chosen. The request is not sent, nor added to the history or a recording, and the error is shown with its Python traceback.
+- **Time limit:** each phase may take 30 seconds; Python is then stopped and started again for the next script.
+- **Working folder:** Python runs in the workspace folder, so scripts can import your own modules from it. Modules load once per Python process; *Tools › Scripts › Stop Python* reloads them.
+
+| The `tr` object | |
+|---|---|
+| `tr.environment`, `tr.collection_variables`, `tr.globals` | `.get(name, default)`, `.set(name, value)`, `.unset(name)`, `.has(name)`, `.clear()`, `.to_dict()`, and `tr.environment["name"]`. Values set are kept in memory until TermRest closes (Postman's "current values"); files are never changed. *Tools › Scripts* shows how many there are and clears them. |
+| `tr.variables` | Reads every scope (this request, the environment, the collection, the globals: the first that has it). `.set()` is for this request only. `.replace_in("{{base}}/x")` replaces `{{variables}}` in a text. |
+| `tr.request` | `.method`, `.url`, `.headers` (`.get`, `.get_all`, `.set`, `.add`, `.remove`, `.items()`), `.body` (raw bodies). Pre-request scripts can change them; `{{variables}}` they contain are replaced afterwards. Test scripts see the request as it was sent. |
+| `tr.response` | In test scripts: `.status` (or `.code`), `.reason`, `.headers`, `.time` (ms), `.size`, `.text()`, `.json()`, `.content` (bytes). |
+| `tr.test(name, fn)`, `@tr.test(name)` | Records a test that fails when `fn` raises, as `assert` does. |
+| `tr.info` | `.phase` (`prerequest` or `test`), `.script`, `.request_name`, `.collection`, `.environment`. |
+| `print(…)` | Goes to the response's *Scripts* tab, and to stderr on the command line. |
+
+Variable values are text: `set("n", 42)` stores `42`, `True` becomes `true`, and lists and dicts become JSON.
+
+```python
+# Collection pre-request script: log in once, then send the token with every request
+import json, urllib.request
+
+if not tr.environment.get("token"):
+    body = json.dumps({"user": tr.environment.get("user"), "password": tr.environment.get("password")}).encode()
+    login = urllib.request.Request(tr.variables.replace_in("{{base}}/login"), body, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(login) as reply:
+        tr.environment.set("token", json.load(reply)["token"])
+tr.request.headers.set("Authorization", "Bearer " + tr.environment.get("token"))
+```
+
+```python
+# Request post-response script
+@tr.test("creates the item")
+def _():
+    assert tr.response.status == 201, tr.response.status
+    assert tr.response.json()["name"] == "Ada"
+
+tr.collection_variables.set("item_id", tr.response.json()["id"])
+```
+
+**Where the results show**
+
+- **In the UI**, the response's status line says `tests 3/3 passed`, `✗ 1 of 3 tests failed` or `✗ script error`. Its *Scripts* tab lists the tests, the output, errors with their traceback, and the variables set. *Help › Scripting (Python)* summarizes the `tr` object.
+- **`termrest send`** prints the output and tests to stderr. It exits with 1 when a test fails or a script fails.
+- **`termrest run`** prints them under each request, and a request whose tests fail counts as failed. `--report-json` includes `tests` and `scriptError`.
+- **Recordings** include `_termrest.scripts`: tests, the error and traceback, the names (not the values) of the variables set, and what the scripts printed, all redacted like the rest.
+
+**Compatibility and safety**
+
+- Scripts are stored in Postman's `event` entries. Python ones are marked `"type": "text/x-python"` (in v3 YAML: `language: text/x-python`). Postman keeps them, but doesn't run them.
+- Postman's JavaScript scripts are kept as they are and not run. The *Scripts* tab says so; switch its language to *Python* to write a script that TermRest runs.
+- **Scripts run as you, with your permissions:** like any program, they can read files and use the network. Choose Python only for workspaces whose collections you trust.
 
 ## Color themes
 
@@ -187,17 +279,27 @@ termrest send … --no-history                 # send without recording
 
 Click **● Record** at the right end of the menu bar (or press **F12**, or choose *Tools › Start recording*). Every request you send after that is recorded with its response:
 
-- **The request:** method, URL, headers, cookies, query parameters, and the body (text, form fields, uploaded files).
+- **The request:** method, URL, headers, cookies, query parameters, and the body: text and form fields as sent; files by reference only (see below).
 - **The response:** status, headers, cookies and the full body.
 - **Connection details:** timing, the server address, and TLS (protocol, cipher, server certificate chain, the client certificate sent).
 - **Failures:** the error of requests that failed.
 
 While recording, the button turns into a red badge with a blinking dot, the time since recording started and the number of requests recorded: **● REC 01:23 · 3 requests · Stop F12**. The Response pane's title shows which request a response was recorded as (**Response · ● recorded #3**).
 
+**Files are recorded by reference, never their content.** For a [body sent from a file](#sending-a-file-as-the-body) or a form-data file field, the recording keeps the file's path, size and modification time. The file stays where it is, and the recording stays small. You see this in three places: the Body tab says so while recording, the status line after sending says *● recorded with the file's path, not its content*, and the stop dialog counts the requests that sent files. In the HAR file, such a body has no `text`; it has a `_file` entry that says `"contentRecorded": false`, plus a comment that HAR viewers show:
+
+```jsonc
+"postData": {
+  "mimeType": "application/json",
+  "_file": { "path": "C:\\work\\payloads\\orders.json", "size": 48213772, "modified": "2026-11-05T16:58:01.123-07:00", "contentRecorded": false },
+  "comment": "Sent from a file. The recording keeps the file's path, not its content."
+}
+```
+
 Click the badge (or press F12) to stop. TermRest asks where to save the recording. The default is `termrest-recording-<date>-<time>.har` in the workspace folder; type another path or use *Browse…*.
 
 - **The file** is JSON in **HAR 1.2** format (HTTP Archive), the format browser dev tools export. Chrome, Edge and Firefox (*Network › Import HAR*), Fiddler, Charles, Insomnia and HAR viewers open it.
-- **TermRest's own details** are under `_termrest` keys, as HAR allows: collection, request, environment, auth type, settings, TLS, warnings, and what was redacted.
+- **TermRest's own details** are under `_termrest` keys, as HAR allows: collection, request, environment, auth type, settings, TLS, warnings, what the [scripts](#scripts-python) did, and what was redacted.
 - **The other choices:** *Keep recording* goes on, and *Discard* throws the recording away. Quitting or switching workspaces while recording asks first.
 
 ```jsonc
@@ -239,7 +341,7 @@ Click the badge (or press F12) to stop. TermRest asks where to save the recordin
 - **Memory:** a recording does not grow in memory.
   - Each request is written to a temporary file as soon as its response arrives, on a background thread.
   - Bodies are written in 64 KB pieces, and saving copies the temporary file into the HAR file through a small buffer.
-  - Responses and uploaded files are included up to the workspace's maximum response size (*Tools › Settings*, 50 MB).
+  - Responses are included up to the workspace's maximum response size (*Tools › Settings*, 50 MB). Files sent with a request are never read for the recording.
 - **Temporary files** are private to you (on Unix, a folder only you can read) and are deleted after saving or discarding:
   - Windows: `%TEMP%`.
   - macOS: `$TMPDIR`, which is per user.
@@ -369,7 +471,7 @@ termrest certs match https://client.badssl.com/ samples
 ```text
 termrest [<workspace>] [--theme <name>]        open the UI (default: current directory)
 termrest send <collection> <request> [opts]    send one request; body to stdout, status/diagnostics to stderr
-termrest run <collection> [--folder F] [opts]  run all requests in order; exit code 1 if any fail
+termrest run <collection> [--folder F] [opts]  run all requests in order, with their scripts; exit code 1 if any fail
 termrest validate <files…>                     check that files (JSON, YAML, v3 folders) round-trip unchanged through TermRest
 termrest convert <input> [--to v3|v2.1] [-o O] convert a collection or environment between v2.1 JSON and v3 YAML
 termrest history [<workspace>] [opts]          requests sent from a workspace, newest first
@@ -380,6 +482,7 @@ termrest snapshot [<workspace>] [--send]       render the UI headlessly (smoke t
 
 <collection>: a *.postman_collection.json file or a v3 collection folder
 common options:      -e/--env <name|file>  --var key=value  --timeout <ms>  -k/--insecure  --record <file.har>
+                     --python <path>  --no-scripts
 send options:        -i/--include  -v/--verbose  -o/--output <file>  --raw  -f/--fail  --curl  --no-history
 run options:         --bail  --allow-http-errors  --report-json <file>
 history options:     -n/--limit <n>  --show <id>  --json  --clear
@@ -392,7 +495,8 @@ snapshot options:    --send  --request <path>  --width <n>  --height <n>  --them
 ```sh
 termrest run "samples/TermRest Demo.postman_collection.json" -e "Postman Echo" --report-json report.json
 termrest send api.postman_collection.json "Users/Get user" --var userId=42 -i
-termrest send api.postman_collection.json "Users/Get user" --curl     # print an equivalent curl command
+termrest send api.postman_collection.json "Users/Get user" --curl     # print an equivalent curl command (scripts do not run)
+termrest run api.postman_collection.json --python .venv/bin/python   # run the collection's Python scripts and tests
 ```
 
 ## Postman compatibility
@@ -404,9 +508,9 @@ termrest send api.postman_collection.json "Users/Get user" --curl     # print an
 | Collection v3.0.0 YAML (Postman v12 "Native Git") | Read/write: `postman/collections/<name>/` folders with `*.request.yaml` and `definition.yaml`; edits rewrite only the changed lines. See [Postman v3 (YAML) collections](#postman-v3-yaml-collections) |
 | Environments / globals | Read/write: JSON (`*.postman_environment.json`, `*.postman_globals.json`) and YAML (`postman/environments/*.environment.yaml`, `postman/globals/workspace.globals.yaml`) |
 | Folders, descriptions, saved examples, `protocolProfileBehavior`, unknown fields | Kept; edited fields are rewritten surgically |
-| Body modes | raw, urlencoded, formdata (text + files), file, graphql |
+| Body modes | raw, urlencoded, formdata (text + files), file (binary, or typed and checked: `file.language`), graphql |
 | Auth | inherit, noauth, basic, bearer, apikey, digest, ntlm, oauth2 (access token) — others are kept, not applied |
-| `pm.*` scripts | Kept and editable, **not executed yet** |
+| Scripts | Python scripts (`"type": "text/x-python"`; v3 `language: text/x-python`) run, see [Scripts (Python)](#scripts-python). JavaScript (`pm.*`) scripts are kept and editable, **not run** |
 | Client certificates | `request.certificate` honoured; Newman certificate-list format for the registry |
 | cURL | Import (bash, cmd and PowerShell syntax) and export |
 
@@ -428,7 +532,8 @@ The [CI workflow](.github/workflows/ci.yml) tests on Windows, Linux and macOS. I
 
 ```text
 src/TermRest.Core   UI-free engine: Postman model + mapper (v2.1 JSON, v3 YAML), YAML reader/writer, variables,
-                    HTTP executor, certificates, history, recording (HAR, redaction), cURL import, workspace
+                    HTTP executor, certificates, history, recording (HAR, redaction), scripts (Python worker),
+                    cURL import, workspace
 src/TermRest.Tui    Terminal.Gui v2 views and dialogs
 src/TermRest.Cli    `termrest` executable (System.CommandLine): TUI by default + headless commands
 tests/…Core.Tests   xUnit v3: fidelity, mapper, URLs, variables, certificates, YAML, Postman v3, history, cURL,
@@ -441,6 +546,7 @@ dotnet build
 dotnet test                                    # Microsoft.Testing.Platform runner (see global.json)
 TERMREST_STORE_TESTS=1 dotnet test             # Windows: also run the non-exportable cert-store mTLS test
 TERMREST_V3_CORPUS=<folder> dotnet test        # also edit and revert every Postman v3 collection found under <folder>
+TERMREST_TEST_PYTHON=<python> dotnet test      # the Python for script tests (default: python3 or python on PATH; skipped without)
 ```
 
 Notes:
@@ -453,9 +559,7 @@ Notes:
 
 - **Next:** OAuth 2.0 token acquisition, including Entra ID client credentials with a certificate; response search and JSON path filtering; saving responses as Postman examples, and showing them in v3 collections.
 - **Phase 2:**
-  - Script execution: generated assertions first, then a `pm.*` sandbox.
-  - A collection runner with tests.
-  - Syntax-highlighted editor.
+  - Syntax-highlighted editor, for bodies and scripts.
   - Proxy authentication.
   - Code snippets.
 - **Packaging:** winget, Homebrew, `.deb`/`.rpm`, and signed binaries.
