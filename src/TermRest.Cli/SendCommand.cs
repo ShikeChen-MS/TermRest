@@ -16,7 +16,7 @@ internal static class SendCommand
         var output = new Option<string?>("--output", "-o") { Description = "Write the raw response body to a file" };
         var raw = new Option<bool>("--raw") { Description = "Print the body as received (no JSON/XML pretty printing)" };
         var fail = new Option<bool>("--fail", "-f") { Description = "Exit with code 22 when the HTTP status is 400 or higher" };
-        var curl = new Option<bool>("--curl") { Description = "Print the request as a cURL command instead of sending it" };
+        var curl = new Option<bool>("--curl") { Description = "Print the request as a cURL command instead of sending it (scripts do not run)" };
         var noHistory = new Option<bool>("--no-history") { Description = "Do not record this request in the workspace history" };
         var options = new RequestOptions();
         command.Arguments.Add(collection);
@@ -52,14 +52,11 @@ internal static class SendCommand
                 return 2;
             }
 
-            var prepared = runner.Prepare(match.Collection, match.Node, match.Node!.ReadSpec());
-            foreach (var warning in prepared.Warnings)
-            {
-                Output.Warning(warning);
-            }
-
+            var spec = match.Node!.ReadSpec();
             if (parseResult.GetValue(curl))
             {
+                var prepared = runner.Prepare(match.Collection, match.Node, spec);
+                PrintWarnings(prepared);
                 Console.Out.WriteLine(CurlExporter.Export(prepared));
                 return 0;
             }
@@ -69,13 +66,27 @@ internal static class SendCommand
                 return 2;
             }
 
-            var exchange = await runner.SendAsync(prepared, cancellationToken);
+            var exchange = await runner.SendAsync(match.Collection, match.Node, spec, PrintWarnings, cancellationToken);
             var recorded = options.SaveRecording(parseResult, runner, recorder);
             var code = await ReportAsync(parseResult, exchange, verbose, include, output, raw, fail, cancellationToken);
+            ScriptOutput.Print(exchange);
+            if (code == 0 && exchange.Scripts is { Succeeded: false })
+            {
+                code = 1; // a test failed or a script did not run
+            }
+
             return recorded || code != 0 ? code : 1;
         });
 
         return command;
+    }
+
+    private static void PrintWarnings(PreparedRequest prepared)
+    {
+        foreach (var warning in prepared.Warnings)
+        {
+            Output.Warning(warning);
+        }
     }
 
     private static async Task<int> ReportAsync(

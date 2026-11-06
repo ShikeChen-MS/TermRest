@@ -25,8 +25,7 @@ internal sealed class RequestEditor : View
     private readonly KeyValueTable _headers;
     private readonly AuthEditor _auth;
     private readonly BodyEditor _body;
-    private readonly TextArea _preRequestScript;
-    private readonly TextArea _testScript;
+    private readonly ScriptsEditor _scripts;
     private readonly OptionSelector _strictSsl;
     private readonly OptionSelector _followRedirects;
     private readonly Label _certificateInfo;
@@ -107,24 +106,16 @@ internal sealed class RequestEditor : View
         bodyTab.Add(_body);
 
         var scriptsTab = new View { Title = "Scripts", Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
-        _preRequestScript = new TextArea { X = 0, Y = 2, Width = Dim.Percent(50), Height = Dim.Fill() };
-        _preRequestScript.UserEdited += (_, _) =>
+        _scripts = new ScriptsEditor();
+        _scripts.Changed += (_, _) =>
         {
-            Spec.PreRequestScript = _preRequestScript.GetText();
+            var scripts = _scripts.Scripts;
+            Spec.PreRequestScript = scripts.PreRequest;
+            Spec.TestScript = scripts.Test;
+            Spec.ScriptLanguage = scripts.Language;
             MarkModified();
         };
-        _testScript = new TextArea { X = Pos.Right(_preRequestScript) + 1, Y = 2, Width = Dim.Fill(), Height = Dim.Fill() };
-        _testScript.UserEdited += (_, _) =>
-        {
-            Spec.TestScript = _testScript.GetText();
-            MarkModified();
-        };
-        scriptsTab.Add(
-            new Label { Text = "Postman scripts are saved with the collection; running them (pm.* API) is on the roadmap.", X = 0, Y = 0 },
-            new Label { Text = "Pre-request", X = 0, Y = 1 },
-            new Label { Text = "Post-response (tests)", X = Pos.Left(_testScript), Y = 1 },
-            _preRequestScript,
-            _testScript);
+        scriptsTab.Add(_scripts);
 
         var settingsTab = new View { Title = "Settings", Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
         _strictSsl = new OptionSelector { X = 30, Y = 0, Orientation = Orientation.Horizontal, Labels = ["Workspace default", "On", "Off"], Value = 0 };
@@ -201,6 +192,25 @@ internal sealed class RequestEditor : View
         set => _auth.DescribeInherited = value;
     }
 
+    /// <summary>Folder that the request's relative file paths start from (its collection's folder).</summary>
+    public Func<string>? BaseDirectory
+    {
+        get => _body.BaseDirectory;
+        set => _body.BaseDirectory = value;
+    }
+
+    /// <summary>What the Body tab says about the body file (for tests).</summary>
+    internal string BodyFileStatus => _body.FileStatus;
+
+    /// <summary>The Scripts tab (for tests).</summary>
+    internal ScriptsEditor ScriptsTab => _scripts;
+
+    /// <summary>Whether requests are being recorded: the Body tab then says how body files are recorded.</summary>
+    public void SetRecording(bool recording) => _body.Recording = recording;
+
+    /// <summary>Uses a body file as if the user picked it in the Body tab (for tests).</summary>
+    internal void ChooseBodyFile(string path) => _body.ChooseFile(path);
+
     public void Load(HttpRequestSpec spec)
     {
         _loading = true;
@@ -215,8 +225,7 @@ internal sealed class RequestEditor : View
             _headers.SetEntries(spec.Headers);
             _auth.Load(spec.Auth);
             _body.Load(spec.Body);
-            _preRequestScript.SetText(spec.PreRequestScript);
-            _testScript.SetText(spec.TestScript);
+            _scripts.Load(spec.Scripts);
             _strictSsl.Value = spec.Settings.StrictSsl switch { true => 1, false => 2, null => 0 };
             _followRedirects.Value = spec.Settings.FollowRedirects switch { true => 1, false => 2, null => 0 };
             _description.SetText(spec.Description ?? "");

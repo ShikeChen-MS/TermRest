@@ -96,6 +96,9 @@ internal sealed class MainWindow : Runnable
         {
             DescribeCertificate = DescribeCertificate,
             DescribeInheritedAuth = DescribeInheritedAuth,
+
+            // Where a relative body file is looked for when sending: the folder of the collection sending it.
+            BaseDirectory = () => (_collection ?? _scratch)?.BaseDirectory ?? Environment.CurrentDirectory,
         };
         _requestFrame.Add(_editor);
 
@@ -207,6 +210,12 @@ internal sealed class MainWindow : Runnable
     /// <summary>The title of the response pane (it says when the response shown was recorded).</summary>
     internal string ResponseTitle => _responseFrame.Title;
 
+    /// <summary>What the Body tab says about the body file.</summary>
+    internal string BodyFileStatus => _editor.BodyFileStatus;
+
+    /// <summary>Uses a body file as if it was picked in the Body tab (for tests: the file dialog is Terminal.Gui's).</summary>
+    internal void ChooseBodyFile(string path) => _editor.ChooseBodyFile(path);
+
     /// <summary>Selects and opens a request (used by snapshots and tests).</summary>
     internal void ShowRequest(RequestNode node)
     {
@@ -217,8 +226,8 @@ internal sealed class MainWindow : Runnable
     /// <summary>Sends the current request and shows the result without an event loop (used by snapshots).</summary>
     internal async Task SendAndShowAsync(CancellationToken cancellationToken = default)
     {
-        var prepared = _runner.Prepare(_collection ?? (_scratch ??= PostmanCollection.Create("Scratch")), _node, _editor.Spec);
-        var exchange = await _runner.SendAsync(prepared, cancellationToken).ConfigureAwait(false);
+        var collection = _collection ?? (_scratch ??= PostmanCollection.Create("Scratch"));
+        var exchange = await _runner.SendAsync(collection, _node, _editor.Spec, null, cancellationToken).ConfigureAwait(false);
         _response.ShowExchange(exchange);
     }
 
@@ -253,6 +262,8 @@ internal sealed class MainWindow : Runnable
             new MenuItem("_Import from cURL…", "", ShowCurlImport),
             new MenuItem("_History", Key.F9, ToggleHistory),
             new MenuItem("Focus _URL bar", Key.L.WithCtrl, () => _editor.FocusUrl()),
+            new Line(),
+            new MenuItem("Collection or folder scrip_ts…", "", () => EditScripts(TargetFolder())),
         ]),
         new MenuBarItem("_Environment",
         [
@@ -263,6 +274,7 @@ internal sealed class MainWindow : Runnable
         [
             new MenuItem("Client _certificates…", Key.F8, ShowCertificates),
             new MenuItem("_Settings…", "", ShowSettings),
+            new MenuItem("Scri_pts (Python)…", "", ShowScriptSettings),
             new MenuItem("Color _theme…", "", ShowThemes),
             new MenuItem("Clear _cookies", "", ClearCookies),
             new Line(),
@@ -272,6 +284,7 @@ internal sealed class MainWindow : Runnable
         new MenuBarItem("_Help",
         [
             new MenuItem("_Keyboard & mouse", "", ShowKeys),
+            new MenuItem("_Scripting (Python)", "", ShowScriptingHelp),
             new MenuItem("_Workspace info", "", ShowWorkspaceInfo),
             new MenuItem("_About TermRest", "", ShowAbout),
         ]),
@@ -337,18 +350,9 @@ internal sealed class MainWindow : Runnable
         }
 
         var collection = _collection ?? (_scratch ??= PostmanCollection.Create("Scratch"));
-        PreparedRequest prepared;
-        try
-        {
-            prepared = _runner.Prepare(collection, _node, _editor.Spec);
-        }
-        catch (Exception ex)
-        {
-            Ui.Error(App!, "Cannot send", ex.Message);
-            return;
-        }
-
-        _response.ShowSending(prepared);
+        var previous = _response.Exchange;
+        PreparedRequest? prepared = null;
+        _response.ShowRunningScripts(); // replaced at once when there are no pre-request scripts
         SetResponseTitle(null);
         _editor.SetSending(true);
         using var cancellation = new CancellationTokenSource();
@@ -358,10 +362,38 @@ internal sealed class MainWindow : Runnable
         HttpExchange exchange;
         try
         {
-            exchange = await _runner.SendAsync(prepared, cancellation.Token);
+            // Scripts run first; the request is shown as soon as it is ready to go.
+            exchange = await _runner.SendAsync(collection, _node, _editor.Spec, ready =>
+            {
+                prepared = ready;
+                _response.ShowSending(ready);
+            }, cancellation.Token);
         }
         catch (Exception ex)
         {
+            if (prepared is null)
+            {
+                // It could not even be prepared (a certificate that does not load…): nothing was sent.
+                _sending = null;
+                if (_closed)
+                {
+                    return;
+                }
+
+                _editor.SetSending(false);
+                if (previous is null)
+                {
+                    _response.Clear();
+                }
+                else
+                {
+                    _response.ShowExchange(previous);
+                }
+
+                Ui.Error(App!, "Cannot send", ex.Message);
+                return;
+            }
+
             exchange = new HttpExchange(prepared) { ErrorMessage = ex.Message, Exception = ex };
         }
         finally
@@ -377,8 +409,15 @@ internal sealed class MainWindow : Runnable
 
         _editor.SetSending(false);
         _response.ShowExchange(exchange);
-        SetResponseTitle(recorder is not null && ReferenceEquals(recorder, _runner.Recorder) && recorder.Count > recordedBefore ? recorder.Count : null);
-        Notify(exchange.Response is null ? "" : $"{exchange.Request.Method} {exchange.Request.Uri?.Host} → {exchange.Response.StatusCode}");
+        var recordedAs = recorder is not null && ReferenceEquals(recorder, _runner.Recorder) && recorder.Count > recordedBefore ? recorder.Count : (int?)null;
+        SetResponseTitle(recordedAs);
+        var result = exchange.Response is null ? "" : $"{exchange.Request.Method} {exchange.Request.Uri?.Host} → {exchange.Response.StatusCode}";
+        if (recordedAs is not null && exchange.Request.Body.HasFiles)
+        {
+            result += (result.Length == 0 ? "" : " · ") + "● recorded with the file's path, not its content";
+        }
+
+        Notify(result);
         UpdateRecording();
         if (exchange.HistoryEntry is { } entry && _historyLoaded)
         {
@@ -608,6 +647,12 @@ internal sealed class MainWindow : Runnable
             items.Add(new MenuItem("De_lete…", "", () => DeleteItem(item)));
         }
 
+        if (item is PostmanCollection or FolderNode)
+        {
+            items.Add(new Line());
+            items.Add(new MenuItem("Scrip_ts…", "", () => EditScripts(TargetFolder())));
+        }
+
         if (item is RequestNode)
         {
             items.Add(new Line());
@@ -693,6 +738,77 @@ internal sealed class MainWindow : Runnable
             Notify($"Color theme: {theme.Name}{(_workspace.Settings.Theme is null ? "" : " (this workspace)")}");
         }
     }
+
+    // ----- scripts ---------------------------------------------------------------------------
+
+    /// <summary>Edits the scripts of a collection or folder: they run around every request inside.</summary>
+    private void EditScripts(FolderNode? folder)
+    {
+        if (folder is null)
+        {
+            Notify("Select a collection or folder first.");
+            return;
+        }
+
+        var collection = folder.Collection;
+        var owner = folder is CollectionRootNode ? $"collection '{collection.Name}'" : $"folder '{folder.PathInCollection}'";
+        if (ScriptsDialog.Edit(App!, owner, collection.GetScripts(folder)) is { } scripts && collection.SetScripts(folder, scripts))
+        {
+            _tree.RefreshItem(collection);
+            UpdateTitles();
+            Notify($"Scripts of {owner} changed (Ctrl+S saves the collection).");
+        }
+    }
+
+    private void ShowScriptSettings()
+    {
+        ScriptsDialog.ShowPython(App!, _workspace, _runner);
+        Notify(_runner.PythonInterpreter is { } python ? $"Scripts run with {python}" : "No Python chosen: scripts do not run.");
+    }
+
+    private void ShowScriptingHelp() => Ui.ShowText(App!, "Scripting (Python)", ScriptingHelp);
+
+    internal const string ScriptingHelp = """
+        Scripts are Python, run by the Python you choose in Tools › Scripts… (a virtual environment's python lets
+        scripts import its packages). One Python process runs them: it starts for the first script and stops after
+        5 idle minutes, so scripts cost nothing until you use them. Each phase may take up to 30 seconds.
+
+        When they run
+          Pre-request scripts run before the request is prepared, then post-response (test) scripts once the response
+          has arrived. Each phase runs the scripts of the collection, then its folders (outermost first), then the
+          request. A pre-request script that fails stops the request: it is not sent. Edit collection and folder
+          scripts with right-click › Scripts…; Postman's JavaScript scripts are kept but not run.
+
+        The tr object
+          tr.environment, tr.collection_variables, tr.globals
+                       .get(name), .set(name, value), .unset(name), .has(name), .to_dict(), and tr.environment["name"].
+                       Values set are kept until TermRest closes (Postman's "current values"): files never change.
+          tr.variables   reads every scope (this request, environment, collection, globals); .set() is for this
+                       request only; .replace_in("{{base}}/x") replaces {{variables}} in a text.
+          tr.request     .method, .url, .headers (.get .set .add .remove), .body: change them before sending.
+          tr.response    .status (or .code), .reason, .headers, .time (ms), .size, .text(), .json(), .content (bytes).
+          tr.test(name, fn)  records a test that fails when fn raises (assert …); also @tr.test("name") on a function.
+          tr.info        .phase ("prerequest" or "test"), .script, .request_name, .collection, .environment.
+          print(…)       output goes to the response's Scripts tab, with the tests and errors.
+
+        Example: a collection pre-request script that logs in once and sends the token
+          import json, urllib.request
+          if not tr.environment.get("token"):
+              body = json.dumps({"user": tr.environment.get("user"), "password": tr.environment.get("password")}).encode()
+              login = urllib.request.Request(tr.variables.replace_in("{{base}}/login"), body, {"Content-Type": "application/json"})
+              with urllib.request.urlopen(login) as reply:
+                  tr.environment.set("token", json.load(reply)["token"])
+          tr.request.headers.set("Authorization", "Bearer " + tr.environment.get("token"))
+
+        Example: tests
+          @tr.test("returns the new item")
+          def _():
+              assert tr.response.status == 201, tr.response.status
+              assert tr.response.json()["name"] == "Ada"
+
+        Python runs in the workspace folder, so scripts can import your own modules from it. Scripts run with your
+        permissions: choose Python only for workspaces whose collections you trust.
+        """;
 
     // ----- recording -------------------------------------------------------------------------
 
@@ -816,6 +932,7 @@ internal sealed class MainWindow : Runnable
             return;
         }
 
+        _editor.SetRecording(_runner.Recorder is not null);
         if (_runner.Recorder is { } recorder)
         {
             _recordIndicator.ShowRecording(recorder.StartedAt, recorder.Count);

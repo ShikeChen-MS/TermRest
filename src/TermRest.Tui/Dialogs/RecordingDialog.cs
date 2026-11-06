@@ -52,6 +52,11 @@ internal static class RecordingDialog
         dialog.Add(
             new Label { Text = summary, X = 1, Y = 1, Width = Dim.Fill(1) },
             new Label { Text = $"Secrets are redacted{redactions}: credentials, cookies, tokens and secret variables read {Redactor.Placeholder}.", X = 1, Y = 2, Width = Dim.Fill(1) });
+        if (recorder.RequestsWithFiles is var withFiles and > 0)
+        {
+            var sent = withFiles == 1 ? "1 of them sent a file" : $"{withFiles} of them sent files";
+            dialog.Add(new Label { Text = $"{sent}: the recording keeps the file's path, not its content.", X = 1, Y = 3, Width = Dim.Fill(1) });
+        }
         var path = Ui.AddRow(dialog, "Save as", new TextField { Text = defaultPath, Width = Dim.Fill(13) }, 4, 8);
         var browse = new Button { Text = "Browse…", X = Pos.AnchorEnd(12), Y = 4 };
         browse.Accepted += (_, _) =>

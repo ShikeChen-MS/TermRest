@@ -12,7 +12,7 @@ internal static class RunCommand
 {
     public static Command Create(Option<bool> insecure)
     {
-        var command = new Command("run", "Run all requests in a collection (or one folder) in order and report status codes and timings.");
+        var command = new Command("run", "Run all requests in a collection (or one folder) in order, with their scripts, and report status codes, tests and timings.");
         var collection = new Argument<string>("collection") { Description = "Collection file or v3 collection folder" };
         var folder = new Option<string?>("--folder") { Description = "Only run requests inside this folder path" };
         var bail = new Option<bool>("--bail") { Description = "Stop at the first failure" };
@@ -70,6 +70,7 @@ internal static class RunCommand
                         $"{(runner.Environment is { } env ? $" with environment '{env.Name}'" : "")}\n");
 
             var results = new List<(RequestNode Node, HttpExchange Exchange, bool Passed)>();
+            var notesShown = new HashSet<string>(StringComparer.Ordinal);
             var cancelled = false;
             foreach (var node in requests)
             {
@@ -80,7 +81,8 @@ internal static class RunCommand
                     break;
                 }
 
-                var passed = exchange.Response is { } r && (parseResult.GetValue(allowHttpErrors) || r.StatusCode < 400);
+                // Passing means a response (not an HTTP error, unless allowed), passing tests and no script errors.
+                var passed = exchange.Response is { } r && (parseResult.GetValue(allowHttpErrors) || r.StatusCode < 400) && exchange.Scripts?.Succeeded != false;
                 results.Add((node, exchange, passed));
                 var status = exchange.Response is { } response ? response.StatusCode.ToString(System.Globalization.CultureInfo.InvariantCulture) : "ERR";
                 Output.Status($"{(passed ? "✓" : "✗")} {status,-4} {HttpExchange.Format(exchange.Timing.Total),9}  {exchange.Request.Method,-7} {node.PathInCollection}", passed);
@@ -94,6 +96,7 @@ internal static class RunCommand
                     Output.Warning($"  {warning}");
                 }
 
+                ScriptOutput.Print(exchange, "      ", notesShown, notRun: false);
                 if (!passed && parseResult.GetValue(bail))
                 {
                     break;
@@ -101,7 +104,13 @@ internal static class RunCommand
             }
 
             var failed = results.Count(r => !r.Passed);
-            Output.Info($"\n{(cancelled ? "Run cancelled. " : "")}{results.Count - failed} passed, {failed} failed, {requests.Count - results.Count} skipped");
+            var tests = results.SelectMany(r => r.Exchange.Scripts?.Tests ?? []).ToList();
+            var testSummary = tests.Count == 0 ? "" : $" (tests: {tests.Count(t => t.Passed)} passed, {tests.Count(t => !t.Passed)} failed)";
+            Output.Info($"\n{(cancelled ? "Run cancelled. " : "")}{results.Count - failed} passed, {failed} failed, {requests.Count - results.Count} skipped{testSummary}");
+            if (results.Count(r => r.Exchange.Scripts?.NotRun.Count > 0) is > 0 and var withJavaScript)
+            {
+                Output.Info($"note: {withJavaScript} request(s) have JavaScript (Postman) scripts, which are not run: TermRest runs scripts written in Python.");
+            }
 
             // A cancelled run still saves what it recorded.
             var recorded = options.SaveRecording(parseResult, runner, recorder);
@@ -118,14 +127,13 @@ internal static class RunCommand
         return command;
     }
 
-    /// <summary>Sends one request; a request that cannot even be prepared is recorded as a failure instead of ending the run.</summary>
+    /// <summary>Sends one request with its scripts; a request that cannot even be prepared is recorded as a failure instead of ending the run.</summary>
     private static async Task<HttpExchange> SendSafelyAsync(RequestRunner runner, PostmanCollection collection, RequestNode node, CancellationToken cancellationToken)
     {
         PreparedRequest? prepared = null;
         try
         {
-            prepared = runner.Prepare(collection, node, node.ReadSpec());
-            return await runner.SendAsync(prepared, cancellationToken);
+            return await runner.SendAsync(collection, node, node.ReadSpec(), p => prepared = p, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -164,6 +172,29 @@ internal static class RunCommand
                 else
                 {
                     writer.WriteString("error", exchange.ErrorMessage);
+                }
+
+                if (exchange.Scripts is { } scripts)
+                {
+                    writer.WriteStartArray("tests");
+                    foreach (var test in scripts.Tests)
+                    {
+                        writer.WriteStartObject();
+                        writer.WriteString("name", test.Name);
+                        writer.WriteBoolean("passed", test.Passed);
+                        if (test.Error is not null)
+                        {
+                            writer.WriteString("error", test.Error);
+                        }
+
+                        writer.WriteEndObject();
+                    }
+
+                    writer.WriteEndArray();
+                    if (scripts.Error is { } error)
+                    {
+                        writer.WriteString("scriptError", error.ToString());
+                    }
                 }
 
                 writer.WriteNumber("totalMs", exchange.Timing.Total?.TotalMilliseconds ?? 0);

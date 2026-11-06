@@ -30,6 +30,7 @@
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestFiles.cs" Link="Infrastructure\Shared\TestFiles.cs" />
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TempDirectoryCleanup.cs" Link="Infrastructure\Shared\TempDirectoryCleanup.cs" />
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\V3Fixture.cs" Link="Infrastructure\Shared\V3Fixture.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestPython.cs" Link="Infrastructure\Shared\TestPython.cs" />
   </ItemGroup>
 
 </Project>

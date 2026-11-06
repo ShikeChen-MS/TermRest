@@ -20,6 +20,7 @@ internal sealed class ResponseView : View
     private readonly TableView _headers;
     private readonly TextArea _timeline;
     private readonly TextArea _tls;
+    private readonly TextArea _scripts;
     private HttpExchange? _exchange;
     private bool _prettyOn = true;
 
@@ -73,10 +74,21 @@ internal sealed class ResponseView : View
         _tls = new TextArea { ReadOnly = true };
         tlsTab.Add(_tls);
 
-        _tabs.AddTabs(_bodyTab, headersTab, timelineTab, tlsTab);
+        var scriptsTab = new View { Title = "Scripts", Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
+        _scripts = new TextArea { ReadOnly = true };
+        scriptsTab.Add(_scripts);
+
+        _tabs.AddTabs(_bodyTab, headersTab, timelineTab, tlsTab, scriptsTab);
         Add(_status, _tabs);
         SetHeaders([]);
+        _scripts.SetText(NoScripts);
     }
+
+    private const string NoScripts =
+        "No scripts ran for this request.\n\n"
+        + "Scripts are Python code that runs before a request is sent and after its response arrives: set variables, sign\n"
+        + "requests, check responses with tests. Write them in the request's Scripts tab, or for a whole collection or folder\n"
+        + "(right-click it › Scripts…). Choose the Python that runs them in Tools › Scripts…; Help › Scripting shows the tr object.";
 
     /// <summary>Raised with short user-facing notices (copied, saved, …).</summary>
     public event EventHandler<string>? Notice;
@@ -84,6 +96,9 @@ internal sealed class ResponseView : View
     public HttpExchange? Exchange => _exchange;
 
     public string StatusText => _status.Text;
+
+    /// <summary>The Scripts tab's text (for tests).</summary>
+    internal string ScriptsText => _scripts.GetText();
 
     public void Clear()
     {
@@ -93,7 +108,15 @@ internal sealed class ResponseView : View
         _body.SetText("");
         _timeline.SetText("");
         _tls.SetText("");
+        _scripts.SetText(NoScripts);
         SetHeaders([]);
+    }
+
+    /// <summary>Pre-request scripts are running: the request is not prepared yet.</summary>
+    public void ShowRunningScripts()
+    {
+        _status.Text = "Running pre-request scripts …  (Esc or Send to cancel)";
+        _status.SchemeName = null;
     }
 
     public void ShowSending(PreparedRequest request)
@@ -107,27 +130,34 @@ internal sealed class ResponseView : View
     {
         _exchange = exchange;
         var response = exchange.Response;
+        var scripts = exchange.Scripts;
         if (response is null)
         {
             _status.Text = exchange.Cancelled ? "Request cancelled." : $"Error: {exchange.ErrorMessage}";
             _status.SchemeName = exchange.Cancelled ? null : "Error";
-            _body.SetText(exchange.Cancelled ? "" : exchange.ErrorMessage ?? "");
+
+            // When a script stopped the request, its traceback is what the user needs to see.
+            _body.SetText(exchange.Cancelled ? "" : scripts?.Error is not null ? $"{exchange.ErrorMessage}\n\n{scripts.Describe()}" : exchange.ErrorMessage ?? "");
             SetHeaders([]);
         }
         else
         {
             var http = $"HTTP/{response.Version.Major}{(response.Version.Major < 2 ? "." + response.Version.Minor : "")}";
             var warnings = exchange.Request.Warnings.Count > 0 ? $" · ⚠ {exchange.Request.Warnings.Count} warning(s), see Timeline" : "";
-            _status.Text = $"{response.StatusCode} {response.ReasonPhrase} · {HttpExchange.Format(exchange.Timing.Total)} · {HttpExchange.FormatSize(response.Body.LongLength)} · {http}{warnings}";
+            var tests = scripts?.Summary is { Length: > 0 } summary ? $" · {summary}" : "";
+            _status.Text = $"{response.StatusCode} {response.ReasonPhrase} · {HttpExchange.Format(exchange.Timing.Total)} · {HttpExchange.FormatSize(response.Body.LongLength)} · {http}{tests}{warnings}";
             _status.SchemeName = response.StatusCode switch
             {
                 >= 500 => "Error",
                 >= 400 => ThemeCatalog.WarningScheme,
+                _ when scripts is { Succeeded: false } => ThemeCatalog.WarningScheme,
                 _ => ThemeCatalog.SuccessScheme,
             };
             SetHeaders(response.Headers);
             RenderBody();
         }
+
+        _scripts.SetText(scripts is null ? NoScripts : scripts.Describe());
 
         _timeline.SetText(DescribeRequest(exchange.Request, exchange));
         _tls.SetText(exchange.Tls.Count == 0

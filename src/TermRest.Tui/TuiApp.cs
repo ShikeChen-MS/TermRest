@@ -48,6 +48,7 @@ public static class TuiApp
 
             using var runner = new RequestRunner(workspace) { StrictSslOverride = options.StrictSslOverride };
             runner.ConfigureHistory();
+            runner.ConfigureScripts();
             using var app = Application.Create();
             app.Init(options.Driver);
             ThemeCatalog.Apply(theme);
@@ -137,6 +138,7 @@ public static class TuiApp
         }
 
         using var runner = new RequestRunner(workspace);
+        runner.ConfigureScripts();
         using var app = Application.Create();
         app.Init(Terminal.Gui.Drivers.DriverRegistry.Names.ANSI);
         app.Driver!.SetScreenSize(width, height);

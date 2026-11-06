@@ -20,12 +20,21 @@ internal sealed class RequestOptions
         Description = "Also record the requests and responses to this HAR file (JSON, as browser dev tools save them); secrets are redacted",
     };
 
+    public Option<string?> Python { get; } = new("--python")
+    {
+        Description = "Python that runs the collection's scripts, e.g. .venv/bin/python (default: the one chosen for this workspace in the full-screen UI)",
+    };
+
+    public Option<bool> NoScripts { get; } = new("--no-scripts") { Description = "Do not run pre-request and test scripts" };
+
     public void AddTo(Command command)
     {
         command.Options.Add(Environment);
         command.Options.Add(Variables);
         command.Options.Add(Timeout);
         command.Options.Add(Record);
+        command.Options.Add(Python);
+        command.Options.Add(NoScripts);
     }
 
     /// <summary>
@@ -118,7 +127,13 @@ internal sealed class RequestOptions
         {
             StrictSslOverride = parseResult.GetValue(insecure) ? false : null,
             TimeoutOverrideMs = parseResult.GetValue(Timeout),
+            ScriptsEnabled = !parseResult.GetValue(NoScripts),
         };
+
+        if (runner.ScriptsEnabled)
+        {
+            runner.ConfigureScripts(parseResult.GetValue(Python));
+        }
 
         if (parseResult.GetValue(Environment) is { } environment)
         {

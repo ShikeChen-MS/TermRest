@@ -6,6 +6,7 @@ using Terminal.Gui.Testing;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Recording;
+using TermRest.Core.Scripting;
 using TermRest.Core.Tests.Infrastructure;
 using TermRest.Core.Workspace;
 using TermRest.Tui.Tests.Infrastructure;
@@ -592,18 +593,7 @@ public sealed class MainWindowTests : IDisposable
             button = ui.Window.RecordButton;
             responseTitle = ui.Window.ResponseTitle;
             recorded = ui.Screen();
-            ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
-            {
-                dialog = ui.Screen();
-                ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
-                {
-                    confirmation = ui.Screen();
-                    ui.Click("► OK ◄");
-                    return false;
-                });
-                ui.Click("► Save ◄");
-                return false;
-            });
+            SaveWhenStopDialogShows(ui, screen => dialog = screen, screen => confirmation = screen);
             ui.Click("Stop F12"); // stops: the dialog runs until saved
             stopped = ui.Screen();
             ui.App.RequestStop();
@@ -651,6 +641,248 @@ public sealed class MainWindowTests : IDisposable
         Assert.StartsWith($"✓ Recording saved: {file} (1 request,", ui.Window.StatusMessage, StringComparison.Ordinal);
         OnScreen("● Record F12", stopped);
         Assert.Empty(Directory.Exists(_recordingTemp) ? Directory.GetDirectories(_recordingTemp) : []);
+    }
+
+    /// <summary>
+    /// Drives the stop-recording dialog that a click is about to open (the click returns only once it is closed):
+    /// saves to the suggested file, then closes the confirmation. Each step waits until its dialog is on screen;
+    /// a fixed delay is not enough, as a slow step can make the next one due before the dialog has closed.
+    /// </summary>
+    private static void SaveWhenStopDialogShows(Harness ui, Action<string> dialogShown, Action<string> saved)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            var screen = ui.Screen();
+            if (!screen.Contains("Stop recording", StringComparison.Ordinal) && DateTime.UtcNow < deadline)
+            {
+                return true;
+            }
+
+            dialogShown(screen);
+            ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+            {
+                var confirmation = ui.Screen();
+                if (!confirmation.Contains("Recording saved", StringComparison.Ordinal) && DateTime.UtcNow < deadline)
+                {
+                    return true;
+                }
+
+                saved(confirmation);
+                ui.Click("► OK ◄");
+                return false;
+            });
+            ui.Click("► Save ◄");
+            return false;
+        });
+    }
+
+    [Fact]
+    public async Task A_json_body_file_must_be_valid_json_and_recordings_keep_only_its_path()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo");
+        var good = Path.Combine(_directory, "order.json");
+        var bad = Path.Combine(_directory, "broken.json");
+        File.WriteAllText(good, "{\"item\": \"Only-In-The-File\"}");
+        File.WriteAllText(bad, "{\"item\": book}");
+        string fileMode = "", rejected = "", afterRejection = "", accepted = "", recording = "", sent = "", dialog = "";
+        var step = 0;
+        var deadline = DateTime.UtcNow.AddSeconds(25);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                ui.Runner.Recorder?.Discard(); // never hang the test run
+                ui.Runner.Recorder = null;
+                ui.App.RequestStop();
+                return false;
+            }
+
+            var screen = ui.Screen();
+            switch (step)
+            {
+                case 0:
+                    ui.Click("POST POST JSON");
+                    ui.Click("Body");
+                    ui.Click("○ file");
+                    ui.Click("○ JSON");
+                    fileMode = ui.Screen();
+                    ui.Window.ChooseBodyFile(bad);
+                    step = 1;
+                    break;
+                case 1 when screen.Contains("File not used", StringComparison.Ordinal):
+                    rejected = screen;
+                    step = 2;
+                    ui.Click("► OK ◄");
+                    break;
+                case 2:
+                    afterRejection = ui.Window.BodyFileStatus;
+                    ui.Window.ChooseBodyFile(good);
+                    step = 3;
+                    break;
+                case 3 when ui.Window.BodyFileStatus.StartsWith('✓'):
+                    accepted = ui.Window.BodyFileStatus;
+                    ui.App.InjectKey(Key.F12);
+                    recording = ui.Screen();
+                    ui.App.InjectKey(Key.F5);
+                    step = 4;
+                    break;
+                case 4 when ui.Window.StatusMessage.Contains("recorded with", StringComparison.Ordinal):
+                    sent = ui.Window.StatusMessage;
+                    step = 5;
+                    SaveWhenStopDialogShows(ui, screen => dialog = screen, _ => { });
+                    ui.Click("Stop F12"); // returns once the dialog is closed
+                    break;
+                case 5:
+                    ui.App.InjectKey(Key.S.WithCtrl); // the edited request is saved, so quitting does not ask
+                    ui.App.RequestStop();
+                    return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("◉ JSON", fileMode);
+        OnScreen("Read from disk each time the request is sent, never loaded into memory.", fileMode);
+        OnScreen("File not used", rejected);
+        OnScreen("broken.json is not valid JSON: 'b' is an invalid start of a value (line 1, column 10).", rejected);
+        Assert.StartsWith("Choose the file to send", afterRejection, StringComparison.Ordinal); // the bad file was not taken
+        Assert.StartsWith("✓ order.json · ", accepted, StringComparison.Ordinal);
+        Assert.EndsWith(" · checked as JSON", accepted, StringComparison.Ordinal);
+        OnScreen("● Recording is on: it keeps this file's path, not its content.", recording);
+        Assert.EndsWith("● recorded with the file's path, not its content", sent, StringComparison.Ordinal);
+        OnScreen("1 of them sent a file: the recording keeps the file's path, not its content.", dialog);
+        var har = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Assert.Single(Directory.GetFiles(_directory, "termrest-recording-*.har"))))!;
+        var request = har["log"]!["entries"]![0]!["request"]!;
+        Assert.Equal(good, request["postData"]!["_file"]!["path"]!.GetValue<string>());
+        Assert.Equal("application/json", request["postData"]!["mimeType"]!.GetValue<string>());
+        Assert.DoesNotContain("Only-In-The-File", request.ToJsonString(), StringComparison.Ordinal);
+        var saved = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json")).FindRequest("Basics/POST JSON")!.ReadSpec().Body;
+        Assert.Equal((BodyMode.File, good, "json"), (saved.Mode, saved.FileSrc, saved.FileLanguage));
+    }
+
+    [Fact]
+    public async Task Python_scripts_run_when_sending_and_the_response_shows_their_tests()
+    {
+        var python = TestPython.Require();
+        await using var server = await LocalEchoServer.StartAsync();
+        var setup = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        setup.SetScripts(setup.RootNode, new ScriptSet("tr.request.url += '&from=collection'", "", ScriptLanguage.Python));
+        var node = setup.FindRequest("Basics/GET with query")!;
+        var spec = node.ReadSpec();
+        spec.ScriptLanguage = ScriptLanguage.Python;
+        spec.TestScript = "@tr.test('the collection script added a parameter')\ndef _():\n    assert 'from=collection' in tr.response.json()['query']\nprint('checked', tr.response.status)";
+        setup.UpdateRequest(node, spec);
+        setup.Save();
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.SetPythonInterpreter(python);
+        });
+        var screen = "";
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            ui.App.InjectKey(Key.F5);
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            screen = ui.Screen();
+            if (screen.Contains("200 OK", StringComparison.Ordinal) || DateTime.UtcNow > deadline)
+            {
+                ui.App.RequestStop();
+                return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("200 OK", screen);
+        OnScreen("tests 1/1 passed", screen);
+        var scripts = ui.Window.ResponsePane.ScriptsText;
+        Assert.Contains("✓ the collection script added a parameter", scripts, StringComparison.Ordinal);
+        Assert.Contains("[test · request 'Basics/GET with query'] checked 200", scripts, StringComparison.Ordinal);
+        Assert.Contains("from=collection", System.Text.Encoding.UTF8.GetString(ui.Window.ResponsePane.Exchange!.Response!.Body), StringComparison.Ordinal);
+        Assert.DoesNotContain("from=collection", ui.Window.Editor.Spec.Url, StringComparison.Ordinal); // scripts change what is sent, not the request
+    }
+
+    [Fact]
+    public void The_scripts_tab_edits_a_requests_scripts_and_their_language()
+    {
+        var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+
+        ui.Click("POST POST JSON");
+        ui.Click("Scripts");
+        var tab = ui.Screen();
+        var label = ui.Find("Pre-request (before sending)");
+        ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 2, label.Y + 1)));
+        ui.Type("print(1)");
+        var typed = ui.Window.Editor.Spec.Clone();
+        ui.App.InjectKey(Key.S.WithCtrl);
+        var savedPython = PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!.ReadSpec();
+        ui.Click("○ JavaScript (Postman)");
+        var javaScript = ui.Screen();
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        OnScreen("◉ Python", tab);
+        OnScreen("Run by your Python (Tools › Scripts…)", tab);
+        Assert.Equal(("print(1)", ScriptLanguage.Python), (typed.PreRequestScript, typed.ScriptLanguage));
+        Assert.Equal(("print(1)", ScriptLanguage.Python), (savedPython.PreRequestScript, savedPython.ScriptLanguage));
+        OnScreen("Postman's JavaScript is kept in the collection but not run", javaScript);
+        Assert.Equal(ScriptLanguage.JavaScript, PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!.ReadSpec().ScriptLanguage);
+        Assert.Contains("text/javascript", File.ReadAllText(path), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Collection_scripts_are_edited_from_the_tree()
+    {
+        using var ui = new Harness(_directory);
+        string menu = "", dialog = "";
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            // The collection's row in the tree (its name is also in the request pane's title).
+            var row = ui.Screen().Split('\n').Select((line, y) => new Point(line.IndexOf("TermRest Demo", StringComparison.Ordinal), y)).First(p => p.X is >= 0 and < 40);
+            ui.App.InjectSequence(InputInjectionExtensions.RightButtonClick(row));
+            menu = ui.Screen();
+
+            // The dialog opens inside the click below, which returns once it is closed: drive it from another timer.
+            ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+            {
+                var screen = ui.Screen();
+                if (!screen.Contains("Scripts of collection 'TermRest Demo'", StringComparison.Ordinal) && DateTime.UtcNow < deadline)
+                {
+                    return true;
+                }
+
+                dialog = screen;
+                var label = ui.Find("Pre-request (before sending)");
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 2, label.Y + 1)));
+                ui.Type("tr.variables.set('a', 1)");
+                ui.Click("► OK ◄");
+                return false;
+            });
+            ui.Click("Scripts…");
+            ui.App.InjectKey(Key.S.WithCtrl);
+            ui.App.RequestStop();
+            return false;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("Scripts…", menu);
+        OnScreen("They run for every request inside", dialog);
+        var saved = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        Assert.Equal(new ScriptSet("tr.variables.set('a', 1)", "", ScriptLanguage.Python), saved.GetScripts(saved.RootNode));
     }
 
     [Fact]
