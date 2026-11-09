@@ -168,33 +168,41 @@ public class ScriptingTests
     }
 
     [Fact]
-    public async Task Without_python_scripts_do_not_run_and_postman_javascript_is_kept_but_not_run()
+    public async Task Scripts_without_a_runtime_stop_the_request_or_are_skipped_with_a_note()
     {
         await using var server = await EchoServer.StartAsync();
         var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
         var collection = workspace.CreateCollection("API");
         using var runner = new RequestRunner(workspace);
         runner.ConfigureScripts(userSettingsDirectory: TestFiles.NewTempDirectory());
-        Assert.Null(runner.PythonInterpreter);
+        Assert.Equal((null, null, null), (runner.PythonInterpreter, runner.JavaScriptRuntime, runner.CSharpRuntime));
+        var javaScript = new HttpRequestSpec { Url = server.Url("echo"), PreRequestScript = "pm.variables.set('a', 1);", ScriptLanguage = ScriptLanguage.JavaScript };
 
+        // The command line: scripts that cannot run are an error, so a pre-request one stops the request.
         var notSent = await runner.SendAsync(collection, null, Python(server.Url("echo"), preRequest: "pass"), _ct);
         Assert.Null(notSent.Response);
         Assert.Contains("--python", notSent.ErrorMessage, StringComparison.Ordinal);
+        var notSentJavaScript = await runner.SendAsync(collection, null, javaScript, _ct);
+        Assert.Null(notSentJavaScript.Response);
+        Assert.Contains("--javascript", notSentJavaScript.ErrorMessage, StringComparison.Ordinal);
+        var notSentCSharp = await runner.SendAsync(collection, null,
+            new HttpRequestSpec { Url = server.Url("echo"), PreRequestScript = "tr.Variables.Set(\"a\", 1);", ScriptLanguage = ScriptLanguage.CSharp }, _ct);
+        Assert.Null(notSentCSharp.Response);
+        Assert.Contains("need the .NET SDK (10 or later), and none is chosen for this workspace: pass --csharp", notSentCSharp.ErrorMessage, StringComparison.Ordinal);
 
         var testsOnly = await runner.SendAsync(collection, null, Python(server.Url("echo"), test: "pass"), _ct);
         Assert.Equal(200, testsOnly.Response!.StatusCode);
         Assert.Contains("--python", testsOnly.Scripts!.Error!.Message, StringComparison.Ordinal);
 
-        var postman = await runner.SendAsync(collection, null, new HttpRequestSpec
-        {
-            Url = server.Url("echo"),
-            TestScript = "pm.test('ok', () => {});",
-            ScriptLanguage = ScriptLanguage.JavaScript,
-        }, _ct);
-        Assert.Equal(200, postman.Response!.StatusCode);
-        Assert.Equal((0, ""), (postman.Scripts!.Ran, postman.Scripts.Summary));
-        Assert.Equal(["request"], postman.Scripts.NotRun);
-        Assert.Contains("Not run: the JavaScript (Postman) scripts of request.", postman.Scripts.Describe(), StringComparison.Ordinal);
+        // The full-screen UI: they are skipped, with a note, and the request is sent.
+        runner.RequireScriptRuntimes = false;
+        var skipped = await runner.SendAsync(collection, null, javaScript, _ct);
+        Assert.Equal(200, skipped.Response!.StatusCode);
+        Assert.True(skipped.Scripts!.Succeeded);
+        Assert.Equal((0, "⚠ scripts not run"), (skipped.Scripts.Ran, skipped.Scripts.Summary));
+        Assert.Equal([new ScriptSkip("request", ScriptLanguage.JavaScript)], skipped.Scripts.NotRun);
+        Assert.Contains("Not run, because no JavaScript runtime (Node.js or Bun) is chosen for this workspace (Tools › Scripts…): the JavaScript scripts of request.",
+            skipped.Scripts.Describe(), StringComparison.Ordinal);
 
         runner.ScriptsEnabled = false;
         var disabled = await runner.SendAsync(collection, null, Python(server.Url("echo"), preRequest: "pass"), _ct);
@@ -298,6 +306,16 @@ public class ScriptingTests
         withScript.TestScript = "pass";
         PostmanRequestMapper.Apply(fresh, withScript, baseline, PostmanSchemaVersion.V21);
         Assert.Equal("""{"listen":"test","script":{"exec":["pass"],"type":"text/x-python"}}""", fresh["event"]![0]!.ToJsonString());
+
+        // C# scripts are text/x-csharp.
+        var csharp = PostmanRequestMapper.Read(fresh, PostmanSchemaVersion.V21);
+        var toCSharp = csharp.Clone();
+        toCSharp.ScriptLanguage = ScriptLanguage.CSharp;
+        toCSharp.TestScript = "tr.Test(\"ok\", () => { });";
+        PostmanRequestMapper.Apply(fresh, toCSharp, csharp, PostmanSchemaVersion.V21);
+        var script = fresh["event"]![0]!["script"]!;
+        Assert.Equal(("text/x-csharp", "tr.Test(\"ok\", () => { });"), (script["type"]!.GetValue<string>(), script["exec"]![0]!.GetValue<string>()));
+        Assert.Equal(ScriptLanguage.CSharp, PostmanRequestMapper.Read(fresh, PostmanSchemaVersion.V21).ScriptLanguage);
     }
 
     [Fact]
@@ -351,29 +369,39 @@ public class ScriptingTests
     }
 
     [Fact]
-    public void Python_is_chosen_per_workspace_in_the_user_settings()
+    public void Runtimes_are_chosen_per_workspace_in_the_user_settings()
     {
         var directory = TestFiles.NewTempDirectory();
         var workspaceRoot = TestFiles.NewTempDirectory();
         var settings = new UserSettings();
-        settings.SetPythonInterpreter(workspaceRoot, ".venv/bin/python");
+        settings.SetScriptRuntime(ScriptLanguage.Python, workspaceRoot, ".venv/bin/python");
+        settings.SetScriptRuntime(ScriptLanguage.JavaScript, workspaceRoot, "node");
+        settings.SetScriptRuntime(ScriptLanguage.CSharp, workspaceRoot, "dotnet");
         settings.Save(directory);
 
         var loaded = UserSettings.Load(directory);
-        Assert.Equal(".venv/bin/python", loaded.GetPythonInterpreter(workspaceRoot + Path.DirectorySeparatorChar));
-        Assert.Null(loaded.GetPythonInterpreter(TestFiles.NewTempDirectory()));
+        Assert.Equal(".venv/bin/python", loaded.GetScriptRuntime(ScriptLanguage.Python, workspaceRoot + Path.DirectorySeparatorChar));
+        Assert.Equal("node", loaded.GetScriptRuntime(ScriptLanguage.JavaScript, workspaceRoot));
+        Assert.Equal("dotnet", loaded.GetScriptRuntime(ScriptLanguage.CSharp, workspaceRoot));
+        Assert.Null(loaded.GetScriptRuntime(ScriptLanguage.Python, TestFiles.NewTempDirectory()));
         if (OperatingSystem.IsWindows())
         {
-            Assert.Equal(".venv/bin/python", loaded.GetPythonInterpreter(workspaceRoot.ToUpperInvariant()));
+            Assert.Equal(".venv/bin/python", loaded.GetScriptRuntime(ScriptLanguage.Python, workspaceRoot.ToUpperInvariant()));
         }
 
         using var runner = new RequestRunner(ApiWorkspace.Open(workspaceRoot));
         runner.ConfigureScripts(userSettingsDirectory: directory);
         Assert.Equal(Path.GetFullPath(Path.Combine(workspaceRoot, ".venv/bin/python")), runner.PythonInterpreter);
-        runner.ConfigureScripts("python3", directory);
-        Assert.Equal("python3", runner.PythonInterpreter);
+        Assert.Equal("node", runner.JavaScriptRuntime);
+        Assert.Equal("dotnet", runner.CSharpRuntime);
+        runner.ConfigureScripts(python: "python3", javaScript: "bun", cSharp: "/opt/dotnet/dotnet", userSettingsDirectory: directory);
+        Assert.Equal(("python3", "bun", "/opt/dotnet/dotnet"), (runner.PythonInterpreter, runner.JavaScriptRuntime, runner.CSharpRuntime));
 
-        loaded.SetPythonInterpreter(workspaceRoot, null);
+        loaded.SetScriptRuntime(ScriptLanguage.Python, workspaceRoot, null);
         Assert.Null(loaded.PythonInterpreters);
+        Assert.NotNull(loaded.JavaScriptRuntimes);
+        var json = File.ReadAllText(Path.Combine(directory, "settings.json"));
+        Assert.Contains("\"javaScriptRuntimes\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"csharpRuntimes\"", json, StringComparison.Ordinal);
     }
 }

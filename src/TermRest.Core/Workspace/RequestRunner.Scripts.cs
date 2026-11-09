@@ -7,14 +7,13 @@ using TermRest.Core.Scripting;
 
 namespace TermRest.Core.Workspace;
 
-// Scripts: Python code run before a request is sent and after its response arrives, at collection, folder and request level.
+// Scripts: Python, JavaScript or C# code run before a request is sent and after its response arrives, at collection,
+// folder and request level, by the runtime the user chose for each language.
 public sealed partial class RequestRunner
 {
-    private const string NoInterpreter =
-        "These scripts need Python, and none is chosen for this workspace: choose one in Tools › Scripts… (full-screen UI) or pass --python.";
-
     private readonly Lock _scriptLock = new();
-    private PythonWorker? _python;
+    private readonly Dictionary<string, string> _runtimes = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ScriptWorker> _workers = new(StringComparer.Ordinal);
 
     /// <summary>Variables set by scripts in this session (Postman's "current values"). Scripts never change files.</summary>
     public SessionVariables Session { get; } = new();
@@ -22,59 +21,130 @@ public sealed partial class RequestRunner
     /// <summary>Whether scripts run (CLI <c>--no-scripts</c> turns them off).</summary>
     public bool ScriptsEnabled { get; set; } = true;
 
-    /// <summary>The Python that runs scripts; null when none is chosen (requests with scripts are then not sent).</summary>
-    public string? PythonInterpreter { get; private set; }
+    /// <summary>
+    /// What happens to scripts whose language has no runtime chosen. True (the command line): it is an error, so a
+    /// pre-request script stops the request. False (the full-screen UI): they are skipped, with a note, and the request
+    /// is sent.
+    /// </summary>
+    public bool RequireScriptRuntimes { get; set; } = true;
 
-    /// <summary>Longest time the scripts of one phase (pre-request or test) may take; Python is then stopped.</summary>
+    /// <summary>The Python that runs Python scripts; null when none is chosen.</summary>
+    public string? PythonInterpreter => GetRuntime(ScriptLanguage.Python);
+
+    /// <summary>The Node.js or Bun that runs JavaScript scripts; null when none is chosen.</summary>
+    public string? JavaScriptRuntime => GetRuntime(ScriptLanguage.JavaScript);
+
+    /// <summary>The <c>dotnet</c> (.NET SDK 10 or later) that builds and runs C# scripts; null when none is chosen.</summary>
+    public string? CSharpRuntime => GetRuntime(ScriptLanguage.CSharp);
+
+    /// <summary>Longest time the scripts of one phase (pre-request or test) may take; the runtime is then stopped.</summary>
     public TimeSpan ScriptTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
-    /// <summary>How long Python keeps running without scripts to run, ready for the next request.</summary>
+    /// <summary>How long a runtime keeps running without scripts to run, ready for the next request.</summary>
     public TimeSpan ScriptIdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
 
-    /// <summary>Whether Python is running now: it starts for the first script and stops once idle.</summary>
-    public bool ScriptsRunning => _python?.IsRunning == true;
+    /// <summary>Whether a runtime is running now: each starts for its first script and stops once idle.</summary>
+    public bool ScriptsRunning => RunningRuntimes.Count > 0;
+
+    /// <summary>The runtimes running now (Python, Node.js, Bun, .NET).</summary>
+    public IReadOnlyList<string> RunningRuntimes
+    {
+        get
+        {
+            lock (_scriptLock)
+            {
+                return _workers.Values.Where(w => w.IsRunning).Select(w => w.Name).ToList();
+            }
+        }
+    }
+
+    public string? GetRuntime(string language)
+    {
+        lock (_scriptLock)
+        {
+            return _runtimes.GetValueOrDefault(language);
+        }
+    }
 
     /// <summary>
-    /// Chooses the Python that runs scripts: <paramref name="python"/> (CLI <c>--python</c>), else the one chosen for this
+    /// Chooses the runtimes that run scripts: <paramref name="python"/>, <paramref name="javaScript"/> and
+    /// <paramref name="cSharp"/> (CLI <c>--python</c>, <c>--javascript</c>, <c>--csharp</c>), else the ones chosen for this
     /// workspace in the user's settings (Tools › Scripts in the full-screen UI).
     /// </summary>
     /// <param name="userSettingsDirectory">Overrides the user's configuration folder (tests, portable setups).</param>
-    public void ConfigureScripts(string? python = null, string? userSettingsDirectory = null) =>
-        SetPythonInterpreter(string.IsNullOrWhiteSpace(python) ? UserSettings.Load(userSettingsDirectory).GetPythonInterpreter(Workspace.RootPath) : python);
-
-    /// <summary>Sets the Python that runs scripts (see <see cref="ResolveInterpreter"/>); a running one is stopped.</summary>
-    public void SetPythonInterpreter(string? interpreter)
+    public void ConfigureScripts(string? python = null, string? javaScript = null, string? cSharp = null, string? userSettingsDirectory = null)
     {
-        var resolved = string.IsNullOrWhiteSpace(interpreter) ? null : ResolveInterpreter(interpreter);
+        var settings = UserSettings.Load(userSettingsDirectory);
+        Choose(ScriptLanguage.Python, python);
+        Choose(ScriptLanguage.JavaScript, javaScript);
+        Choose(ScriptLanguage.CSharp, cSharp);
+
+        void Choose(string language, string? chosen) =>
+            SetRuntime(language, string.IsNullOrWhiteSpace(chosen) ? settings.GetScriptRuntime(language, Workspace.RootPath) : chosen);
+    }
+
+    /// <summary>Sets the runtime for scripts in <paramref name="language"/> (see <see cref="ResolveRuntime"/>); a running one is stopped.</summary>
+    public void SetRuntime(string language, string? runtime)
+    {
+        var resolved = string.IsNullOrWhiteSpace(runtime) ? null : ResolveRuntime(runtime);
         lock (_scriptLock)
         {
-            if (resolved == PythonInterpreter)
+            if (resolved == _runtimes.GetValueOrDefault(language))
             {
                 return;
             }
 
-            _python?.Dispose();
-            _python = null;
-            PythonInterpreter = resolved;
+            if (_workers.Remove(language, out var worker))
+            {
+                worker.Dispose();
+            }
+
+            if (resolved is null)
+            {
+                _runtimes.Remove(language);
+            }
+            else
+            {
+                _runtimes[language] = resolved;
+            }
         }
     }
 
-    /// <summary>A command name (<c>python3</c>) is looked up on PATH; a relative path is relative to the workspace folder.</summary>
-    public string ResolveInterpreter(string interpreter)
+    public void SetPythonInterpreter(string? interpreter) => SetRuntime(ScriptLanguage.Python, interpreter);
+
+    public void SetJavaScriptRuntime(string? runtime) => SetRuntime(ScriptLanguage.JavaScript, runtime);
+
+    public void SetCSharpRuntime(string? dotnet) => SetRuntime(ScriptLanguage.CSharp, dotnet);
+
+    /// <summary>A command name (<c>python3</c>, <c>node</c>, <c>dotnet</c>) is looked up on PATH; a relative path is relative to the workspace folder.</summary>
+    public string ResolveRuntime(string runtime)
     {
-        interpreter = interpreter.Trim().Trim('"');
-        return interpreter.IndexOfAny(['/', '\\']) < 0 || Path.IsPathRooted(interpreter)
-            ? interpreter
-            : Path.GetFullPath(Path.Combine(Workspace.RootPath, interpreter));
+        runtime = runtime.Trim().Trim('"');
+        return runtime.IndexOfAny(['/', '\\']) < 0 || Path.IsPathRooted(runtime)
+            ? runtime
+            : Path.GetFullPath(Path.Combine(Workspace.RootPath, runtime));
     }
 
-    /// <summary>Stops Python now (it starts again for the next script), e.g. after installing packages.</summary>
-    public void StopScripts()
+    /// <summary>Stops the runtimes now (they start again for the next script), e.g. after installing packages.</summary>
+    /// <param name="compilerServer">
+    /// Also stop the .NET SDK's C# compiler server, which builds of C# scripts keep running for 10 minutes (Tools ›
+    /// Scripts › Stop scripts); not when TermRest just closes, so the next build stays quick.
+    /// </param>
+    public void StopScripts(bool compilerServer = false)
     {
         lock (_scriptLock)
         {
-            _python?.Dispose();
-            _python = null;
+            foreach (var worker in _workers.Values)
+            {
+                worker.Dispose();
+            }
+
+            _workers.Clear();
+        }
+
+        if (compilerServer && GetRuntime(ScriptLanguage.CSharp) is { } dotnet)
+        {
+            CSharpPrograms.StopCompilerServer(dotnet);
         }
     }
 
@@ -99,17 +169,26 @@ public sealed partial class RequestRunner
         }
 
         var results = new ScriptResults();
-        results.NotRun.AddRange(chain.JavaScript);
         var local = new Dictionary<string, string?>(StringComparer.Ordinal);
         var working = spec;
         if (chain.PreRequest.Count > 0)
         {
             working = spec.Clone();
-            var request = RequestToSend(working, node?.Name);
-            var reply = await RunScriptsAsync("prerequest", chain.PreRequest, collection, local, request, null, node?.Name, results, cancellationToken).ConfigureAwait(true);
-            if (reply?["request"] is JsonObject edited)
+
+            // Scripts in one language run together; each language sees what the scripts before it did.
+            foreach (var batch in Batches(chain.PreRequest))
             {
-                ApplyRequestEdits(edited, request, working, results);
+                var request = RequestToSend(working, node?.Name);
+                var reply = await RunScriptsAsync("prerequest", batch, collection, local, request, null, node?.Name, results, cancellationToken).ConfigureAwait(true);
+                if (reply?["request"] is JsonObject edited)
+                {
+                    ApplyRequestEdits(edited, request, working, results);
+                }
+
+                if (results.Error is not null || cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
             }
         }
 
@@ -138,7 +217,16 @@ public sealed partial class RequestRunner
         exchange.Scripts = results;
         if (chain.Test.Count > 0 && exchange.Response is not null && !exchange.Cancelled)
         {
-            await RunScriptsAsync("test", chain.Test, collection, local, RequestSent(exchange, node?.Name), ResponseReceived(exchange), node?.Name, results, cancellationToken).ConfigureAwait(true);
+            var request = RequestSent(exchange, node?.Name);
+            var response = ResponseReceived(exchange);
+            foreach (var batch in Batches(chain.Test))
+            {
+                await RunScriptsAsync("test", batch, collection, local, request, response, node?.Name, results, cancellationToken).ConfigureAwait(true);
+                if (results.Error is not null || cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+            }
         }
 
         Record(exchange);
@@ -146,22 +234,67 @@ public sealed partial class RequestRunner
         return exchange;
     }
 
-    /// <summary>Runs the scripts of one phase in Python and takes in what they did; null when they could not run.</summary>
+    /// <summary>Consecutive scripts in the same language.</summary>
+    private static IEnumerable<List<ScriptCode>> Batches(List<ScriptCode> scripts)
+    {
+        var batch = new List<ScriptCode>();
+        foreach (var script in scripts)
+        {
+            if (batch.Count > 0 && batch[0].Language != script.Language)
+            {
+                yield return batch;
+                batch = [];
+            }
+
+            batch.Add(script);
+        }
+
+        if (batch.Count > 0)
+        {
+            yield return batch;
+        }
+    }
+
+    /// <summary>Runs scripts in one language and takes in what they did; null when they did not run.</summary>
     private async Task<JsonObject?> RunScriptsAsync(string phase, List<ScriptCode> scripts, PostmanCollection collection,
         Dictionary<string, string?> local, JsonObject request, JsonObject? response, string? requestName, ScriptResults results,
         CancellationToken cancellationToken)
     {
         var label = phase == "prerequest" ? "pre-request" : "test";
-        PythonWorker worker;
+        var language = scripts[0].Language;
+        ScriptWorker worker;
         lock (_scriptLock)
         {
-            if (PythonInterpreter is null)
+            if (_runtimes.GetValueOrDefault(language) is not { } runtime)
             {
-                results.Error ??= new ScriptError("", NoInterpreter);
+                if (RequireScriptRuntimes)
+                {
+                    var needed = language switch
+                    {
+                        ScriptLanguage.Python => "Python",
+                        ScriptLanguage.CSharp => "the .NET SDK (10 or later)",
+                        _ => "a JavaScript runtime (Node.js or Bun)",
+                    };
+                    results.Error ??= new ScriptError("",
+                        $"These scripts need {needed}, and none is chosen for this workspace: pass {ScriptLanguage.Option(language)} " +
+                        "(or --no-scripts), or choose one in the full-screen UI (Tools › Scripts…).");
+                }
+                else
+                {
+                    results.NotRun.AddRange(scripts.Select(s => new ScriptSkip(s.Name, language)));
+                }
+
                 return null;
             }
 
-            worker = _python ??= new PythonWorker(PythonInterpreter, Workspace.RootPath) { IdleTimeout = ScriptIdleTimeout };
+            if (!_workers.TryGetValue(language, out var existing))
+            {
+                existing = ScriptWorker.For(language, runtime, Workspace.RootPath);
+                existing.IdleTimeout = ScriptIdleTimeout;
+                _workers[language] = existing;
+            }
+
+            worker = existing;
         }
 
         var message = new JsonObject
@@ -175,16 +308,17 @@ public sealed partial class RequestRunner
                 ["globals"] = Values(Workspace.Globals?.Values, Session.Globals),
                 ["local"] = Values(LocalVariables.Select(v => new KeyValueEntry { Key = v.Key, Value = v.Value }), local),
             },
-            ["request"] = request,
-            ["response"] = response,
+            ["request"] = request.DeepClone(),
+            ["response"] = response?.DeepClone(),
             ["info"] = new JsonObject { ["request_name"] = requestName, ["collection"] = collection.Name, ["environment"] = Environment?.Name },
         };
 
         JsonObject reply;
         try
         {
-            // Off the caller's thread: starting Python takes a moment, and the UI must stay responsive meanwhile.
-            reply = await Task.Run(() => worker.RunAsync(message, ScriptTimeout, cancellationToken), cancellationToken).ConfigureAwait(true);
+            // Off the caller's thread: starting a runtime (or building C#) takes a moment, and the UI must stay responsive.
+            var related = language == ScriptLanguage.CSharp ? CSharpScriptsOf(collection) : null;
+            reply = await Task.Run(() => worker.RunAsync(message, ScriptTimeout, related, cancellationToken), cancellationToken).ConfigureAwait(true);
         }
         catch (ScriptException ex)
         {
@@ -193,7 +327,7 @@ public sealed partial class RequestRunner
         }
         catch (ObjectDisposedException)
         {
-            results.Error ??= new ScriptError("", "Python was stopped while the scripts ran.");
+            results.Error ??= new ScriptError("", $"{worker.Name} was stopped while the scripts ran.");
             return null;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -205,7 +339,7 @@ public sealed partial class RequestRunner
         var error = reply["error"] as JsonObject;
         var failed = error is null ? -1 : scripts.FindIndex(s => s.Name == Text(error["script"]));
         results.Ran += failed < 0 ? scripts.Count : failed + 1;
-        ApplyVariableChanges(reply["changes"] as JsonObject, collection, local, results);
+        ApplyVariableChanges(reply["changes"] as JsonObject, collection, local, results, language);
         foreach (var test in (reply["tests"] as JsonArray)?.OfType<JsonObject>() ?? [])
         {
             var passed = test["passed"] is JsonValue value && value.TryGetValue<bool>(out var ok) && ok;
@@ -222,6 +356,11 @@ public sealed partial class RequestRunner
             results.Notes.Add($"{more} more lines the {label} scripts printed are not shown.");
         }
 
+        foreach (var note in (reply["notes"] as JsonArray)?.Select(Text).OfType<string>() ?? [])
+        {
+            results.Notes.Add(note);
+        }
+
         if (error is not null)
         {
             results.Error ??= new ScriptError(Text(error["script"]) ?? "", Text(error["message"]) ?? "error", Text(error["traceback"]));
@@ -230,18 +369,28 @@ public sealed partial class RequestRunner
         return reply;
     }
 
-    /// <summary>Keeps the variables scripts set: for this session (environment, collection, globals) or this request.</summary>
-    private void ApplyVariableChanges(JsonObject? changes, PostmanCollection collection, Dictionary<string, string?> local, ScriptResults results)
+    /// <summary>
+    /// Keeps the variables scripts set: for this session (environment, collection, globals) or this request. They are
+    /// listed with the names the script's language uses (<c>collection_variables</c> in Python, <c>collectionVariables</c>
+    /// in JavaScript, <c>CollectionVariables</c> in C#).
+    /// </summary>
+    private void ApplyVariableChanges(JsonObject? changes, PostmanCollection collection, Dictionary<string, string?> local, ScriptResults results, string language)
     {
         if (changes is null)
         {
             return;
         }
 
-        Apply("environment", "environment", () => Environment is { } environment ? Session.For(environment) : null);
-        Apply("collection", "collection_variables", () => Session.For(collection));
-        Apply("globals", "globals", () => Session.Globals);
-        Apply("local", "variables", () => local);
+        var csharp = language == ScriptLanguage.CSharp;
+        Apply("environment", csharp ? "Environment" : "environment", () => Environment is { } environment ? Session.For(environment) : null);
+        Apply("collection", language switch
+        {
+            ScriptLanguage.Python => "collection_variables",
+            ScriptLanguage.CSharp => "CollectionVariables",
+            _ => "collectionVariables",
+        }, () => Session.For(collection));
+        Apply("globals", csharp ? "Globals" : "globals", () => Session.Globals);
+        Apply("local", csharp ? "Variables" : "variables", () => local);
 
         void Apply(string scope, string name, Func<Dictionary<string, string?>?> target)
         {
@@ -264,7 +413,7 @@ public sealed partial class RequestRunner
         }
     }
 
-    /// <summary>Takes in what pre-request scripts changed in <c>tr.request</c>.</summary>
+    /// <summary>Takes in what pre-request scripts changed in the request (<c>tr.request</c>, <c>pm.request</c>, <c>tr.Request</c>).</summary>
     private static void ApplyRequestEdits(JsonObject edited, JsonObject original, HttpRequestSpec spec, ScriptResults results)
     {
         if (Text(edited["method"]) is { Length: > 0 } method && method != Text(original["method"]))
@@ -315,7 +464,7 @@ public sealed partial class RequestRunner
             }
             else
             {
-                results.Notes.Add("tr.request.body was not used: scripts can change raw bodies only.");
+                results.Notes.Add("The request body was not changed: scripts can change raw bodies only.");
             }
         }
     }
@@ -404,6 +553,39 @@ public sealed partial class RequestRunner
 
     private static string? Text(JsonNode? node) => node is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
 
+    /// <summary>
+    /// The C# scripts of a whole collection, as saved: they are built into one program with the scripts that run now,
+    /// so that the collection's other requests need no new build.
+    /// </summary>
+    private static List<ScriptCode> CSharpScriptsOf(PostmanCollection collection)
+    {
+        var scripts = new List<ScriptCode>();
+        void Add(ScriptSet set)
+        {
+            if (set.Language == ScriptLanguage.CSharp)
+            {
+                scripts.AddRange(((string[])[set.PreRequest, set.Test]).Where(code => !string.IsNullOrWhiteSpace(code))
+                    .Select(code => new ScriptCode("", code, ScriptLanguage.CSharp)));
+            }
+        }
+
+        Add(collection.GetScripts(collection.RootNode));
+        foreach (var node in collection.Descendants())
+        {
+            switch (node)
+            {
+                case FolderNode folder:
+                    Add(collection.GetScripts(folder));
+                    break;
+                case RequestNode request:
+                    Add(request.Baseline.Scripts);
+                    break;
+            }
+        }
+
+        return scripts;
+    }
+
     /// <summary>The scripts around one request, in the order they run: collection, folders (outermost first), request.</summary>
     private sealed class ScriptChain
     {
@@ -411,10 +593,7 @@ public sealed partial class RequestRunner
 
         public List<ScriptCode> Test { get; } = [];
 
-        /// <summary>Where JavaScript (Postman) scripts are: kept, not run.</summary>
-        public List<string> JavaScript { get; } = [];
-
-        public bool IsEmpty => PreRequest.Count == 0 && Test.Count == 0 && JavaScript.Count == 0;
+        public bool IsEmpty => PreRequest.Count == 0 && Test.Count == 0;
 
         public static ScriptChain For(PostmanCollection collection, RequestNode? node, HttpRequestSpec spec)
         {
@@ -429,20 +608,14 @@ public sealed partial class RequestRunner
             var chain = new ScriptChain();
             foreach (var (name, scripts) in levels.Where(l => !l.Scripts.IsEmpty))
             {
-                if (!scripts.IsPython)
-                {
-                    chain.JavaScript.Add(name);
-                    continue;
-                }
-
                 if (!string.IsNullOrWhiteSpace(scripts.PreRequest))
                 {
-                    chain.PreRequest.Add(new ScriptCode(name, scripts.PreRequest));
+                    chain.PreRequest.Add(new ScriptCode(name, scripts.PreRequest, scripts.Language));
                 }
 
                 if (!string.IsNullOrWhiteSpace(scripts.Test))
                 {
-                    chain.Test.Add(new ScriptCode(name, scripts.Test));
+                    chain.Test.Add(new ScriptCode(name, scripts.Test, scripts.Language));
                 }
             }
 

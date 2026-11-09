@@ -439,7 +439,7 @@ internal static class HarEntryWriter
 
         if (scripts.NotRun.Count > 0)
         {
-            WriteStrings(writer, "notRun", scripts.NotRun); // JavaScript (Postman) scripts
+            WriteStrings(writer, "notRun", scripts.NotRun.Select(s => $"{s.Script} ({ScriptLanguage.Label(s.Language)}: no runtime chosen)"));
         }
 
         writer.WriteEndObject();

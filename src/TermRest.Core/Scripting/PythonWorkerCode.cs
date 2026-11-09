@@ -1,7 +1,7 @@
 namespace TermRest.Core.Scripting;
 
 /// <summary>
-/// The Python side of <see cref="PythonWorker"/>, passed to the interpreter with <c>-c</c> (no file is written). It reads
+/// The Python side of <see cref="ScriptWorker"/>, passed to the interpreter with <c>-c</c> (no file is written). It reads
 /// one JSON message per line, runs the scripts in it with the <c>tr</c> object, and writes one JSON line back. Whatever
 /// scripts print is captured, so it cannot corrupt the protocol.
 /// </summary>

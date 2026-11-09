@@ -1,5 +1,7 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using TermRest.Core.IO;
+using TermRest.Core.Scripting;
 
 namespace TermRest.Core.Workspace;
 
@@ -16,31 +18,60 @@ public sealed class UserSettings
     public string? Theme { get; set; }
 
     /// <summary>
-    /// The Python interpreter chosen for each workspace folder to run its scripts. It is kept with the user's settings,
-    /// not in the workspace, so a cloned repository cannot choose a program for TermRest to run.
+    /// The Python chosen for each workspace folder to run its scripts. Runtimes are kept with the user's settings, not
+    /// in the workspace, so a cloned repository cannot choose a program for TermRest to run.
     /// </summary>
     public Dictionary<string, string>? PythonInterpreters { get; set; }
 
-    /// <summary>The Python interpreter chosen for the workspace in <paramref name="workspaceRoot"/>, if any.</summary>
-    public string? GetPythonInterpreter(string workspaceRoot) =>
-        PythonInterpreters?.FirstOrDefault(p => SameFolder(p.Key, workspaceRoot)).Value is { Length: > 0 } interpreter ? interpreter : null;
+    /// <summary>The JavaScript runtime (Node.js or Bun) chosen for each workspace folder to run its scripts.</summary>
+    public Dictionary<string, string>? JavaScriptRuntimes { get; set; }
 
-    /// <summary>Chooses the Python interpreter for the workspace in <paramref name="workspaceRoot"/>; null or empty forgets it.</summary>
-    public void SetPythonInterpreter(string workspaceRoot, string? interpreter)
+    /// <summary>The .NET SDK (<c>dotnet</c>, 10 or later) chosen for each workspace folder to build and run its C# scripts.</summary>
+    [JsonPropertyName("csharpRuntimes")]
+    public Dictionary<string, string>? CSharpRuntimes { get; set; }
+
+    /// <summary>The runtime chosen for scripts in <paramref name="language"/> in the workspace in <paramref name="workspaceRoot"/>, if any.</summary>
+    public string? GetScriptRuntime(string language, string workspaceRoot) =>
+        Runtimes(language)?.FirstOrDefault(p => SameFolder(p.Key, workspaceRoot)).Value is { Length: > 0 } runtime ? runtime : null;
+
+    /// <summary>Chooses the runtime for scripts in <paramref name="language"/> in a workspace; null or empty forgets it.</summary>
+    public void SetScriptRuntime(string language, string workspaceRoot, string? runtime)
     {
-        foreach (var key in PythonInterpreters?.Keys.Where(k => SameFolder(k, workspaceRoot)).ToList() ?? [])
+        var runtimes = Runtimes(language);
+        foreach (var key in runtimes?.Keys.Where(k => SameFolder(k, workspaceRoot)).ToList() ?? [])
         {
-            PythonInterpreters!.Remove(key);
+            runtimes!.Remove(key);
         }
 
-        if (!string.IsNullOrWhiteSpace(interpreter))
+        if (!string.IsNullOrWhiteSpace(runtime))
         {
-            PythonInterpreters ??= new Dictionary<string, string>(StringComparer.Ordinal);
-            PythonInterpreters[NormalizeFolder(workspaceRoot)] = interpreter.Trim();
+            runtimes ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            runtimes[NormalizeFolder(workspaceRoot)] = runtime.Trim();
         }
-        else if (PythonInterpreters is { Count: 0 })
+
+        SetRuntimes(language, runtimes is { Count: 0 } ? null : runtimes);
+    }
+
+    private Dictionary<string, string>? Runtimes(string language) => language switch
+    {
+        ScriptLanguage.Python => PythonInterpreters,
+        ScriptLanguage.CSharp => CSharpRuntimes,
+        _ => JavaScriptRuntimes,
+    };
+
+    private void SetRuntimes(string language, Dictionary<string, string>? runtimes)
+    {
+        switch (language)
         {
-            PythonInterpreters = null;
+            case ScriptLanguage.Python:
+                PythonInterpreters = runtimes;
+                break;
+            case ScriptLanguage.CSharp:
+                CSharpRuntimes = runtimes;
+                break;
+            default:
+                JavaScriptRuntimes = runtimes;
+                break;
         }
     }
 
