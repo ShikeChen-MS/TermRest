@@ -3,8 +3,8 @@
 A lightweight terminal REST client for development and testing:
 
 - **Full-screen, mouse-friendly UI** in the style of Microsoft Edit: menu bar, resizable panes, tables with checkboxes, context menus. Every action also works from the keyboard. Color themes are built in (Dracula, Nord, Solarized, and more), or you can create your own.
-- **Postman-compatible storage.** Collections and environments are Postman files, edited in place: v2.1 JSON, or the v3 YAML folders that Postman v12 keeps in Git. TermRest writes them back as Postman would (untouched JSON byte-for-byte; in YAML only the lines you changed) and keeps everything it doesn't understand (Postman's JavaScript scripts, examples, unknown fields).
-- **Scripts in Python.** Pre-request and test scripts for collections, folders and requests, with variables, request changes and tests, like Postman's. They run in the Python you choose (your project's virtual environment, so its packages are there to use). TermRest carries no script engine: Python starts for the first script and stops when idle. See [Scripts (Python)](#scripts-python).
+- **Postman-compatible storage.** Collections and environments are Postman files, edited in place: v2.1 JSON, or the v3 YAML folders that Postman v12 keeps in Git. TermRest writes them back as Postman would (untouched JSON byte-for-byte; in YAML only the lines you changed) and keeps everything it doesn't understand (examples, unknown fields).
+- **Scripts in Python, JavaScript or C#.** Pre-request and test scripts for collections, folders and requests, with variables, request changes and tests. JavaScript scripts use Postman's `pm` object, so Postman collections' scripts run too. Each language runs in the runtime you choose: your project's Python, Node.js or Bun, and the .NET SDK, with the packages you installed (NuGet packages for C#). TermRest carries no script engine: a runtime starts for its first script and stops when idle. See [Scripts](#scripts). **Scripts are not sandboxed:** they run with your permissions, so turn them on only for collections you trust (see [Script safety](#script-safety)).
 - **Request history and cURL import.** Every request you send is kept per workspace, with credentials masked, ready to reopen, send again or save. Paste a curl command (for example from a browser's *Copy as cURL*) into the URL bar to import it.
 - **Recording.** Press Record (F12) and every request and response you send is recorded. On stop, TermRest asks where to save it as a HAR file (JSON, opens in browser dev tools). Credentials, cookies, tokens and secret variables are redacted, files sent with a request are recorded by path only, and a recording streams to a private temporary file instead of growing in memory.
 - **Large bodies from files.** Send a file as the body without loading it: it is streamed when the request is sent, and a JSON or XML file is checked first.
@@ -118,7 +118,7 @@ Everything is clickable: menus, tree items, tabs, buttons, table rows, and check
 - **Headers**
 - **Auth:** inherit, none, Basic, Bearer, API key, Digest, NTLM, or an OAuth 2.0 access token. Other Postman auth types are kept but not yet applied.
 - **Body:** none, raw (JSON, XML, text, HTML, JavaScript, with Beautify), form-data with files, x-www-form-urlencoded, a file (see [Sending a file as the body](#sending-a-file-as-the-body)), or GraphQL.
-- **Scripts:** pre-request and post-response (test) scripts in Python (see [Scripts (Python)](#scripts-python)). Postman's JavaScript scripts are kept and editable, but not run.
+- **Scripts:** pre-request and post-response (test) scripts, in Python, JavaScript or C# (see [Scripts](#scripts)).
 - **Settings:** per-request SSL verification and redirects, which client certificate applies, and the description.
 
 **Response tabs**
@@ -143,35 +143,45 @@ For a large payload, choose **file** in the Body tab instead of pasting it into 
 - **Postman:** the body is Postman's binary body (`"mode": "file"`); the type is stored as `"language"` in its `file` object, which Postman ignores.
 - **Recordings** keep the file's path, not its content (see [Recording requests](#recording-requests)). While recording, the Body tab says so.
 
-## Scripts (Python)
+## Scripts
 
-Scripts run around each request, as in Postman: **pre-request** scripts before it is sent (set variables, sign it, fetch a token), **post-response** scripts once the response is in (tests, keep a value for the next request). They are written in **Python** and run by **a Python you choose**, typically your project's virtual environment, so scripts can `import` its packages (`requests`, `jwt`, `boto3` …).
+Scripts run around each request, as in Postman: **pre-request** scripts before it is sent (set variables, sign it, fetch a token), **post-response** scripts once the response is in (tests, keep a value for the next request). Write them in **Python**, in **JavaScript** with Postman's `pm` object (so the scripts of Postman collections run too), or in **C#**. Each language runs in **a runtime you choose**: your project's Python (a virtual environment, so its packages are there to use), Node.js or Bun, and the .NET SDK (10 or later).
 
-TermRest itself carries no script engine. Until a request has a script, nothing extra runs. Then one Python process runs every script of the session, and it stops after 5 idle minutes. Measured on the same machine, an embedded engine would always cost more:
+> [!CAUTION]
+> **Scripts are programs, and TermRest does not sandbox them.** Choosing a runtime for a workspace lets every script of its collections run as you, with your permissions. They can read, change, delete or upload your files, keys and credentials, see your variables and secrets, start programs, download packages, and send anything anywhere. Postman runs its scripts in a restricted sandbox; TermRest hands them the full Python, Node.js, Bun or .NET you chose, with nothing to contain a malicious one. **Treat a collection with scripts like a program you download and run:** choose runtimes only for workspaces whose collections you wrote or have read. See [Script safety](#script-safety).
+
+TermRest itself carries no script engine. Until a request has a script, nothing extra runs. Then one process per runtime runs every script of the session, and it stops after 5 idle minutes. Measured on the same machine (memory while scripting; TermRest starts Node.js with V8 options that halve its memory):
 
 | Option | Added to TermRest | Memory while scripting |
 |---|---|---|
-| **Your Python, one process per session (TermRest)** | nothing | about 20 MB, only while scripts are in use |
-| Jint (JavaScript interpreter) | +7.6 MB per binary | +16–19 MB |
-| V8 (ClearScript) | +28.5 MB native library per platform | +50 MB |
-| Roslyn (C# scripting) | +23 MB, and no Native AOT | +190 MB |
+| **Your Python, one process per session (TermRest)** | nothing | about 23 MB, only while scripts are in use |
+| **Your Node.js, one process per session (TermRest)** | nothing | about 68 MB (35 MB private), only while scripts are in use |
+| **Your Bun, one process per session (TermRest)** | nothing | about 46 MB, only while scripts are in use |
+| **Your .NET SDK, a program built from the C# scripts (TermRest)** | nothing | about 26 MB (7 MB private), only while scripts are in use; building them also keeps the SDK's compiler server (about 160 MB) for 10 minutes |
+| Jint (JavaScript interpreter, embedded) | +7.6 MB per binary | +16–19 MB, always |
+| V8 (ClearScript, embedded) | +28.5 MB native library per platform | +50 MB, always |
+| Roslyn (C# scripting, embedded) | +23 MB, and no Native AOT | +190 MB, always |
 
-**Choosing Python**
+A runtime answers in about a millisecond once started; starting takes 0.1–0.3 s. C# scripts are built first (see *C# scripts* below).
 
-- **In the UI:** *Tools › Scripts (Python)…*. Type a command (`python3`) or a path, which may be relative to the workspace (`.venv/bin/python`, `.venv\Scripts\python.exe`). Or press **Find**: it looks for `.venv`, `venv` and `env` in the workspace, then `python3` and `python` on PATH. **Check** shows the version. Python 3.8 or later is needed.
-- **Your choice is kept per workspace folder in your user settings**, never in the workspace. A cloned repository cannot choose a program for TermRest to run.
-- **On the command line:** `--python <path>` on `send` and `run`; without it, the UI's choice for that workspace applies. `--no-scripts` turns scripts off.
+**Choosing the runtimes**
+
+- **In the UI:** *Tools › Scripts…*, one row for each language. Type a command (`python3`, `node`, `bun`, `dotnet`) or a path, which may be relative to the workspace (`.venv/bin/python`, `.venv\Scripts\python.exe`). Or press **Find**: for Python, it looks for `.venv`, `venv` and `env` in the workspace, then `python3` and `python` on PATH; for JavaScript, `node` and `bun` on PATH; for C#, `dotnet` on PATH, then `~/.dotnet`. **Check** shows the version. Python 3.8, Node.js 18 or Bun 1.1, and the .NET 10 SDK or later are needed (for C#, the SDK: a .NET runtime alone cannot build scripts).
+- **Your choices are kept per workspace folder in your user settings**, never in the workspace. A cloned repository cannot choose a program for TermRest to run.
+- **On the command line:** `--python <path>`, `--javascript <path>` and `--csharp <path>` on `send` and `run`; without them, the UI's choices for that workspace apply. `--no-scripts` turns scripts off.
+- **No runtime chosen for a language:** in the UI, its scripts are skipped and the request is sent; the status line says `⚠ scripts not run` and the *Scripts* tab says which. On the command line, that is an error (so a CI run never passes without its tests): the request is not sent, and the message says to pass `--python`, `--javascript`, `--csharp` or `--no-scripts`.
 
 **Writing scripts**
 
-- **A request's scripts** are in its *Scripts* tab, with the language set to *Python*.
+- **A request's scripts** are in its *Scripts* tab; choose *Python*, *JavaScript* or *C#* there.
 - **A collection's or folder's scripts:** right-click it in the tree › *Scripts…* (or *Request › Collection or folder scripts…*). They run for every request inside.
-- **Order:** each phase runs the scripts of the collection, then the folders (outermost first), then the request.
-- **A failing pre-request script stops the request.** This covers an exception, a syntax error, a timeout, and no Python chosen. The request is not sent, nor added to the history or a recording, and the error is shown with its Python traceback.
-- **Time limit:** each phase may take 30 seconds; Python is then stopped and started again for the next script.
-- **Working folder:** Python runs in the workspace folder, so scripts can import your own modules from it. Modules load once per Python process; *Tools › Scripts › Stop Python* reloads them.
+- **Order:** each phase runs the scripts of the collection, then the folders (outermost first), then the request. The languages can be mixed: each script sees the variables and request changes of the ones before it.
+- **A failing pre-request script stops the request.** This covers an exception, a syntax or compile error, and a timeout. The request is not sent, nor added to the history or a recording, and the error is shown with the script's line.
+- **Time limit:** each phase may take 30 seconds (building C# scripts does not count); the runtime is then stopped and started again for the next script.
+- **Working folder:** the runtimes run in the workspace folder, so scripts can import your own modules from it (`import helpers`, `require('./helpers')`) and read its files. Python modules load once per process; *Tools › Scripts › Stop scripts* reloads them.
+- **Values are text:** a variable set to `42` reads back as `"42"` in the next request or phase, and lists and objects become JSON.
 
-| The `tr` object | |
+| Python: the `tr` object | |
 |---|---|
 | `tr.environment`, `tr.collection_variables`, `tr.globals` | `.get(name, default)`, `.set(name, value)`, `.unset(name)`, `.has(name)`, `.clear()`, `.to_dict()`, and `tr.environment["name"]`. Values set are kept in memory until TermRest closes (Postman's "current values"); files are never changed. *Tools › Scripts* shows how many there are and clears them. |
 | `tr.variables` | Reads every scope (this request, the environment, the collection, the globals: the first that has it). `.set()` is for this request only. `.replace_in("{{base}}/x")` replaces `{{variables}}` in a text. |
@@ -181,10 +191,38 @@ TermRest itself carries no script engine. Until a request has a script, nothing 
 | `tr.info` | `.phase` (`prerequest` or `test`), `.script`, `.request_name`, `.collection`, `.environment`. |
 | `print(…)` | Goes to the response's *Scripts* tab, and to stderr on the command line. |
 
-Variable values are text: `set("n", 42)` stores `42`, `True` becomes `true`, and lists and dicts become JSON.
+| JavaScript: Postman's `pm` object | |
+|---|---|
+| `pm.environment`, `pm.collectionVariables`, `pm.globals`, `pm.variables`, `pm.iterationData` | `.get`, `.set`, `.unset`, `.has`, `.clear`, `.toObject`, `.replaceIn`, as in Postman. |
+| `pm.request` | `.method`, `.url` (`.query.add`, `.toString()`, `.getHost()` …), `.headers` (`.add`, `.upsert`, `.remove`, `.get`, `.has`, `.each` …), `.body.raw`. Pre-request scripts can change them, as with `tr.request`. |
+| `pm.response` | `.code`, `.status`, `.headers`, `.responseTime`, `.responseSize`, `.json()`, `.text()`, `.stream`, `.cookies`, and Postman's assertions: `.to.have.status(…)`, `.to.have.header(…)`, `.to.have.body(…)`, `.to.have.jsonBody(…)`, `.to.be.ok`, `.success`, `.clientError`, `.json` … |
+| `pm.test(name, fn)`, `pm.expect(value)` | Tests (also asynchronous: `async` functions, or a `done` callback) and chai's assertions: `equal`, `eql`, `include`, `a`/`an`, `property`, `lengthOf`, `above`/`below`, `oneOf`, `members`, `keys`, `match`, `throw`, `not`, `deep`, `nested` …, with chai's messages. |
+| `pm.sendRequest(request, callback)` | With a callback, or `await` it. It uses the runtime's own `fetch`: TermRest's certificates and proxy settings do not apply. |
+| `pm.info`, `pm.cookies`, `console.log` … | As in Postman; `console` output goes where `print` does. |
+| The API from before `pm` | `tests["name"] = …`, `postman.setEnvironmentVariable(…)`, `responseBody`, `responseCode`, `responseHeaders`, `responseTime`. |
+| `require(…)` | Node.js modules, your own files, and the packages installed in the workspace (`npm install lodash crypto-js moment`). Postman's globals `_`, `CryptoJS`, `cheerio` and `tv4` load those packages when first used; `xml2Json` uses `xml2js`. Bun installs packages it cannot find by itself. |
+| Not supported | `pm.execution.skipRequest()` (the request is not sent, with an error), `setNextRequest` (requests run in order), `pm.vault`, `pm.require` (Postman's package library), `pm.cookies.jar()`, `pm.visualizer` (ignored). Each script phase runs in a fresh context, as in Postman. |
+
+**C# scripts**
+
+- **Built, then run.** TermRest writes the C# scripts of a collection into one small program, each script the body of a method, and your .NET SDK builds it as a C# file without a project (`dotnet run --file`, new in .NET 10). The first build takes a few seconds (more when it restores NuGet packages); a change, about a second. Built programs are kept in TermRest's cache folder, so unchanged scripts start at once, in the next TermRest too: `%LOCALAPPDATA%\TermRest\csharp`, `~/Library/Caches/TermRest/csharp` or `~/.cache/termrest/csharp` (`TERMREST_CACHE_DIR` moves it). The 16 most recently used are kept, a few hundred KB each.
+- **A script is the body of an async method:** statements, local functions, `await`, `return`. It may start with `using` directives and the directives of C# files: `#:package Name@1.2.3` (NuGet packages), `#:project path`, `#:property Name=Value`, and `#:include helpers.cs` (SDK 10.0.300 or later) for a file of your own types, as scripts cannot declare classes. Relative paths are relative to the workspace. Besides .NET's usual namespaces (`System`, `System.IO`, `System.Linq`, `System.Net.Http` …), `System.Text`, `System.Text.Json.Nodes` and `System.Text.RegularExpressions` are imported.
+- **Compile errors name the script and its line**, as the compiler reports them. The scripts before it still run, and a script that does not compile does not keep the collection's other requests from running theirs.
+- **Building uses the SDK's compiler server**, which stays for 10 minutes after a build (about 160 MB), as with any `dotnet build`: it makes the next build quick. *Tools › Scripts › Stop scripts* stops it.
+
+| C#: the `tr` object | |
+|---|---|
+| `tr.Environment`, `tr.CollectionVariables`, `tr.Globals` | `["name"]` (null when not set; setting null unsets), `.Get(name, fallback)`, `.Set(name, value)`, `.Unset(name)`, `.Has(name)`, `.Clear()`, `.ToDictionary()`. Kept as in Python. |
+| `tr.Variables` | Reads every scope (this request, the environment, the collection, the globals). `.Set()` is for this request only. `.ReplaceIn("{{base}}/x")` replaces `{{variables}}` in a text. |
+| `tr.Request` | `.Method`, `.Url`, `.Headers` (`["name"]`, `.Get`, `.GetAll`, `.Set`, `.Add`, `.Remove`, `.Has`), `.Body` (raw bodies). Pre-request scripts can change them. |
+| `tr.Response` | In test scripts: `.Status` (or `.Code`), `.Reason`, `.Headers`, `.Time` (ms), `.Size`, `.Text()`, `.Json()` (a `JsonNode`: `json["name"]`, `(int)json["id"]`), `.Content` (bytes). |
+| `tr.Test(name, () => …)` | Records a test that fails when it throws; `async () => …` tests are awaited. Assertion libraries from NuGet work too. |
+| `tr.Assert(condition)`, `tr.AssertEqual(expected, actual)` | Fail with the code that failed: `assertion failed: tr.Response.Status == 201`, `tr.Response.Code: expected 201, got 200`. `AssertEqual` compares numbers as numbers and JSON as JSON: `tr.AssertEqual("Ada", json["name"])`. |
+| `tr.Info` | `.Phase`, `.Script`, `.RequestName`, `.Collection`, `.Environment`. |
+| `Console.WriteLine(…)` | Goes where `print` does. `HttpClient` sends requests of the script's own (TermRest's certificates and proxy settings do not apply). |
 
 ```python
-# Collection pre-request script: log in once, then send the token with every request
+# Python: a collection pre-request script that logs in once, then sends the token with every request
 import json, urllib.request
 
 if not tr.environment.get("token"):
@@ -196,7 +234,7 @@ tr.request.headers.set("Authorization", "Bearer " + tr.environment.get("token"))
 ```
 
 ```python
-# Request post-response script
+# Python: a request's post-response script
 @tr.test("creates the item")
 def _():
     assert tr.response.status == 201, tr.response.status
@@ -205,18 +243,69 @@ def _():
 tr.collection_variables.set("item_id", tr.response.json()["id"])
 ```
 
+```js
+// JavaScript: the same tests, as Postman writes them
+pm.test("creates the item", () => {
+    pm.response.to.have.status(201);
+    pm.expect(pm.response.json().name).to.eql("Ada");
+});
+pm.collectionVariables.set("item_id", pm.response.json().id);
+```
+
+```csharp
+// C#: the same tests
+tr.Test("creates the item", () =>
+{
+    tr.AssertEqual(201, tr.Response.Status);
+    tr.AssertEqual("Ada", tr.Response.Json()["name"]);
+});
+tr.CollectionVariables.Set("item_id", tr.Response.Json()["id"]);
+```
+
 **Where the results show**
 
-- **In the UI**, the response's status line says `tests 3/3 passed`, `✗ 1 of 3 tests failed` or `✗ script error`. Its *Scripts* tab lists the tests, the output, errors with their traceback, and the variables set. *Help › Scripting (Python)* summarizes the `tr` object.
+- **In the UI**, the response's status line says `tests 3/3 passed`, `✗ 1 of 3 tests failed`, `✗ script error` or `⚠ scripts not run`. Its *Scripts* tab lists the tests, the output, errors with their line, the variables set, and the scripts that did not run. *Help › Scripting* summarizes the `tr` and `pm` objects.
 - **`termrest send`** prints the output and tests to stderr. It exits with 1 when a test fails or a script fails.
 - **`termrest run`** prints them under each request, and a request whose tests fail counts as failed. `--report-json` includes `tests` and `scriptError`.
 - **Recordings** include `_termrest.scripts`: tests, the error and traceback, the names (not the values) of the variables set, and what the scripts printed, all redacted like the rest.
 
-**Compatibility and safety**
+**Compatibility**
 
-- Scripts are stored in Postman's `event` entries. Python ones are marked `"type": "text/x-python"` (in v3 YAML: `language: text/x-python`). Postman keeps them, but doesn't run them.
-- Postman's JavaScript scripts are kept as they are and not run. The *Scripts* tab says so; switch its language to *Python* to write a script that TermRest runs.
-- **Scripts run as you, with your permissions:** like any program, they can read files and use the network. Choose Python only for workspaces whose collections you trust.
+- Scripts are stored in Postman's `event` entries. JavaScript ones stay as Postman wrote them (`"type": "text/javascript"`), so Postman runs them too. Python ones are marked `"type": "text/x-python"` and C# ones `"type": "text/x-csharp"` (in v3 YAML: `language: text/x-python`, `language: text/x-csharp`); Postman keeps them, but doesn't run them.
+
+### Script safety
+
+TermRest runs scripts the way a terminal runs commands: it starts the runtime you chose and lets the scripts do anything that runtime can. That makes them as capable as any program you write, and as dangerous as any program you run without reading it. You choose the runtimes, so the responsibility for what runs is yours.
+
+**What a script can do, with nothing to stop it**
+
+- Read, change, delete or upload any file you can: source code, SSH keys, cloud credentials (`~/.azure`, `~/.aws`, `~/.kube`), browser profiles.
+- See every variable, secret ones included, the requests with their `Authorization` headers, the responses, and TermRest's environment variables (tokens, in CI). It can send them anywhere: `fetch`, `HttpClient`, `urllib` and `pm.sendRequest` do not go through TermRest.
+- Start programs, which may keep running after TermRest stops the runtime, install software, and change your system's settings.
+- Run code it brings in:
+  - **C#:** `#:package` restores NuGet packages, and their build steps (MSBuild targets, analyzers) run while the scripts are built, before any script does. `#:sdk`, `#:project` and `#:include` bring in more.
+  - **JavaScript:** `require` loads npm packages from the workspace's `node_modules`, and Bun downloads missing ones by itself.
+  - **Python:** scripts import whatever the chosen environment has.
+  - A repository can ship such code itself, for example a `node_modules` folder or a `.venv`.
+
+**What TermRest does, and does not do**
+
+- It never chooses a runtime by itself. Runtimes are chosen per workspace folder and kept in your user settings, never in the workspace, so a cloned repository cannot turn its scripts on. *Find* only looks when you press it.
+- Without a runtime, the UI sends requests and skips their scripts (`⚠ scripts not run`). On the command line, scripts without a runtime are an error until one is chosen (in the UI, or with `--python`, `--javascript` or `--csharp`), or until you pass `--no-scripts`.
+- `tr` and `pm` cannot change collection, environment or settings files: the values scripts set stay in memory until TermRest closes. Recordings redact secrets, in what scripts print too.
+- It does **not** sandbox, review, sign or limit scripts.
+  - JavaScript gets a fresh context per phase for Postman compatibility, not for isolation: Node.js's `vm` module is not a security boundary.
+  - A timeout stops the runtime, not what a script already did.
+- Once a runtime is chosen for a workspace, **every** script of its collections runs on the next send, without asking. That includes scripts that arrive with a `git pull`, an import or a teammate's change, and the scripts of the collection and its folders, which a request's *Scripts* tab does not show.
+
+**Before you turn scripts on**
+
+- **Read the scripts first:** the request's *Scripts* tab, and right-click › *Scripts…* on the collection and on each folder. In the files, they are the `event` entries (`script.exec`) of JSON collections and the `scripts` of v3 YAML files. Review changes to them as you review code.
+- **Keep collections you did not write, or have not read, in a workspace folder with no runtime chosen.** On the command line, use `--no-scripts` for them.
+- **Choose runtimes you installed yourself.** *Find* suggests the workspace's own `.venv`: in a repository you did not create, make sure it is one you made.
+- **Pin package versions** (`#:package Name@1.2.3`, lock files), and prefer package feeds you trust.
+- **Run collections from unknown sources in a container, a VM or a separate account.** In CI, give the job only the secrets its requests need: scripts see the job's environment.
+- **To turn scripts off again,** clear the runtime in *Tools › Scripts…* and save, or remove it from `pythonInterpreters`, `javaScriptRuntimes` or `csharpRuntimes` in your `settings.json`.
 
 ## Color themes
 
@@ -299,7 +388,7 @@ While recording, the button turns into a red badge with a blinking dot, the time
 Click the badge (or press F12) to stop. TermRest asks where to save the recording. The default is `termrest-recording-<date>-<time>.har` in the workspace folder; type another path or use *Browse…*.
 
 - **The file** is JSON in **HAR 1.2** format (HTTP Archive), the format browser dev tools export. Chrome, Edge and Firefox (*Network › Import HAR*), Fiddler, Charles, Insomnia and HAR viewers open it.
-- **TermRest's own details** are under `_termrest` keys, as HAR allows: collection, request, environment, auth type, settings, TLS, warnings, what the [scripts](#scripts-python) did, and what was redacted.
+- **TermRest's own details** are under `_termrest` keys, as HAR allows: collection, request, environment, auth type, settings, TLS, warnings, what the [scripts](#scripts) did, and what was redacted.
 - **The other choices:** *Keep recording* goes on, and *Discard* throws the recording away. Quitting or switching workspaces while recording asks first.
 
 ```jsonc
@@ -482,7 +571,7 @@ termrest snapshot [<workspace>] [--send]       render the UI headlessly (smoke t
 
 <collection>: a *.postman_collection.json file or a v3 collection folder
 common options:      -e/--env <name|file>  --var key=value  --timeout <ms>  -k/--insecure  --record <file.har>
-                     --python <path>  --no-scripts
+                     --python <path>  --javascript <path>  --csharp <path>  --no-scripts
 send options:        -i/--include  -v/--verbose  -o/--output <file>  --raw  -f/--fail  --curl  --no-history
 run options:         --bail  --allow-http-errors  --report-json <file>
 history options:     -n/--limit <n>  --show <id>  --json  --clear
@@ -497,6 +586,8 @@ termrest run "samples/TermRest Demo.postman_collection.json" -e "Postman Echo" -
 termrest send api.postman_collection.json "Users/Get user" --var userId=42 -i
 termrest send api.postman_collection.json "Users/Get user" --curl     # print an equivalent curl command (scripts do not run)
 termrest run api.postman_collection.json --python .venv/bin/python   # run the collection's Python scripts and tests
+termrest run postman-export.json --javascript node                   # run a Postman collection's pm.* scripts and tests
+termrest run api.postman_collection.json --csharp dotnet             # build and run the collection's C# scripts and tests
 ```
 
 ## Postman compatibility
@@ -510,7 +601,7 @@ termrest run api.postman_collection.json --python .venv/bin/python   # run the c
 | Folders, descriptions, saved examples, `protocolProfileBehavior`, unknown fields | Kept; edited fields are rewritten surgically |
 | Body modes | raw, urlencoded, formdata (text + files), file (binary, or typed and checked: `file.language`), graphql |
 | Auth | inherit, noauth, basic, bearer, apikey, digest, ntlm, oauth2 (access token) — others are kept, not applied |
-| Scripts | Python scripts (`"type": "text/x-python"`; v3 `language: text/x-python`) run, see [Scripts (Python)](#scripts-python). JavaScript (`pm.*`) scripts are kept and editable, **not run** |
+| Scripts | JavaScript (`pm.*`, and the older `postman.*` and `tests[]`) runs in Node.js or Bun, Python (`"type": "text/x-python"`; v3 `language: text/x-python`) in Python, C# (`"type": "text/x-csharp"`) with the .NET SDK; see [Scripts](#scripts) for the `pm` API supported |
 | Client certificates | `request.certificate` honoured; Newman certificate-list format for the registry |
 | cURL | Import (bash, cmd and PowerShell syntax) and export |
 
@@ -532,7 +623,8 @@ The [CI workflow](.github/workflows/ci.yml) tests on Windows, Linux and macOS. I
 
 ```text
 src/TermRest.Core   UI-free engine: Postman model + mapper (v2.1 JSON, v3 YAML), YAML reader/writer, variables,
-                    HTTP executor, certificates, history, recording (HAR, redaction), scripts (Python worker),
+                    HTTP executor, certificates, history, recording (HAR, redaction), scripts (Python and
+                    JavaScript workers, C# programs built by the user's .NET SDK),
                     cURL import, workspace
 src/TermRest.Tui    Terminal.Gui v2 views and dialogs
 src/TermRest.Cli    `termrest` executable (System.CommandLine): TUI by default + headless commands
@@ -547,6 +639,8 @@ dotnet test                                    # Microsoft.Testing.Platform runn
 TERMREST_STORE_TESTS=1 dotnet test             # Windows: also run the non-exportable cert-store mTLS test
 TERMREST_V3_CORPUS=<folder> dotnet test        # also edit and revert every Postman v3 collection found under <folder>
 TERMREST_TEST_PYTHON=<python> dotnet test      # the Python for script tests (default: python3 or python on PATH; skipped without)
+TERMREST_TEST_JAVASCRIPT=<runtime> dotnet test # the Node.js or Bun for script tests (default: node or bun on PATH; skipped without)
+TERMREST_TEST_DOTNET=<dotnet> dotnet test      # the .NET SDK (10+) for C# script tests (default: dotnet on PATH; skipped without)
 ```
 
 Notes:
