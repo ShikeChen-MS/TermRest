@@ -127,4 +127,14 @@ internal static class Ui
         container.Add(field);
         return field;
     }
+
+    /// <summary>
+    /// Runs <paramref name="action"/> when a button inside a dialog is pressed, and only that: a press the button does
+    /// not handle would also press the dialog's default button (Save, OK) and close it.
+    /// </summary>
+    public static void OnPress(Button button, Action action) => button.Accepting += (_, e) =>
+    {
+        e.Handled = true;
+        action();
+    };
 }

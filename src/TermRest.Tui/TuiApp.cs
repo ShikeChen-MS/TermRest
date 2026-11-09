@@ -46,7 +46,7 @@ public static class TuiApp
                 return 2;
             }
 
-            using var runner = new RequestRunner(workspace) { StrictSslOverride = options.StrictSslOverride };
+            using var runner = new RequestRunner(workspace) { StrictSslOverride = options.StrictSslOverride, RequireScriptRuntimes = false };
             runner.ConfigureHistory();
             runner.ConfigureScripts();
             using var app = Application.Create();
@@ -137,7 +137,7 @@ public static class TuiApp
             throw new ArgumentException($"Color theme '{theme}' was not found; see 'termrest themes'.", nameof(theme));
         }
 
-        using var runner = new RequestRunner(workspace);
+        using var runner = new RequestRunner(workspace) { RequireScriptRuntimes = false };
         runner.ConfigureScripts();
         using var app = Application.Create();
         app.Init(Terminal.Gui.Drivers.DriverRegistry.Names.ANSI);

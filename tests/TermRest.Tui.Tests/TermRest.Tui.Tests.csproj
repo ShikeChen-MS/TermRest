@@ -31,6 +31,8 @@
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TempDirectoryCleanup.cs" Link="Infrastructure\Shared\TempDirectoryCleanup.cs" />
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\V3Fixture.cs" Link="Infrastructure\Shared\V3Fixture.cs" />
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestPython.cs" Link="Infrastructure\Shared\TestPython.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestJavaScript.cs" Link="Infrastructure\Shared\TestJavaScript.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestCSharp.cs" Link="Infrastructure\Shared\TestCSharp.cs" />
   </ItemGroup>
 
 </Project>

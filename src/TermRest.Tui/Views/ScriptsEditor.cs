@@ -27,7 +27,7 @@ internal sealed class ScriptsEditor : View
             X = Pos.Right(languageLabel) + 1,
             Y = 0,
             Orientation = Orientation.Horizontal,
-            Labels = ["Python", "JavaScript (Postman)"],
+            Labels = [.. ScriptLanguage.All.Select(ScriptLanguage.Label)],
             Value = 0,
         };
         _language.ValueChanged += (_, e) =>
@@ -62,14 +62,14 @@ internal sealed class ScriptsEditor : View
     /// <summary>The hint under the language (for tests).</summary>
     internal string Hint => _hint.Text;
 
-    private string Language => _language.Value == 1 ? ScriptLanguage.JavaScript : ScriptLanguage.Python;
+    private string Language => ScriptLanguage.All[Math.Clamp(_language.Value ?? 0, 0, ScriptLanguage.All.Count - 1)];
 
     public void Load(ScriptSet scripts)
     {
         _loading = true;
         try
         {
-            _language.Value = scripts.IsPython ? 0 : 1;
+            _language.Value = Math.Max(0, ScriptLanguage.All.ToList().IndexOf(scripts.Language));
             _preRequest.SetText(scripts.PreRequest);
             _test.SetText(scripts.Test);
             UpdateHint();
@@ -82,7 +82,10 @@ internal sealed class ScriptsEditor : View
 
     public void FocusPreRequest() => _preRequest.SetFocus();
 
-    private void UpdateHint() => _hint.Text = Language == ScriptLanguage.Python
-        ? "Run by your Python (Tools › Scripts…) with the tr object: tr.request, tr.response, tr.environment, tr.test… (Help › Scripting)"
-        : "Postman's JavaScript is kept in the collection but not run: TermRest runs scripts written in Python.";
+    private void UpdateHint() => _hint.Text = Language switch
+    {
+        ScriptLanguage.Python => "Run by your Python (Tools › Scripts…) with the tr object: tr.request, tr.response, tr.environment, tr.test… (Help › Scripting)",
+        ScriptLanguage.CSharp => "Built and run by your .NET 10 SDK (Tools › Scripts…) with the tr object: tr.Request, tr.Response, tr.Test… (Help › Scripting)",
+        _ => "Run by your Node.js or Bun (Tools › Scripts…) with Postman's pm object: pm.test, pm.expect, pm.response… (Help › Scripting)",
+    };
 }

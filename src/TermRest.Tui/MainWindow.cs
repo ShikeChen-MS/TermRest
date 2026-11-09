@@ -274,7 +274,7 @@ internal sealed class MainWindow : Runnable
         [
             new MenuItem("Client _certificates…", Key.F8, ShowCertificates),
             new MenuItem("_Settings…", "", ShowSettings),
-            new MenuItem("Scri_pts (Python)…", "", ShowScriptSettings),
+            new MenuItem("Scri_pts…", "", ShowScriptSettings),
             new MenuItem("Color _theme…", "", ShowThemes),
             new MenuItem("Clear _cookies", "", ClearCookies),
             new Line(),
@@ -284,7 +284,7 @@ internal sealed class MainWindow : Runnable
         new MenuBarItem("_Help",
         [
             new MenuItem("_Keyboard & mouse", "", ShowKeys),
-            new MenuItem("_Scripting (Python)", "", ShowScriptingHelp),
+            new MenuItem("_Scripting", "", ShowScriptingHelp),
             new MenuItem("_Workspace info", "", ShowWorkspaceInfo),
             new MenuItem("_About TermRest", "", ShowAbout),
         ]),
@@ -762,27 +762,29 @@ internal sealed class MainWindow : Runnable
 
     private void ShowScriptSettings()
     {
-        ScriptsDialog.ShowPython(App!, _workspace, _runner);
-        Notify(_runner.PythonInterpreter is { } python ? $"Scripts run with {python}" : "No Python chosen: scripts do not run.");
+        ScriptsDialog.ShowRuntimes(App!, _workspace, _runner);
+        Notify($"Scripts: Python {_runner.PythonInterpreter ?? "not chosen"} · JavaScript {_runner.JavaScriptRuntime ?? "not chosen"} · C# {_runner.CSharpRuntime ?? "not chosen"}");
     }
 
-    private void ShowScriptingHelp() => Ui.ShowText(App!, "Scripting (Python)", ScriptingHelp);
+    private void ShowScriptingHelp() => Ui.ShowText(App!, "Scripting", ScriptingHelp);
 
     internal const string ScriptingHelp = """
-        Scripts are Python, run by the Python you choose in Tools › Scripts… (a virtual environment's python lets
-        scripts import its packages). One Python process runs them: it starts for the first script and stops after
-        5 idle minutes, so scripts cost nothing until you use them. Each phase may take up to 30 seconds.
+        Scripts run in a runtime you choose in Tools › Scripts… for each workspace: Python for Python scripts, Node.js
+        or Bun for JavaScript (Postman's pm.* scripts), the .NET SDK (10 or later) for C#. TermRest carries no script
+        engine: one process per runtime runs the scripts, starting for the first one and stopping after 5 idle minutes.
+        Each phase may take up to 30 seconds. Scripts whose runtime is not chosen do not run: the response's Scripts tab
+        says so.
 
         When they run
           Pre-request scripts run before the request is prepared, then post-response (test) scripts once the response
           has arrived. Each phase runs the scripts of the collection, then its folders (outermost first), then the
-          request. A pre-request script that fails stops the request: it is not sent. Edit collection and folder
-          scripts with right-click › Scripts…; Postman's JavaScript scripts are kept but not run.
+          request; the languages can be mixed. A pre-request script that fails stops the request: it is not sent.
+          Edit collection and folder scripts with right-click › Scripts…, and choose the language in the Scripts tab.
+          Values scripts set are kept until TermRest closes (Postman's "current values"): files never change.
 
-        The tr object
+        Python: the tr object
           tr.environment, tr.collection_variables, tr.globals
                        .get(name), .set(name, value), .unset(name), .has(name), .to_dict(), and tr.environment["name"].
-                       Values set are kept until TermRest closes (Postman's "current values"): files never change.
           tr.variables   reads every scope (this request, environment, collection, globals); .set() is for this
                        request only; .replace_in("{{base}}/x") replaces {{variables}} in a text.
           tr.request     .method, .url, .headers (.get .set .add .remove), .body: change them before sending.
@@ -791,23 +793,47 @@ internal sealed class MainWindow : Runnable
           tr.info        .phase ("prerequest" or "test"), .script, .request_name, .collection, .environment.
           print(…)       output goes to the response's Scripts tab, with the tests and errors.
 
-        Example: a collection pre-request script that logs in once and sends the token
-          import json, urllib.request
-          if not tr.environment.get("token"):
-              body = json.dumps({"user": tr.environment.get("user"), "password": tr.environment.get("password")}).encode()
-              login = urllib.request.Request(tr.variables.replace_in("{{base}}/login"), body, {"Content-Type": "application/json"})
-              with urllib.request.urlopen(login) as reply:
-                  tr.environment.set("token", json.load(reply)["token"])
-          tr.request.headers.set("Authorization", "Bearer " + tr.environment.get("token"))
-
-        Example: tests
           @tr.test("returns the new item")
           def _():
               assert tr.response.status == 201, tr.response.status
               assert tr.response.json()["name"] == "Ada"
 
-        Python runs in the workspace folder, so scripts can import your own modules from it. Scripts run with your
-        permissions: choose Python only for workspaces whose collections you trust.
+        JavaScript: Postman's pm object
+          pm.environment, pm.collectionVariables, pm.globals, pm.variables   .get .set .unset .has .toObject .replaceIn
+          pm.request     .method, .url (.query, .toString()), .headers (.add .upsert .remove .get), .body.raw
+          pm.response    .code, .status, .headers, .responseTime, .json(), .text(), .to.have.status(200), .to.be.ok …
+          pm.test(name, fn), pm.expect(value).to.equal(…) (chai's assertions), pm.sendRequest(…), pm.info, console.log
+          The old API works too: tests["name"] = …, postman.setEnvironmentVariable(…), responseBody, responseCode.
+          require() loads Node.js modules and the packages installed in the workspace (npm install lodash crypto-js …);
+          _, CryptoJS, cheerio and tv4 load those packages when first used, as Postman's globals.
+
+          pm.test("returns the new item", () => {
+              pm.response.to.have.status(201);
+              pm.expect(pm.response.json().name).to.eql("Ada");
+          });
+
+        C#: the tr object, as in Python
+          A script is the body of an async method: statements, local functions, await. It may start with using
+          directives and #:package Name@1.2.3 (NuGet packages; also #:project, #:property). TermRest builds the
+          scripts of a collection into one small program with dotnet: the first build takes a few seconds, a change
+          about a second, and built programs are kept, so they start at once next time. Builds leave the SDK's compiler
+          server running for 10 minutes (100 MB or more, as any dotnet build does): Stop scripts in Tools › Scripts…
+          stops it.
+          tr.Environment, tr.CollectionVariables, tr.Globals   ["name"], .Get .Set .Unset .Has .ToDictionary
+          tr.Variables   reads every scope; .Set() is for this request only; .ReplaceIn("{{base}}/x").
+          tr.Request     .Method, .Url, .Headers (.Get .Set .Add .Remove, ["name"]), .Body: change them before sending.
+          tr.Response    .Status (or .Code), .Reason, .Headers, .Time (ms), .Size, .Text(), .Json() (a JsonNode), .Content.
+          tr.Test(name, () => …) (async too), tr.Assert(condition), tr.AssertEqual(expected, actual), tr.Info.
+          Console.WriteLine(…) output goes to the Scripts tab.
+
+          tr.Test("returns the new item", () =>
+          {
+              tr.AssertEqual(201, tr.Response.Status);
+              tr.AssertEqual("Ada", tr.Response.Json()["name"]);
+          });
+
+        The runtimes run in the workspace folder, so scripts can import your own modules from it. Scripts run with your
+        permissions: choose runtimes only for workspaces whose collections you trust.
         """;
 
     // ----- recording -------------------------------------------------------------------------

@@ -86,9 +86,10 @@ internal sealed class ResponseView : View
 
     private const string NoScripts =
         "No scripts ran for this request.\n\n"
-        + "Scripts are Python code that runs before a request is sent and after its response arrives: set variables, sign\n"
-        + "requests, check responses with tests. Write them in the request's Scripts tab, or for a whole collection or folder\n"
-        + "(right-click it › Scripts…). Choose the Python that runs them in Tools › Scripts…; Help › Scripting shows the tr object.";
+        + "Scripts run before a request is sent and after its response arrives: set variables, sign requests, check\n"
+        + "responses with tests. Write them in Python, JavaScript (Postman's pm.* scripts) or C# in the request's Scripts\n"
+        + "tab, or for a whole collection or folder (right-click it › Scripts…). Choose the runtimes that run them (Python,\n"
+        + "Node.js or Bun, the .NET SDK) in Tools › Scripts…; Help › Scripting shows the tr and pm objects.";
 
     /// <summary>Raised with short user-facing notices (copied, saved, …).</summary>
     public event EventHandler<string>? Notice;
@@ -150,7 +151,7 @@ internal sealed class ResponseView : View
             {
                 >= 500 => "Error",
                 >= 400 => ThemeCatalog.WarningScheme,
-                _ when scripts is { Succeeded: false } => ThemeCatalog.WarningScheme,
+                _ when scripts is { Succeeded: false } or { NotRun.Count: > 0 } => ThemeCatalog.WarningScheme,
                 _ => ThemeCatalog.SuccessScheme,
             };
             SetHeaders(response.Headers);

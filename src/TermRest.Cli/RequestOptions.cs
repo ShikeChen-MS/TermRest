@@ -22,7 +22,17 @@ internal sealed class RequestOptions
 
     public Option<string?> Python { get; } = new("--python")
     {
-        Description = "Python that runs the collection's scripts, e.g. .venv/bin/python (default: the one chosen for this workspace in the full-screen UI)",
+        Description = "Python that runs the collection's Python scripts, e.g. .venv/bin/python (default: the one chosen for this workspace in the full-screen UI)",
+    };
+
+    public Option<string?> JavaScript { get; } = new("--javascript")
+    {
+        Description = "Node.js or Bun that runs the collection's JavaScript (Postman pm.*) scripts, e.g. node (default: the one chosen for this workspace in the full-screen UI)",
+    };
+
+    public Option<string?> CSharp { get; } = new("--csharp")
+    {
+        Description = "The dotnet (.NET SDK 10 or later) that builds and runs the collection's C# scripts, e.g. dotnet (default: the one chosen for this workspace in the full-screen UI)",
     };
 
     public Option<bool> NoScripts { get; } = new("--no-scripts") { Description = "Do not run pre-request and test scripts" };
@@ -34,6 +44,8 @@ internal sealed class RequestOptions
         command.Options.Add(Timeout);
         command.Options.Add(Record);
         command.Options.Add(Python);
+        command.Options.Add(JavaScript);
+        command.Options.Add(CSharp);
         command.Options.Add(NoScripts);
     }
 
@@ -132,7 +144,7 @@ internal sealed class RequestOptions
 
         if (runner.ScriptsEnabled)
         {
-            runner.ConfigureScripts(parseResult.GetValue(Python));
+            runner.ConfigureScripts(parseResult.GetValue(Python), parseResult.GetValue(JavaScript), parseResult.GetValue(CSharp));
         }
 
         if (parseResult.GetValue(Environment) is { } environment)

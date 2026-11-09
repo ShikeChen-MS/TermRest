@@ -9,6 +9,7 @@ using TermRest.Core.Recording;
 using TermRest.Core.Scripting;
 using TermRest.Core.Tests.Infrastructure;
 using TermRest.Core.Workspace;
+using TermRest.Tui.Dialogs;
 using TermRest.Tui.Tests.Infrastructure;
 using TermRest.Tui.Theming;
 using Xunit;
@@ -48,7 +49,7 @@ public sealed class MainWindowTests : IDisposable
         public Harness(string directory, Action<RequestRunner>? configure = null)
         {
             Workspace = ApiWorkspace.Open(directory);
-            Runner = new RequestRunner(Workspace);
+            Runner = new RequestRunner(Workspace) { RequireScriptRuntimes = false }; // as in the app (TuiApp)
             configure?.Invoke(Runner);
             App = Application.Create();
             App.Init(DriverRegistry.Names.ANSI);
@@ -828,8 +829,13 @@ public sealed class MainWindowTests : IDisposable
         var typed = ui.Window.Editor.Spec.Clone();
         ui.App.InjectKey(Key.S.WithCtrl);
         var savedPython = PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!.ReadSpec();
-        ui.Click("○ JavaScript (Postman)");
+        ui.Click("○ JavaScript");
         var javaScript = ui.Screen();
+        ui.App.InjectKey(Key.S.WithCtrl);
+        var savedJavaScript = PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!.ReadSpec();
+        var javaScriptFile = File.ReadAllText(path);
+        ui.Click("○ C#");
+        var csharp = ui.Screen();
         ui.App.InjectKey(Key.S.WithCtrl);
         ui.App.End(token!);
 
@@ -837,9 +843,115 @@ public sealed class MainWindowTests : IDisposable
         OnScreen("Run by your Python (Tools › Scripts…)", tab);
         Assert.Equal(("print(1)", ScriptLanguage.Python), (typed.PreRequestScript, typed.ScriptLanguage));
         Assert.Equal(("print(1)", ScriptLanguage.Python), (savedPython.PreRequestScript, savedPython.ScriptLanguage));
-        OnScreen("Postman's JavaScript is kept in the collection but not run", javaScript);
-        Assert.Equal(ScriptLanguage.JavaScript, PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!.ReadSpec().ScriptLanguage);
-        Assert.Contains("text/javascript", File.ReadAllText(path), StringComparison.Ordinal);
+        OnScreen("Run by your Node.js or Bun (Tools › Scripts…) with Postman's pm object", javaScript);
+        Assert.Equal(ScriptLanguage.JavaScript, savedJavaScript.ScriptLanguage);
+        Assert.Contains("text/javascript", javaScriptFile, StringComparison.Ordinal);
+        OnScreen("Built and run by your .NET 10 SDK (Tools › Scripts…) with the tr object", csharp);
+        Assert.Equal(ScriptLanguage.CSharp, PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!.ReadSpec().ScriptLanguage);
+        Assert.Contains("text/x-csharp", File.ReadAllText(path), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CSharp_scripts_are_built_and_run_by_the_chosen_dotnet()
+    {
+        var dotnet = TestCSharp.Require();
+        await using var server = await LocalEchoServer.StartAsync();
+        var setup = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        var request = setup.FindRequest("Basics/GET with query")!;
+        var spec = request.ReadSpec();
+        spec.ScriptLanguage = ScriptLanguage.CSharp;
+        spec.TestScript = $"// {Guid.NewGuid():N}\ntr.Test(\"status is 200\", () => tr.AssertEqual(200, tr.Response.Status));\nConsole.WriteLine(\"query \" + tr.Response.Json()[\"query\"]);";
+        setup.UpdateRequest(request, spec);
+        setup.Save();
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.SetCSharpRuntime(dotnet);
+        });
+        var ran = "";
+        var deadline = DateTime.UtcNow.AddSeconds(90);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            ui.App.InjectKey(Key.F5);
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            var screen = ui.Screen();
+            if (screen.Contains("tests 1/1 passed", StringComparison.Ordinal) || DateTime.UtcNow > deadline)
+            {
+                ran = screen;
+                ui.App.RequestStop();
+                return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("tests 1/1 passed", ran);
+        var scripts = ui.Window.ResponsePane.ScriptsText;
+        Assert.Contains("✓ status is 200", scripts, StringComparison.Ordinal);
+        Assert.Contains("[test · request 'Basics/GET with query'] query ?foo=bar&source=termrest", scripts, StringComparison.Ordinal);
+        Assert.Contains("The C# scripts were built", scripts, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Postman_javascript_scripts_are_skipped_until_a_runtime_is_chosen_then_run()
+    {
+        var node = TestJavaScript.Require();
+        await using var server = await LocalEchoServer.StartAsync();
+        var setup = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        var node1 = setup.FindRequest("Basics/GET with query")!;
+        var spec = node1.ReadSpec();
+        spec.ScriptLanguage = ScriptLanguage.JavaScript;
+        spec.TestScript = "pm.test('status is 200', () => pm.response.to.have.status(200));\nconsole.log('query', pm.response.json().query);";
+        setup.UpdateRequest(node1, spec);
+        setup.Save();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo");
+        string skipped = "", ran = "";
+        var sends = 0;
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            ui.App.InjectKey(Key.F5);
+            sends = 1;
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            var screen = ui.Screen();
+            if (DateTime.UtcNow > deadline)
+            {
+                ui.App.RequestStop();
+                return false;
+            }
+
+            if (sends == 1 && screen.Contains("200 OK", StringComparison.Ordinal))
+            {
+                skipped = screen;
+                ui.Runner.SetJavaScriptRuntime(node); // as Tools › Scripts… does once saved
+                ui.App.InjectKey(Key.F5);
+                sends = 2;
+            }
+            else if (sends == 2 && screen.Contains("tests 1/1 passed", StringComparison.Ordinal))
+            {
+                ran = screen;
+                ui.App.RequestStop();
+                return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("⚠ scripts not run", skipped);
+        OnScreen("tests 1/1 passed", ran);
+        var scripts = ui.Window.ResponsePane.ScriptsText;
+        Assert.Contains("✓ status is 200", scripts, StringComparison.Ordinal);
+        Assert.Contains("[test · request 'Basics/GET with query'] query ?foo=bar&source=termrest", scripts, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -883,6 +995,62 @@ public sealed class MainWindowTests : IDisposable
         OnScreen("They run for every request inside", dialog);
         var saved = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
         Assert.Equal(new ScriptSet("tr.variables.set('a', 1)", "", ScriptLanguage.Python), saved.GetScripts(saved.RootNode));
+    }
+
+    [Fact]
+    public void The_scripts_dialog_chooses_a_runtime_for_each_language()
+    {
+        TestCSharp.Require();
+        var settings = TestFiles.NewTempDirectory();
+        using var ui = new Harness(_directory);
+        string dialog = "", found = "";
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            var clicked = false;
+            ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+            {
+                var screen = ui.Screen();
+                if (!screen.Contains("Stop scripts", StringComparison.Ordinal))
+                {
+                    return DateTime.UtcNow < deadline;
+                }
+
+                if (!clicked)
+                {
+                    // The third row's Find: C#.
+                    dialog = screen;
+                    var finds = screen.Split('\n').SelectMany((line, y) => Enumerable.Range(0, line.Length)
+                        .Where(x => string.CompareOrdinal(line, x, "Find", 0, 4) == 0).Select(x => new Point(x, y))).ToList();
+                    ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(finds[2]));
+                    clicked = true;
+                    return true;
+                }
+
+                if (!screen.Contains("✓ .NET SDK", StringComparison.Ordinal) && DateTime.UtcNow < deadline)
+                {
+                    return true;
+                }
+
+                found = screen;
+                ui.Click("► Save ◄");
+                return false;
+            });
+            ScriptsDialog.ShowRuntimes(ui.App, ui.Workspace, ui.Runner, settings);
+            found = found.Length > 0 ? found : "closed before Find answered:\n" + ui.Screen();
+            ui.App.RequestStop();
+            return false;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("None chosen: Python scripts do not run.", dialog);
+        OnScreen("None chosen: JavaScript scripts do not run.", dialog);
+        OnScreen("None chosen: C# scripts do not run.", dialog);
+        Assert.True(found.Contains("✓ .NET SDK", StringComparison.Ordinal), $"{dialog}\n----\n{found}");
+        Assert.Equal("dotnet", UserSettings.Load(settings).GetScriptRuntime(ScriptLanguage.CSharp, ui.Workspace.RootPath));
+        Assert.Equal("dotnet", ui.Runner.CSharpRuntime);
+        Assert.Null(ui.Runner.PythonInterpreter);
     }
 
     [Fact]

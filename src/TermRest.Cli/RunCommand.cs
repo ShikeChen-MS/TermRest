@@ -96,7 +96,7 @@ internal static class RunCommand
                     Output.Warning($"  {warning}");
                 }
 
-                ScriptOutput.Print(exchange, "      ", notesShown, notRun: false);
+                ScriptOutput.Print(exchange, "      ", notesShown);
                 if (!passed && parseResult.GetValue(bail))
                 {
                     break;
@@ -107,10 +107,6 @@ internal static class RunCommand
             var tests = results.SelectMany(r => r.Exchange.Scripts?.Tests ?? []).ToList();
             var testSummary = tests.Count == 0 ? "" : $" (tests: {tests.Count(t => t.Passed)} passed, {tests.Count(t => !t.Passed)} failed)";
             Output.Info($"\n{(cancelled ? "Run cancelled. " : "")}{results.Count - failed} passed, {failed} failed, {requests.Count - results.Count} skipped{testSummary}");
-            if (results.Count(r => r.Exchange.Scripts?.NotRun.Count > 0) is > 0 and var withJavaScript)
-            {
-                Output.Info($"note: {withJavaScript} request(s) have JavaScript (Postman) scripts, which are not run: TermRest runs scripts written in Python.");
-            }
 
             // A cancelled run still saves what it recorded.
             var recorded = options.SaveRecording(parseResult, runner, recorder);

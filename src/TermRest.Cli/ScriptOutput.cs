@@ -7,8 +7,7 @@ internal static class ScriptOutput
 {
     /// <param name="indent">Prefix of every line (the collection runner indents them under the request).</param>
     /// <param name="notesShown">Notes printed already: each is printed once. Null prints them all.</param>
-    /// <param name="notRun">Whether to say which JavaScript (Postman) scripts were not run (the runner sums them up instead).</param>
-    public static void Print(HttpExchange exchange, string indent = "", ISet<string>? notesShown = null, bool notRun = true)
+    public static void Print(HttpExchange exchange, string indent = "", ISet<string>? notesShown = null)
     {
         if (exchange.Scripts is not { } results)
         {
@@ -45,7 +44,7 @@ internal static class ScriptOutput
             }
         }
 
-        foreach (var note in results.Notes.Append(notRun ? results.NotRunNote : null).OfType<string>())
+        foreach (var note in results.Notes.Concat(results.NotRunNotes))
         {
             if (notesShown?.Add(note) != false)
             {
