@@ -2,6 +2,7 @@ using System.Text.Json.Nodes;
 using TermRest.Core.Json;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
+using TermRest.Core.Scripting;
 using TermRest.Core.Tests.Infrastructure;
 using Xunit;
 
@@ -275,9 +276,9 @@ public class PostmanRequestMapperTests
     {
         var (collection, node, _) = Load(Data("complex.postman_collection.json"), "Folder A/Nested folder/Deep request");
         var spec = node.ReadSpec();
-        Assert.Contains("pm.response.to.have.status(200);", spec.TestScript, StringComparison.Ordinal);
+        Assert.Contains("pm.response.to.have.status(200);", spec.Scripts.For(ScriptLanguage.JavaScript).Test, StringComparison.Ordinal);
 
-        spec.TestScript = "pm.test('ok', () => {});\npm.expect(1).to.eql(1);";
+        spec.Scripts = spec.Scripts.With(spec.Scripts.For(ScriptLanguage.JavaScript) with { Test = "pm.test('ok', () => {});\npm.expect(1).to.eql(1);" });
         collection.UpdateRequest(node, spec);
 
         var test = node.Json["event"]!.AsArray().First(e => e!["listen"].GetString() == "test")!;

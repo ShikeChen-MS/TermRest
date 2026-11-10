@@ -14,7 +14,7 @@ public class CSharpScriptingTests
     private readonly CancellationToken _ct = TestContext.Current.CancellationToken;
 
     private static HttpRequestSpec CSharp(string url, string preRequest = "", string test = "") =>
-        new() { Url = url, PreRequestScript = preRequest, TestScript = test, ScriptLanguage = ScriptLanguage.CSharp };
+        new() { Url = url, Scripts = new ScriptSet(preRequest, test, ScriptLanguage.CSharp) };
 
     private static (ApiWorkspace Workspace, PostmanCollection Collection) NewWorkspace()
     {
@@ -46,8 +46,7 @@ public class CSharpScriptingTests
         var request = collection.AddRequest(folder, "Create", new HttpRequestSpec
         {
             Url = "{{base}}?q=1",
-            ScriptLanguage = ScriptLanguage.CSharp,
-            PreRequestScript = """
+            Scripts = new ScriptSet(language: ScriptLanguage.CSharp, preRequest: """
                 using System.Security.Cryptography;
                 using static System.Math;
                 using Json = System.Text.Json.JsonSerializer;
@@ -60,7 +59,7 @@ public class CSharpScriptingTests
                 tr.Variables.Set("started", 42);
                 await Task.Delay(1);
                 """,
-            TestScript = """
+            test: """
                 var sent = tr.Response.Json();
                 tr.Test("the pre-request scripts changed the request", () =>
                 {
@@ -79,7 +78,7 @@ public class CSharpScriptingTests
                 });
                 tr.CollectionVariables.Set("last_status", tr.Response.Code);
                 Console.WriteLine($"token is {tr.Environment["token"]} in {tr.Info.Environment}");
-                """,
+                """),
         });
         collection.Save();
         using var runner = new RequestRunner(workspace);
@@ -217,24 +216,27 @@ public class CSharpScriptingTests
     }
 
     [Fact]
-    public async Task Python_and_csharp_scripts_take_turns()
+    public async Task Requests_in_different_languages_run_in_their_own_runtimes()
     {
         var dotnet = TestCSharp.Require();
         var python = TestPython.Require();
         await using var server = await EchoServer.StartAsync();
         var (workspace, collection) = NewWorkspace();
-        collection.SetScripts(collection.RootNode, new ScriptSet("tr.variables.set('from_python', 'py')", "", ScriptLanguage.Python));
         using var runner = new RequestRunner(workspace);
         runner.SetPythonInterpreter(python);
         runner.SetCSharpRuntime(dotnet);
 
-        var exchange = await runner.SendAsync(collection, null, CSharp(server.Url("echo"),
-            preRequest: Fresh() + "\ntr.Request.Headers.Set(\"X-From\", tr.Variables[\"from_python\"] + \"+cs\");",
-            test: "tr.Test(\"python ran first\", () => tr.AssertEqual(\"py+cs\", tr.Response.Json()[\"headers\"][\"x-from\"]));"), _ct);
+        var csharp = await runner.SendAsync(collection, null, CSharp(server.Url("echo"),
+            preRequest: Fresh() + "\ntr.Request.Headers.Set(\"X-From\", \"cs\");",
+            test: "tr.Test(\"csharp\", () => tr.AssertEqual(\"cs\", tr.Response.Json()[\"headers\"][\"x-from\"]));"), _ct);
+        var python3 = await runner.SendAsync(collection, null,
+            new HttpRequestSpec { Url = server.Url("echo"), Scripts = new ScriptSet("", "tr.test('python', lambda: None)", ScriptLanguage.Python) }, _ct);
 
-        Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
-        Assert.Equal(["python ran first"], exchange.Scripts.Tests.Select(t => t.Name));
-        Assert.Equal(3, exchange.Scripts.Ran);
+        Assert.True(csharp.Scripts!.Succeeded, csharp.Scripts.Describe());
+        Assert.Equal(["csharp"], csharp.Scripts.Tests.Select(t => t.Name));
+        Assert.True(python3.Scripts!.Succeeded, python3.Scripts.Describe());
+        Assert.Equal(["python"], python3.Scripts.Tests.Select(t => t.Name));
+        Assert.Equal([".NET", "Python"], runner.RunningRuntimes.Order(StringComparer.Ordinal));
     }
 
     [Fact]

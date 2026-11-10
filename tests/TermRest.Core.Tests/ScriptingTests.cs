@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Text.Encodings.Web;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using TermRest.Core.History;
 using TermRest.Core.Http;
@@ -13,6 +15,8 @@ namespace TermRest.Core.Tests;
 
 public class ScriptingTests
 {
+    private static readonly JsonSerializerOptions Unescaped = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+
     private readonly CancellationToken _ct = TestContext.Current.CancellationToken;
 
     private static JsonObject Echoed(HttpExchange exchange) => JsonNode.Parse(exchange.Response!.Body)!.AsObject();
@@ -20,7 +24,7 @@ public class ScriptingTests
     private static string Header(HttpExchange exchange, string name) => Echoed(exchange)["headers"]![name]!.GetValue<string>();
 
     private static HttpRequestSpec Python(string url, string preRequest = "", string test = "") =>
-        new() { Url = url, PreRequestScript = preRequest, TestScript = test, ScriptLanguage = ScriptLanguage.Python };
+        new() { Url = url, Scripts = new ScriptSet(preRequest, test, ScriptLanguage.Python) };
 
     [Fact]
     public async Task Scripts_run_around_a_request_from_the_collection_down_to_the_request()
@@ -41,13 +45,13 @@ public class ScriptingTests
         {
             Url = "{{base}}?q=1",
             Headers = [new() { Key = "X-Order", Value = "{{order}}" }, new() { Key = "X-Off", Value = "1", Enabled = false }],
-            PreRequestScript = """
+            Scripts = new ScriptSet(language: ScriptLanguage.Python, preRequest: """
                 tr.variables.set("order", tr.variables.get("order") + "r")
                 tr.request.headers.set("X-Added", "yes")
                 tr.request.url = tr.request.url + "&added=1"
                 tr.environment.set("token", "abc-123")
                 """,
-            TestScript = """
+            test: """
                 @tr.test("echoes what the pre-request scripts set")
                 def _():
                     sent = tr.response.json()
@@ -61,7 +65,7 @@ public class ScriptingTests
                 tr.test("fails on purpose", wrong_status)
                 print("token is", tr.environment.get("token"), "in", tr.info.environment)
                 tr.collection_variables.set("last_status", tr.response.code)
-                """,
+                """),
         });
         collection.Save();
         var environmentFile = File.ReadAllText(environment.FilePath!);
@@ -175,8 +179,8 @@ public class ScriptingTests
         var collection = workspace.CreateCollection("API");
         using var runner = new RequestRunner(workspace);
         runner.ConfigureScripts(userSettingsDirectory: TestFiles.NewTempDirectory());
-        Assert.Equal((null, null, null), (runner.PythonInterpreter, runner.JavaScriptRuntime, runner.CSharpRuntime));
-        var javaScript = new HttpRequestSpec { Url = server.Url("echo"), PreRequestScript = "pm.variables.set('a', 1);", ScriptLanguage = ScriptLanguage.JavaScript };
+        Assert.Equal((null, null, null, null), (runner.PythonInterpreter, runner.JavaScriptRuntime, runner.CSharpRuntime, runner.PowerShellRuntime));
+        var javaScript = new HttpRequestSpec { Url = server.Url("echo"), Scripts = new ScriptSet("pm.variables.set('a', 1);", "", ScriptLanguage.JavaScript) };
 
         // The command line: scripts that cannot run are an error, so a pre-request one stops the request.
         var notSent = await runner.SendAsync(collection, null, Python(server.Url("echo"), preRequest: "pass"), _ct);
@@ -186,9 +190,13 @@ public class ScriptingTests
         Assert.Null(notSentJavaScript.Response);
         Assert.Contains("--javascript", notSentJavaScript.ErrorMessage, StringComparison.Ordinal);
         var notSentCSharp = await runner.SendAsync(collection, null,
-            new HttpRequestSpec { Url = server.Url("echo"), PreRequestScript = "tr.Variables.Set(\"a\", 1);", ScriptLanguage = ScriptLanguage.CSharp }, _ct);
+            new HttpRequestSpec { Url = server.Url("echo"), Scripts = new ScriptSet("tr.Variables.Set(\"a\", 1);", "", ScriptLanguage.CSharp) }, _ct);
         Assert.Null(notSentCSharp.Response);
         Assert.Contains("need the .NET SDK (10 or later), and none is chosen for this workspace: pass --csharp", notSentCSharp.ErrorMessage, StringComparison.Ordinal);
+        var notSentPowerShell = await runner.SendAsync(collection, null,
+            new HttpRequestSpec { Url = server.Url("echo"), Scripts = new ScriptSet("$tr.Variables.Set('a', 1)", "", ScriptLanguage.PowerShell) }, _ct);
+        Assert.Null(notSentPowerShell.Response);
+        Assert.Contains("need PowerShell (7 or later), and none is chosen for this workspace: pass --powershell", notSentPowerShell.ErrorMessage, StringComparison.Ordinal);
 
         var testsOnly = await runner.SendAsync(collection, null, Python(server.Url("echo"), test: "pass"), _ct);
         Assert.Equal(200, testsOnly.Response!.StatusCode);
@@ -267,7 +275,7 @@ public class ScriptingTests
     }
 
     [Fact]
-    public void Script_language_is_read_from_and_written_to_the_script_type()
+    public void Scripts_are_kept_per_language_in_postman_events()
     {
         var item = JsonNode.Parse("""
             {"name":"r","event":[
@@ -275,47 +283,82 @@ public class ScriptingTests
               {"listen":"test","script":{"exec":["tr.test('x', lambda: None)"],"type":"text/x-python"}}],
              "request":{"method":"GET","url":"https://h/"}}
             """)!.AsObject();
-        string?[] Types() => item["event"]!.AsArray().Select(e => e!["script"]!["type"]!.GetValue<string>()).ToArray();
         var spec = PostmanRequestMapper.Read(item, PostmanSchemaVersion.V21);
-        Assert.Equal(ScriptLanguage.Python, spec.ScriptLanguage);
+        Assert.Equal(new ScriptSet("", "tr.test('x', lambda: None)", ScriptLanguage.Python), spec.Scripts);
 
-        // Python code written into Postman's empty JavaScript event makes it a Python script.
+        // A JavaScript script goes into Postman's empty event. A new Python one gets an event of its own, disabled for
+        // Postman and Newman, which would run it as JavaScript; the Python event that did not change stays as it was.
         var edited = spec.Clone();
-        edited.PreRequestScript = "print(1)";
+        edited.Scripts = spec.Scripts
+            .With(new LanguageScripts(ScriptLanguage.JavaScript, "pm.variables.set('a', 1);", ""))
+            .With(new LanguageScripts(ScriptLanguage.Python, "print(1)", "tr.test('x', lambda: None)"));
+        Assert.False(edited.ContentEquals(spec));
         PostmanRequestMapper.Apply(item, edited, spec, PostmanSchemaVersion.V21);
-        Assert.Equal(["text/x-python", "text/x-python"], Types());
+        Assert.Equal(
+            """[{"listen":"prerequest","script":{"exec":["pm.variables.set('a', 1);"],"type":"text/javascript"}},""" +
+            """{"listen":"test","script":{"exec":["tr.test('x', lambda: None)"],"type":"text/x-python"}},""" +
+            """{"listen":"prerequest","script":{"exec":["print(1)"],"type":"text/x-python"},"disabled":true}]""",
+            item["event"]!.ToJsonString(Unescaped));
+        var both = PostmanRequestMapper.Read(item, PostmanSchemaVersion.V21);
+        Assert.Equal(edited.Scripts, both.Scripts);
 
-        var python = PostmanRequestMapper.Read(item, PostmanSchemaVersion.V21);
-        var switched = python.Clone();
-        switched.ScriptLanguage = ScriptLanguage.JavaScript;
-        Assert.False(switched.ContentEquals(python));
-        PostmanRequestMapper.Apply(item, switched, python, PostmanSchemaVersion.V21);
-        Assert.Equal(["text/javascript", "text/javascript"], Types());
+        // Clearing a Python script removes its event; Postman's keeps its event, empty, as Postman does.
+        var cleared = both.Clone();
+        cleared.Scripts = both.Scripts
+            .With(new LanguageScripts(ScriptLanguage.Python, "", "tr.test('x', lambda: None)"))
+            .With(new LanguageScripts(ScriptLanguage.JavaScript, "", ""));
+        PostmanRequestMapper.Apply(item, cleared, both, PostmanSchemaVersion.V21);
+        Assert.Equal(
+            """[{"listen":"prerequest","script":{"exec":[""],"type":"text/javascript"}},""" +
+            """{"listen":"test","script":{"exec":["tr.test('x', lambda: None)"],"type":"text/x-python"}}]""",
+            item["event"]!.ToJsonString(Unescaped));
 
-        // Without code the language does not matter, and new requests default to Python.
-        var empty = PostmanRequestMapper.Read(JsonNode.Parse("""{"name":"e","request":"https://h/"}""")!.AsObject(), PostmanSchemaVersion.V21);
-        Assert.Equal(ScriptLanguage.Python, empty.ScriptLanguage);
-        var other = empty.Clone();
-        other.ScriptLanguage = ScriptLanguage.JavaScript;
-        Assert.True(other.ContentEquals(empty));
-
-        // New Python events have no Postman "packages".
-        var fresh = JsonNode.Parse("""{"name":"n","request":{"method":"GET","url":"https://h/"}}""")!.AsObject();
+        // New events, one per language: Postman's has "packages", the others are disabled. A disabled JavaScript script
+        // is not one TermRest runs (nor does Postman): it is not read, and it is kept.
+        var fresh = JsonNode.Parse("""
+            {"name":"n","event":[{"listen":"test","script":{"exec":["pm.test('off', () => {});"],"type":"text/javascript"},"disabled":true}],
+             "request":{"method":"GET","url":"https://h/"}}
+            """)!.AsObject();
         var baseline = PostmanRequestMapper.Read(fresh, PostmanSchemaVersion.V21);
-        var withScript = baseline.Clone();
-        withScript.TestScript = "pass";
-        PostmanRequestMapper.Apply(fresh, withScript, baseline, PostmanSchemaVersion.V21);
-        Assert.Equal("""{"listen":"test","script":{"exec":["pass"],"type":"text/x-python"}}""", fresh["event"]![0]!.ToJsonString());
+        Assert.True(baseline.Scripts.IsEmpty);
+        var all = baseline.Clone();
+        all.Scripts = new ScriptSet(ScriptLanguage.All.Select(l => new LanguageScripts(l, "", $"test in {l}")));
+        PostmanRequestMapper.Apply(fresh, all, baseline, PostmanSchemaVersion.V21);
+        Assert.Equal(
+            """[{"listen":"test","script":{"exec":["pm.test('off', () => {});"],"type":"text/javascript"},"disabled":true},""" +
+            """{"listen":"test","script":{"exec":["test in python"],"type":"text/x-python"},"disabled":true},""" +
+            """{"listen":"test","script":{"exec":["test in javascript"],"type":"text/javascript","packages":{}}},""" +
+            """{"listen":"test","script":{"exec":["test in csharp"],"type":"text/x-csharp"},"disabled":true},""" +
+            """{"listen":"test","script":{"exec":["test in powershell"],"type":"text/x-powershell"},"disabled":true}]""",
+            fresh["event"]!.ToJsonString(Unescaped));
+        Assert.Equal(all.Scripts, PostmanRequestMapper.Read(fresh, PostmanSchemaVersion.V21).Scripts);
+        Assert.Equal(ScriptLanguage.PowerShell, ScriptLanguage.FromType("application/x-powershell"));
+    }
 
-        // C# scripts are text/x-csharp.
-        var csharp = PostmanRequestMapper.Read(fresh, PostmanSchemaVersion.V21);
-        var toCSharp = csharp.Clone();
-        toCSharp.ScriptLanguage = ScriptLanguage.CSharp;
-        toCSharp.TestScript = "tr.Test(\"ok\", () => { });";
-        PostmanRequestMapper.Apply(fresh, toCSharp, csharp, PostmanSchemaVersion.V21);
-        var script = fresh["event"]![0]!["script"]!;
-        Assert.Equal(("text/x-csharp", "tr.Test(\"ok\", () => { });"), (script["type"]!.GetValue<string>(), script["exec"]![0]!.GetValue<string>()));
-        Assert.Equal(ScriptLanguage.CSharp, PostmanRequestMapper.Read(fresh, PostmanSchemaVersion.V21).ScriptLanguage);
+    [Fact]
+    public void How_a_request_runs_its_scripts_is_kept_under_termrest()
+    {
+        var item = JsonNode.Parse("""{"name":"r","event":[],"request":{"method":"GET","url":"https://h/"},"response":[]}""")!.AsObject();
+        var spec = PostmanRequestMapper.Read(item, PostmanSchemaVersion.V21);
+        Assert.Equal(ScriptSettings.Auto, spec.ScriptSettings);
+
+        var chosen = spec.Clone();
+        chosen.ScriptSettings = new ScriptSettings(ScriptLanguage.PowerShell, PreRequest: false);
+        Assert.False(chosen.ContentEquals(spec));
+        PostmanRequestMapper.Apply(item, chosen, spec, PostmanSchemaVersion.V21);
+        Assert.Equal(
+            """{"name":"r","event":[],"termrest":{"scripts":{"language":"powershell","preRequest":false}},"request":{"method":"GET","url":"https://h/"},"response":[]}""",
+            item.ToJsonString(Unescaped));
+        Assert.Equal(chosen.ScriptSettings, PostmanRequestMapper.Read(item, PostmanSchemaVersion.V21).ScriptSettings);
+
+        var back = chosen.Clone();
+        back.ScriptSettings = ScriptSettings.Auto;
+        PostmanRequestMapper.Apply(item, back, chosen, PostmanSchemaVersion.V21);
+        Assert.Equal("""{"name":"r","event":[],"request":{"method":"GET","url":"https://h/"},"response":[]}""", item.ToJsonString(Unescaped));
+
+        // A language TermRest does not know is no choice (and stays in the file until the settings change).
+        var unknown = JsonNode.Parse("""{"name":"u","termrest":{"scripts":{"language":"ruby","postResponse":true}},"request":"https://h/"}""")!.AsObject();
+        Assert.Equal(new ScriptSettings(null, null, true), PostmanRequestMapper.Read(unknown, PostmanSchemaVersion.V21).ScriptSettings);
     }
 
     [Fact]
@@ -343,7 +386,7 @@ public class ScriptingTests
     }
 
     [Fact]
-    public void Python_scripts_keep_their_language_in_v3_collections()
+    public void Scripts_in_other_languages_are_kept_beside_postmans_in_v3_collections()
     {
         var root = V3Fixture.Create();
         var collection = Assert.Single(ApiWorkspace.Open(root).Collections);
@@ -351,9 +394,10 @@ public class ScriptingTests
         collection.SetScripts(collection.FindFolder("Widgets")!, new ScriptSet("", "print('folder')", ScriptLanguage.Python));
         var node = collection.FindRequest("Widgets/List widgets")!;
         var spec = node.ReadSpec();
-        Assert.Equal(ScriptLanguage.JavaScript, spec.ScriptLanguage);
-        spec.ScriptLanguage = ScriptLanguage.Python;
-        spec.TestScript = "tr.test('ok', lambda: None)";
+        var postman = spec.Scripts.For(ScriptLanguage.JavaScript);
+        Assert.Equal("pm.test('ok', () => pm.response.to.have.status(200));", postman.Test);
+        spec.Scripts = spec.Scripts.With(new LanguageScripts(ScriptLanguage.Python, "", "tr.test('ok', lambda: None)"));
+        spec.ScriptSettings = new ScriptSettings(PostResponse: true);
         Assert.True(collection.UpdateRequest(node, spec));
         collection.Save();
 
@@ -361,11 +405,15 @@ public class ScriptingTests
         Assert.Equal(new ScriptSet("tr.variables.set('a', 1)", "", ScriptLanguage.Python), reloaded.GetScripts(reloaded.RootNode));
         Assert.Equal(new ScriptSet("", "print('folder')", ScriptLanguage.Python), reloaded.GetScripts(reloaded.FindFolder("Widgets")!));
         var list = reloaded.FindRequest("Widgets/List widgets")!.ReadSpec();
-        Assert.Equal((ScriptLanguage.Python, "tr.test('ok', lambda: None)"), (list.ScriptLanguage, list.TestScript));
-        var file = Directory.GetFiles(V3Fixture.CollectionPath(root), "*.yaml", SearchOption.AllDirectories)
-            .Single(f => File.ReadAllText(f).Contains("tr.test('ok'", StringComparison.Ordinal));
-        Assert.Contains("language: text/x-python", File.ReadAllText(file), StringComparison.Ordinal);
-        Assert.DoesNotContain("text/javascript", File.ReadAllText(file), StringComparison.Ordinal);
+        Assert.Equal(spec.Scripts, list.Scripts);
+        Assert.Equal(postman, list.Scripts.For(ScriptLanguage.JavaScript));
+        Assert.Equal(new ScriptSettings(PostResponse: true), list.ScriptSettings);
+        var text = File.ReadAllText(Directory.GetFiles(V3Fixture.CollectionPath(root), "*.yaml", SearchOption.AllDirectories)
+            .Single(f => File.ReadAllText(f).Contains("lambda: None", StringComparison.Ordinal))).ReplaceLineEndings("\n");
+        var scripts = text[text.IndexOf("scripts:", StringComparison.Ordinal)..text.IndexOf("examples:", StringComparison.Ordinal)];
+        Assert.Contains("    language: text/javascript\n  - type: afterResponse\n", scripts, StringComparison.Ordinal);
+        Assert.Contains("    language: text/x-python\ntermrest:\n  scripts:\n    postResponse: true\n", scripts, StringComparison.Ordinal);
+        Assert.DoesNotContain("disabled", scripts, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -377,12 +425,14 @@ public class ScriptingTests
         settings.SetScriptRuntime(ScriptLanguage.Python, workspaceRoot, ".venv/bin/python");
         settings.SetScriptRuntime(ScriptLanguage.JavaScript, workspaceRoot, "node");
         settings.SetScriptRuntime(ScriptLanguage.CSharp, workspaceRoot, "dotnet");
+        settings.SetScriptRuntime(ScriptLanguage.PowerShell, workspaceRoot, "pwsh");
         settings.Save(directory);
 
         var loaded = UserSettings.Load(directory);
         Assert.Equal(".venv/bin/python", loaded.GetScriptRuntime(ScriptLanguage.Python, workspaceRoot + Path.DirectorySeparatorChar));
         Assert.Equal("node", loaded.GetScriptRuntime(ScriptLanguage.JavaScript, workspaceRoot));
         Assert.Equal("dotnet", loaded.GetScriptRuntime(ScriptLanguage.CSharp, workspaceRoot));
+        Assert.Equal("pwsh", loaded.GetScriptRuntime(ScriptLanguage.PowerShell, workspaceRoot));
         Assert.Null(loaded.GetScriptRuntime(ScriptLanguage.Python, TestFiles.NewTempDirectory()));
         if (OperatingSystem.IsWindows())
         {
@@ -394,8 +444,10 @@ public class ScriptingTests
         Assert.Equal(Path.GetFullPath(Path.Combine(workspaceRoot, ".venv/bin/python")), runner.PythonInterpreter);
         Assert.Equal("node", runner.JavaScriptRuntime);
         Assert.Equal("dotnet", runner.CSharpRuntime);
-        runner.ConfigureScripts(python: "python3", javaScript: "bun", cSharp: "/opt/dotnet/dotnet", userSettingsDirectory: directory);
-        Assert.Equal(("python3", "bun", "/opt/dotnet/dotnet"), (runner.PythonInterpreter, runner.JavaScriptRuntime, runner.CSharpRuntime));
+        Assert.Equal("pwsh", runner.PowerShellRuntime);
+        runner.ConfigureScripts(python: "python3", javaScript: "bun", cSharp: "/opt/dotnet/dotnet", powerShell: "/opt/microsoft/powershell/7/pwsh", userSettingsDirectory: directory);
+        Assert.Equal(("python3", "bun", "/opt/dotnet/dotnet", "/opt/microsoft/powershell/7/pwsh"),
+            (runner.PythonInterpreter, runner.JavaScriptRuntime, runner.CSharpRuntime, runner.PowerShellRuntime));
 
         loaded.SetScriptRuntime(ScriptLanguage.Python, workspaceRoot, null);
         Assert.Null(loaded.PythonInterpreters);
@@ -403,5 +455,34 @@ public class ScriptingTests
         var json = File.ReadAllText(Path.Combine(directory, "settings.json"));
         Assert.Contains("\"javaScriptRuntimes\"", json, StringComparison.Ordinal);
         Assert.Contains("\"csharpRuntimes\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"powerShellRuntimes\"", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"scriptLanguageOrder\"", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void The_language_order_is_the_users_for_every_workspace()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        var settings = UserSettings.Load(directory);
+        Assert.Equal(ScriptLanguage.All, settings.GetScriptLanguageOrder());
+
+        settings.SetScriptLanguageOrder([ScriptLanguage.PowerShell, "c#", "PowerShell", "ruby"]);
+        settings.Save(directory);
+        Assert.Contains("\"scriptLanguageOrder\"", File.ReadAllText(Path.Combine(directory, "settings.json")), StringComparison.Ordinal);
+        IReadOnlyList<string> mine = [ScriptLanguage.PowerShell, ScriptLanguage.CSharp, ScriptLanguage.Python, ScriptLanguage.JavaScript];
+        Assert.Equal(mine, UserSettings.Load(directory).GetScriptLanguageOrder());
+
+        using var runner = new RequestRunner(ApiWorkspace.Open(TestFiles.NewTempDirectory()));
+        Assert.Equal(ScriptLanguage.All, runner.ScriptLanguageOrder);
+        runner.ConfigureScripts(userSettingsDirectory: directory);
+        Assert.Equal(mine, runner.ScriptLanguageOrder);
+        runner.ConfigureScripts(userSettingsDirectory: directory, scriptOrder: [ScriptLanguage.JavaScript]);
+        Assert.Equal([ScriptLanguage.JavaScript, ScriptLanguage.PowerShell, ScriptLanguage.CSharp, ScriptLanguage.Python], runner.ScriptLanguageOrder);
+        runner.ScriptLanguageOrder = [ScriptLanguage.CSharp];
+        Assert.Equal([ScriptLanguage.CSharp, ScriptLanguage.Python, ScriptLanguage.JavaScript, ScriptLanguage.PowerShell], runner.ScriptLanguageOrder);
+
+        settings.SetScriptLanguageOrder(ScriptLanguage.All);
+        Assert.Null(settings.ScriptLanguageOrder);
+        Assert.Equal((ScriptLanguage.CSharp, ScriptLanguage.JavaScript, (string?)null), (ScriptLanguage.Parse(" C# "), ScriptLanguage.Parse("js"), ScriptLanguage.Parse("ruby")));
     }
 }

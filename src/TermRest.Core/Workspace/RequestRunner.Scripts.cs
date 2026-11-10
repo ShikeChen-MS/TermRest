@@ -7,13 +7,15 @@ using TermRest.Core.Scripting;
 
 namespace TermRest.Core.Workspace;
 
-// Scripts: Python, JavaScript or C# code run before a request is sent and after its response arrives, at collection,
-// folder and request level, by the runtime the user chose for each language.
+// Scripts: Python, JavaScript, C# or PowerShell code run before a request is sent and after its response arrives, at
+// collection, folder and request level, by the runtime the user chose for each language. Each level may have a script
+// per language; a request runs those of one language only (ScriptPlan), one at a time, in one runtime.
 public sealed partial class RequestRunner
 {
     private readonly Lock _scriptLock = new();
     private readonly Dictionary<string, string> _runtimes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ScriptWorker> _workers = new(StringComparer.Ordinal);
+    private IReadOnlyList<string> _scriptLanguageOrder = ScriptLanguage.All;
 
     /// <summary>Variables set by scripts in this session (Postman's "current values"). Scripts never change files.</summary>
     public SessionVariables Session { get; } = new();
@@ -37,6 +39,20 @@ public sealed partial class RequestRunner
     /// <summary>The <c>dotnet</c> (.NET SDK 10 or later) that builds and runs C# scripts; null when none is chosen.</summary>
     public string? CSharpRuntime => GetRuntime(ScriptLanguage.CSharp);
 
+    /// <summary>The <c>pwsh</c> (PowerShell 7 or later) that runs PowerShell scripts; null when none is chosen.</summary>
+    public string? PowerShellRuntime => GetRuntime(ScriptLanguage.PowerShell);
+
+    /// <summary>
+    /// The order in which the languages of a request's scripts are tried when its Scripts tab chooses none: the first
+    /// language with all the scripts it runs runs them (Tools › Scripts in the full-screen UI, <c>--script-order</c>).
+    /// Always has every language.
+    /// </summary>
+    public IReadOnlyList<string> ScriptLanguageOrder
+    {
+        get => _scriptLanguageOrder;
+        set => _scriptLanguageOrder = ScriptLanguage.Order(value);
+    }
+
     /// <summary>Longest time the scripts of one phase (pre-request or test) may take; the runtime is then stopped.</summary>
     public TimeSpan ScriptTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
@@ -46,7 +62,7 @@ public sealed partial class RequestRunner
     /// <summary>Whether a runtime is running now: each starts for its first script and stops once idle.</summary>
     public bool ScriptsRunning => RunningRuntimes.Count > 0;
 
-    /// <summary>The runtimes running now (Python, Node.js, Bun, .NET).</summary>
+    /// <summary>The runtimes running now (Python, Node.js, Bun, .NET, PowerShell).</summary>
     public IReadOnlyList<string> RunningRuntimes
     {
         get
@@ -67,17 +83,22 @@ public sealed partial class RequestRunner
     }
 
     /// <summary>
-    /// Chooses the runtimes that run scripts: <paramref name="python"/>, <paramref name="javaScript"/> and
-    /// <paramref name="cSharp"/> (CLI <c>--python</c>, <c>--javascript</c>, <c>--csharp</c>), else the ones chosen for this
-    /// workspace in the user's settings (Tools › Scripts in the full-screen UI).
+    /// Chooses the runtimes that run scripts: <paramref name="python"/>, <paramref name="javaScript"/>,
+    /// <paramref name="cSharp"/> and <paramref name="powerShell"/> (CLI <c>--python</c>, <c>--javascript</c>,
+    /// <c>--csharp</c>, <c>--powershell</c>), else the ones chosen for this workspace in the user's settings (Tools ›
+    /// Scripts in the full-screen UI); and the language order: <paramref name="scriptOrder"/> first (CLI
+    /// <c>--script-order</c>), then the user's.
     /// </summary>
     /// <param name="userSettingsDirectory">Overrides the user's configuration folder (tests, portable setups).</param>
-    public void ConfigureScripts(string? python = null, string? javaScript = null, string? cSharp = null, string? userSettingsDirectory = null)
+    public void ConfigureScripts(string? python = null, string? javaScript = null, string? cSharp = null, string? powerShell = null,
+        string? userSettingsDirectory = null, IEnumerable<string>? scriptOrder = null)
     {
         var settings = UserSettings.Load(userSettingsDirectory);
         Choose(ScriptLanguage.Python, python);
         Choose(ScriptLanguage.JavaScript, javaScript);
         Choose(ScriptLanguage.CSharp, cSharp);
+        Choose(ScriptLanguage.PowerShell, powerShell);
+        ScriptLanguageOrder = [.. (scriptOrder ?? []).Concat(settings.GetScriptLanguageOrder())];
 
         void Choose(string language, string? chosen) =>
             SetRuntime(language, string.IsNullOrWhiteSpace(chosen) ? settings.GetScriptRuntime(language, Workspace.RootPath) : chosen);
@@ -116,7 +137,9 @@ public sealed partial class RequestRunner
 
     public void SetCSharpRuntime(string? dotnet) => SetRuntime(ScriptLanguage.CSharp, dotnet);
 
-    /// <summary>A command name (<c>python3</c>, <c>node</c>, <c>dotnet</c>) is looked up on PATH; a relative path is relative to the workspace folder.</summary>
+    public void SetPowerShellRuntime(string? pwsh) => SetRuntime(ScriptLanguage.PowerShell, pwsh);
+
+    /// <summary>A command name (<c>python3</c>, <c>node</c>, <c>dotnet</c>, <c>pwsh</c>) is looked up on PATH; a relative path is relative to the workspace folder.</summary>
     public string ResolveRuntime(string runtime)
     {
         runtime = runtime.Trim().Trim('"');
@@ -154,14 +177,16 @@ public sealed partial class RequestRunner
     /// The request is then prepared (<paramref name="prepared"/> sees it before it goes out) and sent, and the test
     /// scripts run on the response, in the same order. Only then is it recorded in <see cref="History"/> and
     /// <see cref="Recorder"/>, with what the scripts did in <see cref="HttpExchange.Scripts"/>.
+    /// The scripts that run are those of one language (<see cref="PlanScripts"/>), so one runtime runs them, one after
+    /// the other. When no language has all the scripts the request runs, it is not sent.
     /// Without scripts this is exactly <see cref="Prepare(PostmanCollection, RequestNode?, HttpRequestSpec)"/> and send.
     /// </summary>
     public async Task<HttpExchange> SendAsync(PostmanCollection collection, RequestNode? node, HttpRequestSpec spec,
         Action<PreparedRequest>? prepared, CancellationToken cancellationToken = default)
     {
         // No ConfigureAwait(false) here either: UI callers resume on their own thread.
-        var chain = ScriptsEnabled ? ScriptChain.For(collection, node, spec) : new ScriptChain();
-        if (chain.IsEmpty)
+        var plan = ScriptsEnabled ? PlanScripts(collection, node, spec.Scripts, spec.ScriptSettings) : ScriptPlan.None;
+        if (plan.IsEmpty && plan.Error is null && plan.Notes.Count == 0)
         {
             var request = Prepare(collection, node, spec);
             prepared?.Invoke(request);
@@ -169,26 +194,22 @@ public sealed partial class RequestRunner
         }
 
         var results = new ScriptResults();
+        results.Notes.AddRange(plan.Notes);
         var local = new Dictionary<string, string?>(StringComparer.Ordinal);
         var working = spec;
-        if (chain.PreRequest.Count > 0)
+        if (plan.Error is { } planError)
+        {
+            results.Error = new ScriptError("", planError);
+        }
+        else if (plan.PreRequest.Count > 0)
         {
             working = spec.Clone();
-
-            // Scripts in one language run together; each language sees what the scripts before it did.
-            foreach (var batch in Batches(chain.PreRequest))
+            var request = RequestToSend(working, node?.Name);
+            var reply = await RunScriptsAsync("prerequest", [.. plan.PreRequest], collection, local, request, null, node?.Name, results, cancellationToken)
+                .ConfigureAwait(true);
+            if (reply?["request"] is JsonObject edited)
             {
-                var request = RequestToSend(working, node?.Name);
-                var reply = await RunScriptsAsync("prerequest", batch, collection, local, request, null, node?.Name, results, cancellationToken).ConfigureAwait(true);
-                if (reply?["request"] is JsonObject edited)
-                {
-                    ApplyRequestEdits(edited, request, working, results);
-                }
-
-                if (results.Error is not null || cancellationToken.IsCancellationRequested)
-                {
-                    break;
-                }
+                ApplyRequestEdits(edited, request, working, results);
             }
         }
 
@@ -199,7 +220,7 @@ public sealed partial class RequestRunner
             var notSent = new HttpExchange(request) { Scripts = results };
             if (results.Error is { } error)
             {
-                request.Errors.Add($"A pre-request script failed: {error}");
+                request.Errors.Add(error.Script.Length == 0 ? error.Message : $"A pre-request script failed: {error}");
                 notSent.ErrorMessage = $"Not sent: {error}";
             }
             else
@@ -215,18 +236,10 @@ public sealed partial class RequestRunner
         prepared?.Invoke(ready);
         var exchange = await Executor.SendAsync(ready, cancellationToken).ConfigureAwait(true);
         exchange.Scripts = results;
-        if (chain.Test.Count > 0 && exchange.Response is not null && !exchange.Cancelled)
+        if (plan.PostResponse.Count > 0 && exchange.Response is not null && !exchange.Cancelled)
         {
-            var request = RequestSent(exchange, node?.Name);
-            var response = ResponseReceived(exchange);
-            foreach (var batch in Batches(chain.Test))
-            {
-                await RunScriptsAsync("test", batch, collection, local, request, response, node?.Name, results, cancellationToken).ConfigureAwait(true);
-                if (results.Error is not null || cancellationToken.IsCancellationRequested)
-                {
-                    break;
-                }
-            }
+            await RunScriptsAsync("test", [.. plan.PostResponse], collection, local, RequestSent(exchange, node?.Name), ResponseReceived(exchange), node?.Name,
+                results, cancellationToken).ConfigureAwait(true);
         }
 
         Record(exchange);
@@ -234,28 +247,24 @@ public sealed partial class RequestRunner
         return exchange;
     }
 
-    /// <summary>Consecutive scripts in the same language.</summary>
-    private static IEnumerable<List<ScriptCode>> Batches(List<ScriptCode> scripts)
+    /// <summary>
+    /// Which scripts run around a request with these <paramref name="scripts"/> and <paramref name="settings"/>: those of
+    /// its collection, its folders and its own, in one language (see <see cref="ScriptPlan"/>).
+    /// </summary>
+    public ScriptPlan PlanScripts(PostmanCollection collection, RequestNode? node, ScriptSet scripts, ScriptSettings settings)
     {
-        var batch = new List<ScriptCode>();
-        foreach (var script in scripts)
+        var levels = new List<ScriptLevel> { new($"collection '{collection.Name}'", collection.GetScripts(collection.RootNode)) };
+        if (node is not null && node.Collection == collection)
         {
-            if (batch.Count > 0 && batch[0].Language != script.Language)
-            {
-                yield return batch;
-                batch = [];
-            }
-
-            batch.Add(script);
+            levels.AddRange(node.Ancestors().Where(f => f is not CollectionRootNode).Reverse()
+                .Select(f => new ScriptLevel($"folder '{f.PathInCollection}'", collection.GetScripts(f))));
         }
 
-        if (batch.Count > 0)
-        {
-            yield return batch;
-        }
+        levels.Add(new ScriptLevel(node is null ? "request" : $"request '{node.PathInCollection}'", scripts));
+        return ScriptPlan.For(levels, settings, ScriptLanguageOrder);
     }
 
-    /// <summary>Runs scripts in one language and takes in what they did; null when they did not run.</summary>
+    /// <summary>Runs the scripts of one phase, all in one language, and takes in what they did; null when they did not run.</summary>
     private async Task<JsonObject?> RunScriptsAsync(string phase, List<ScriptCode> scripts, PostmanCollection collection,
         Dictionary<string, string?> local, JsonObject request, JsonObject? response, string? requestName, ScriptResults results,
         CancellationToken cancellationToken)
@@ -273,6 +282,7 @@ public sealed partial class RequestRunner
                     {
                         ScriptLanguage.Python => "Python",
                         ScriptLanguage.CSharp => "the .NET SDK (10 or later)",
+                        ScriptLanguage.PowerShell => "PowerShell (7 or later)",
                         _ => "a JavaScript runtime (Node.js or Bun)",
                     };
                     results.Error ??= new ScriptError("",
@@ -372,7 +382,7 @@ public sealed partial class RequestRunner
     /// <summary>
     /// Keeps the variables scripts set: for this session (environment, collection, globals) or this request. They are
     /// listed with the names the script's language uses (<c>collection_variables</c> in Python, <c>collectionVariables</c>
-    /// in JavaScript, <c>CollectionVariables</c> in C#).
+    /// in JavaScript, <c>CollectionVariables</c> in C# and PowerShell).
     /// </summary>
     private void ApplyVariableChanges(JsonObject? changes, PostmanCollection collection, Dictionary<string, string?> local, ScriptResults results, string language)
     {
@@ -381,16 +391,16 @@ public sealed partial class RequestRunner
             return;
         }
 
-        var csharp = language == ScriptLanguage.CSharp;
-        Apply("environment", csharp ? "Environment" : "environment", () => Environment is { } environment ? Session.For(environment) : null);
+        var pascal = language is ScriptLanguage.CSharp or ScriptLanguage.PowerShell;
+        Apply("environment", pascal ? "Environment" : "environment", () => Environment is { } environment ? Session.For(environment) : null);
         Apply("collection", language switch
         {
             ScriptLanguage.Python => "collection_variables",
-            ScriptLanguage.CSharp => "CollectionVariables",
+            ScriptLanguage.CSharp or ScriptLanguage.PowerShell => "CollectionVariables",
             _ => "collectionVariables",
         }, () => Session.For(collection));
-        Apply("globals", csharp ? "Globals" : "globals", () => Session.Globals);
-        Apply("local", csharp ? "Variables" : "variables", () => local);
+        Apply("globals", pascal ? "Globals" : "globals", () => Session.Globals);
+        Apply("local", pascal ? "Variables" : "variables", () => local);
 
         void Apply(string scope, string name, Func<Dictionary<string, string?>?> target)
         {
@@ -413,7 +423,7 @@ public sealed partial class RequestRunner
         }
     }
 
-    /// <summary>Takes in what pre-request scripts changed in the request (<c>tr.request</c>, <c>pm.request</c>, <c>tr.Request</c>).</summary>
+    /// <summary>Takes in what pre-request scripts changed in the request (<c>tr.request</c>, <c>pm.request</c>, <c>tr.Request</c>, <c>$tr.Request</c>).</summary>
     private static void ApplyRequestEdits(JsonObject edited, JsonObject original, HttpRequestSpec spec, ScriptResults results)
     {
         if (Text(edited["method"]) is { Length: > 0 } method && method != Text(original["method"]))
@@ -562,11 +572,9 @@ public sealed partial class RequestRunner
         var scripts = new List<ScriptCode>();
         void Add(ScriptSet set)
         {
-            if (set.Language == ScriptLanguage.CSharp)
-            {
-                scripts.AddRange(((string[])[set.PreRequest, set.Test]).Where(code => !string.IsNullOrWhiteSpace(code))
-                    .Select(code => new ScriptCode("", code, ScriptLanguage.CSharp)));
-            }
+            var csharp = set.For(ScriptLanguage.CSharp);
+            scripts.AddRange(((string[])[csharp.PreRequest, csharp.Test]).Where(code => !string.IsNullOrWhiteSpace(code))
+                .Select(code => new ScriptCode("", code, ScriptLanguage.CSharp)));
         }
 
         Add(collection.GetScripts(collection.RootNode));
@@ -584,42 +592,5 @@ public sealed partial class RequestRunner
         }
 
         return scripts;
-    }
-
-    /// <summary>The scripts around one request, in the order they run: collection, folders (outermost first), request.</summary>
-    private sealed class ScriptChain
-    {
-        public List<ScriptCode> PreRequest { get; } = [];
-
-        public List<ScriptCode> Test { get; } = [];
-
-        public bool IsEmpty => PreRequest.Count == 0 && Test.Count == 0;
-
-        public static ScriptChain For(PostmanCollection collection, RequestNode? node, HttpRequestSpec spec)
-        {
-            var levels = new List<(string Name, ScriptSet Scripts)> { ($"collection '{collection.Name}'", collection.GetScripts(collection.RootNode)) };
-            if (node is not null && node.Collection == collection)
-            {
-                levels.AddRange(node.Ancestors().Where(f => f is not CollectionRootNode).Reverse()
-                    .Select(f => ($"folder '{f.PathInCollection}'", collection.GetScripts(f))));
-            }
-
-            levels.Add((node is null ? "request" : $"request '{node.PathInCollection}'", spec.Scripts));
-            var chain = new ScriptChain();
-            foreach (var (name, scripts) in levels.Where(l => !l.Scripts.IsEmpty))
-            {
-                if (!string.IsNullOrWhiteSpace(scripts.PreRequest))
-                {
-                    chain.PreRequest.Add(new ScriptCode(name, scripts.PreRequest, scripts.Language));
-                }
-
-                if (!string.IsNullOrWhiteSpace(scripts.Test))
-                {
-                    chain.Test.Add(new ScriptCode(name, scripts.Test, scripts.Language));
-                }
-            }
-
-            return chain;
-        }
     }
 }

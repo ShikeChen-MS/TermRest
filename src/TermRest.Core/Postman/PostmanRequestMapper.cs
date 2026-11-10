@@ -32,15 +32,17 @@ internal enum KeyValueStyle
 public static class PostmanRequestMapper
 {
     internal static readonly string[] RootOrder = ["info", "item", "auth", "event", "variable", "protocolProfileBehavior"];
-    internal static readonly string[] ItemOrder = ["id", "name", "description", "item", "event", "auth", "protocolProfileBehavior", "request", "response", "variable"];
+    internal static readonly string[] ItemOrder = ["id", "name", "description", "item", "event", "termrest", "auth", "protocolProfileBehavior", "request", "response", "variable"];
     internal static readonly string[] RequestOrder = ["auth", "method", "header", "body", "url", "description", "certificate", "proxy"];
     internal static readonly string[] UrlOrder = ["raw", "protocol", "auth", "host", "port", "path", "query", "hash", "variable"];
     internal static readonly string[] BodyOrder = ["mode", "raw", "urlencoded", "formdata", "file", "graphql", "options", "disabled"];
     internal static readonly string[] KeyValueOrder = ["key", "value", "description", "type", "src", "contentType", "disabled", "enabled"];
     internal static readonly string[] AuthParamOrder = ["key", "value", "type"];
     internal static readonly string[] CertificateOrder = ["name", "matches", "key", "cert", "pfx", "passphrase"];
-    internal static readonly string[] EventOrder = ["listen", "script"];
+    internal static readonly string[] EventOrder = ["id", "listen", "script", "disabled"];
     internal static readonly string[] ScriptOrder = ["id", "exec", "type", "packages"];
+    private static readonly string[] TermRestOrder = ["scripts"];
+    private static readonly string[] ScriptSettingsOrder = ["language", "preRequest", "postResponse"];
 
     private static readonly string[] BodyModeKeys = ["raw", "urlencoded", "formdata", "file", "graphql"];
 
@@ -69,10 +71,8 @@ public static class PostmanRequestMapper
         }
 
         spec.Settings = ReadSettings(item["protocolProfileBehavior"]);
-        var scripts = ReadScripts(item["event"]);
-        spec.PreRequestScript = scripts.PreRequest;
-        spec.TestScript = scripts.Test;
-        spec.ScriptLanguage = scripts.Language;
+        spec.Scripts = ReadScripts(item["event"]);
+        spec.ScriptSettings = ReadScriptSettings(item["termrest"]);
         return spec;
     }
 
@@ -292,38 +292,49 @@ public static class PostmanRequestMapper
     }
 
     /// <summary>
-    /// Reads the pre-request and test scripts from the <c>event</c> array of a collection, folder or request. The
-    /// language is the type of the first script with code; without code it is Python, the language TermRest runs.
+    /// Reads the scripts from the <c>event</c> array of a collection, folder or request: a pre-request and a post-response
+    /// script per language, the language being the script's <c>type</c> (Postman's are JavaScript). A disabled JavaScript
+    /// script is not read, as Postman does not run it. Scripts in TermRest's other languages are read though they are
+    /// marked disabled: TermRest marks them so for Postman, which would run them as JavaScript.
     /// </summary>
     public static ScriptSet ReadScripts(JsonNode? node)
     {
-        string preRequest = "", test = "";
-        string? language = null;
+        var scripts = new Dictionary<string, (string PreRequest, string Test)>(StringComparer.Ordinal);
         foreach (var e in (node as JsonArray)?.OfType<JsonObject>() ?? [])
         {
+            if (PhaseOf(e) is not { } phase)
+            {
+                continue;
+            }
+
             var script = e["script"] as JsonObject;
+            var language = ScriptLanguage.FromType(script?["type"].GetString());
+            if (language == ScriptLanguage.JavaScript && e["disabled"].GetBool() == true)
+            {
+                continue;
+            }
+
             var exec = script?["exec"];
             var text = exec is JsonArray lines ? string.Join('\n', lines.Select(l => l.GetString() ?? "")) : exec.GetString() ?? "";
-            switch (e["listen"].GetString())
-            {
-                case "prerequest":
-                    preRequest = text;
-                    break;
-                case "test":
-                    test = text;
-                    break;
-                default:
-                    continue;
-            }
-
-            if (language is null && !string.IsNullOrWhiteSpace(text))
-            {
-                language = ScriptLanguage.FromType(script?["type"].GetString());
-            }
+            var current = scripts.GetValueOrDefault(language, (PreRequest: "", Test: ""));
+            scripts[language] = phase == ScriptPhase.PreRequest ? (text, current.Test) : (current.PreRequest, text);
         }
 
-        return new ScriptSet(preRequest, test, language ?? ScriptLanguage.Python);
+        return new ScriptSet(scripts.Select(p => new LanguageScripts(p.Key, p.Value.PreRequest, p.Value.Test)));
     }
+
+    /// <summary>How a request runs its scripts: TermRest's <c>"termrest": {"scripts": {…}}</c>; the defaults when absent.</summary>
+    public static ScriptSettings ReadScriptSettings(JsonNode? node) =>
+        (node as JsonObject)?["scripts"] is JsonObject scripts
+            ? new ScriptSettings(ScriptLanguage.Parse(scripts["language"].GetString()), scripts["preRequest"].GetBool(), scripts["postResponse"].GetBool())
+            : ScriptSettings.Auto;
+
+    private static ScriptPhase? PhaseOf(JsonObject e) => e["listen"].GetString() switch
+    {
+        "prerequest" => ScriptPhase.PreRequest,
+        "test" => ScriptPhase.PostResponse,
+        _ => null,
+    };
 
     // ----- writing ---------------------------------------------------------------------------
 
@@ -424,23 +435,79 @@ public static class PostmanRequestMapper
         }
 
         ApplyScripts(item, spec.Scripts, baseline.Scripts, ItemOrder);
+        ApplyScriptSettings(item, spec.ScriptSettings, baseline.ScriptSettings);
     }
 
     /// <summary>
     /// Writes the scripts that differ from <paramref name="baseline"/> into the <c>event</c> array of a collection
-    /// (<paramref name="order"/> = <see cref="RootOrder"/>), folder or request (<see cref="ItemOrder"/>).
+    /// (<paramref name="order"/> = <see cref="RootOrder"/>), folder or request (<see cref="ItemOrder"/>): one event per
+    /// phase and language.
     /// </summary>
     public static void ApplyScripts(JsonObject owner, ScriptSet scripts, ScriptSet baseline, string[] order)
     {
-        var languageChanged = scripts.Language != baseline.Language;
-        if (languageChanged || scripts.PreRequest != baseline.PreRequest)
+        foreach (var language in scripts.Languages.Concat(baseline.Languages).Select(s => s.Language).Distinct(StringComparer.Ordinal).ToList())
         {
-            WriteScript(owner, "prerequest", scripts.PreRequest, scripts.Language, order);
+            var now = scripts.For(language);
+            var before = baseline.For(language);
+            foreach (var phase in ScriptPhases.All)
+            {
+                if (now.Code(phase) != before.Code(phase))
+                {
+                    WriteScript(owner, phase, now.Code(phase), language, order);
+                }
+            }
+        }
+    }
+
+    /// <summary>Writes how a request runs its scripts into <c>"termrest": {"scripts": {…}}</c>, removed when it is the default.</summary>
+    public static void ApplyScriptSettings(JsonObject item, ScriptSettings settings, ScriptSettings baseline)
+    {
+        if (settings == baseline)
+        {
+            return;
         }
 
-        if (languageChanged || scripts.Test != baseline.Test)
+        var termrest = item["termrest"] as JsonObject;
+        if (settings.IsAuto)
         {
-            WriteScript(owner, "test", scripts.Test, scripts.Language, order);
+            if (termrest is not null)
+            {
+                termrest.Remove("scripts");
+                if (termrest.Count == 0)
+                {
+                    item.Remove("termrest");
+                }
+            }
+
+            return;
+        }
+
+        if (termrest is null)
+        {
+            termrest = new JsonObject();
+            item.SetOrdered("termrest", termrest, ItemOrder);
+        }
+
+        if (termrest["scripts"] is not JsonObject scripts)
+        {
+            scripts = new JsonObject();
+            termrest.SetOrdered("scripts", scripts, TermRestOrder);
+        }
+
+        Set("language", settings.Language is null ? null : JsonValue.Create(settings.Language));
+        Set("preRequest", settings.PreRequest is { } preRequest ? JsonValue.Create(preRequest) : null);
+        Set("postResponse", settings.PostResponse is { } postResponse ? JsonValue.Create(postResponse) : null);
+
+        void Set(string key, JsonNode? value)
+        {
+            if (value is null)
+            {
+                scripts.Remove(key);
+            }
+            else
+            {
+                scripts.SetOrdered(key, value, ScriptSettingsOrder);
+            }
         }
     }
 
@@ -843,13 +910,34 @@ public static class PostmanRequestMapper
         }
     }
 
-    /// <summary>Writes one script's code; its <c>type</c> follows <paramref name="language"/> (Postman's scripts are JavaScript).</summary>
-    private static void WriteScript(JsonObject owner, string listen, string text, string language, string[] order)
+    /// <summary>
+    /// Writes the script of <paramref name="phase"/> in <paramref name="language"/>. Postman's JavaScript scripts are
+    /// written as Postman writes them. Scripts in TermRest's other languages are marked <c>"disabled": true</c>:
+    /// Postman and Newman run every script that is not disabled as JavaScript. Clearing one of them removes it.
+    /// </summary>
+    private static void WriteScript(JsonObject owner, ScriptPhase phase, string text, string language, string[] order)
     {
+        var listen = phase == ScriptPhase.PreRequest ? "prerequest" : "test";
+        var javaScript = language == ScriptLanguage.JavaScript;
         var events = owner["event"] as JsonArray;
-        var existing = events?.OfType<JsonObject>().LastOrDefault(e => e["listen"].GetString() == listen);
-        if (existing is null && text.Length == 0)
+        var existing = events?.OfType<JsonObject>().LastOrDefault(e =>
+            e["listen"].GetString() == listen
+            && ScriptLanguage.FromType((e["script"] as JsonObject)?["type"].GetString()) == language
+            && !(javaScript && e["disabled"].GetBool() == true));
+        var empty = javaScript ? text.Length == 0 : text.Trim().Length == 0;
+        if (existing is null && empty)
         {
+            return;
+        }
+
+        if (!javaScript && empty)
+        {
+            events!.Remove(existing);
+            if (events.Count == 0)
+            {
+                owner.Remove("event");
+            }
+
             return;
         }
 
@@ -862,7 +950,7 @@ public static class PostmanRequestMapper
         if (existing is null)
         {
             var created = new JsonObject { ["exec"] = new JsonArray(), ["type"] = ScriptLanguage.ToType(language) };
-            if (language == ScriptLanguage.JavaScript)
+            if (javaScript)
             {
                 created["packages"] = new JsonObject();
             }
@@ -882,6 +970,11 @@ public static class PostmanRequestMapper
         if (ScriptLanguage.FromType(script["type"].GetString()) != language)
         {
             script.SetOrdered("type", ScriptLanguage.ToType(language), ScriptOrder);
+        }
+
+        if (!javaScript && existing["disabled"].GetBool() != true)
+        {
+            existing.SetOrdered("disabled", true, EventOrder);
         }
     }
 }

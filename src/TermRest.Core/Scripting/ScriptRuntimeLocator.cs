@@ -3,7 +3,7 @@ using System.Diagnostics;
 
 namespace TermRest.Core.Scripting;
 
-/// <summary>Finds and checks the runtimes that run scripts: Python, Node.js or Bun for JavaScript, and the .NET SDK for C#.</summary>
+/// <summary>Finds and checks the runtimes that run scripts: Python, Node.js or Bun for JavaScript, the .NET SDK for C#, and PowerShell.</summary>
 public static class ScriptRuntimeLocator
 {
     /// <summary>The oldest Python that runs TermRest's scripts.</summary>
@@ -17,15 +17,31 @@ public static class ScriptRuntimeLocator
     /// <summary>The oldest .NET SDK that builds C# scripts: .NET 10 builds C# files without a project (dotnet run --file).</summary>
     public static readonly Version MinimumDotnetSdk = new(10, 0);
 
+    /// <summary>The oldest PowerShell that runs TermRest's scripts: PowerShell 7 (pwsh), not Windows PowerShell 5.1.</summary>
+    public static readonly Version MinimumPowerShell = new(7, 0);
+
     private static readonly TimeSpan CheckTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>
     /// Runtimes worth trying for a workspace: for Python, its virtual environment, then <c>python3</c> and <c>python</c>
     /// on PATH; for JavaScript, <c>node</c> and <c>bun</c> on PATH; for C#, <c>dotnet</c> on PATH, then the .NET installed
-    /// for the user (<c>~/.dotnet</c>).
+    /// for the user (<c>~/.dotnet</c>); for PowerShell, <c>pwsh</c> on PATH, then where its installer puts it on Windows.
     /// </summary>
     public static IEnumerable<string> Candidates(string language, string workspaceRoot)
     {
+        if (language == ScriptLanguage.PowerShell)
+        {
+            yield return "pwsh";
+            var programs = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            var installed = Path.Combine(programs, "PowerShell", "7", "pwsh.exe");
+            if (OperatingSystem.IsWindows() && programs.Length > 0 && File.Exists(installed))
+            {
+                yield return installed;
+            }
+
+            yield break;
+        }
+
         if (language == ScriptLanguage.CSharp)
         {
             yield return "dotnet";
@@ -82,6 +98,7 @@ public static class ScriptRuntimeLocator
     {
         var python = language == ScriptLanguage.Python;
         var csharp = language == ScriptLanguage.CSharp;
+        var powerShell = language == ScriptLanguage.PowerShell;
         var info = new ProcessStartInfo(runtime)
         {
             WorkingDirectory = workingDirectory,
@@ -96,6 +113,13 @@ public static class ScriptRuntimeLocator
             info.ArgumentList.Add("--list-sdks");
             info.Environment["DOTNET_NOLOGO"] = "1";
         }
+        else if (powerShell)
+        {
+            foreach (var argument in (string[])["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "'PowerShell ' + $PSVersionTable.PSVersion; (Get-Process -Id $PID).Path"])
+            {
+                info.ArgumentList.Add(argument);
+            }
+        }
         else
         {
             info.ArgumentList.Add(python ? "-c" : "-e");
@@ -104,7 +128,7 @@ public static class ScriptRuntimeLocator
                 : "console.log(typeof Bun !== 'undefined' ? 'Bun ' + Bun.version : 'Node.js ' + process.versions.node); console.log(process.execPath)");
         }
 
-        var expected = python ? "Python" : "Node.js or Bun";
+        var expected = python ? "Python" : powerShell ? "PowerShell" : "Node.js or Bun";
         Process? process = null;
         try
         {
@@ -127,17 +151,18 @@ public static class ScriptRuntimeLocator
             }
 
             var name = lines.Length >= 2 ? lines[0][..Math.Max(0, lines[0].LastIndexOf(' '))] : "";
-            if (process.ExitCode != 0 || lines.Length < 2 || !Version.TryParse(lines[0][(lines[0].LastIndexOf(' ') + 1)..], out var version)
-                || (python ? name != "Python" : name is not ("Node.js" or "Bun")))
+            var text = lines.Length >= 2 ? lines[0][(lines[0].LastIndexOf(' ') + 1)..] : "";
+            var expectedName = python ? name == "Python" : powerShell ? name == "PowerShell" : name is "Node.js" or "Bun";
+            if (process.ExitCode != 0 || lines.Length < 2 || !Version.TryParse(text.Split('-')[0], out var version) || !expectedName)
             {
                 var reason = (await error.ConfigureAwait(false)).Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).LastOrDefault();
                 return (false, $"{runtime} did not run as {expected} ({reason ?? $"exit code {process.ExitCode}"}).");
             }
 
-            var minimum = name switch { "Python" => MinimumPython, "Bun" => MinimumBun, _ => MinimumNode };
+            var minimum = name switch { "Python" => MinimumPython, "Bun" => MinimumBun, "PowerShell" => MinimumPowerShell, _ => MinimumNode };
             return version < minimum
-                ? (false, $"{name} {version} is too old: scripts need {name} {minimum.ToString(2)} or later ({lines[1]}).")
-                : (true, $"{name} {version} · {lines[1]}");
+                ? (false, $"{name} {text} is too old: scripts need {name} {minimum.ToString(2)} or later ({lines[1]}).")
+                : (true, $"{name} {text} · {lines[1]}");
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or PlatformNotSupportedException)
         {

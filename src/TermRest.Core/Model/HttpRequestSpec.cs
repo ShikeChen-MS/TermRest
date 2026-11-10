@@ -32,17 +32,11 @@ public sealed class HttpRequestSpec
 
     public string? Description { get; set; }
 
-    public string PreRequestScript { get; set; } = "";
+    /// <summary>The request's scripts, in each language (see <see cref="Scripting.ScriptSet"/>).</summary>
+    public Scripting.ScriptSet Scripts { get; set; } = Scripting.ScriptSet.Empty;
 
-    public string TestScript { get; set; } = "";
-
-    /// <summary>
-    /// The language of both scripts: <see cref="Scripting.ScriptLanguage.Python"/>, which TermRest runs, or
-    /// JavaScript (Postman's own scripts, kept but not run).
-    /// </summary>
-    public string ScriptLanguage { get; set; } = Scripting.ScriptLanguage.Python;
-
-    public Scripting.ScriptSet Scripts => new(PreRequestScript, TestScript, ScriptLanguage);
+    /// <summary>How the request runs its scripts: their language, and whether pre-request and post-response scripts run.</summary>
+    public Scripting.ScriptSettings ScriptSettings { get; set; } = Scripting.ScriptSettings.Auto;
 
     /// <summary>True when the source used the short form <c>"url": "..."</c>.</summary>
     internal bool UrlWasString { get; set; }
@@ -59,9 +53,8 @@ public sealed class HttpRequestSpec
         Certificate = Certificate?.Clone(),
         Settings = Settings.Clone(),
         Description = Description,
-        PreRequestScript = PreRequestScript,
-        TestScript = TestScript,
-        ScriptLanguage = ScriptLanguage,
+        Scripts = Scripts,
+        ScriptSettings = ScriptSettings,
         UrlWasString = UrlWasString,
     };
 
@@ -69,7 +62,7 @@ public sealed class HttpRequestSpec
         Method == other.Method && UrlEquals(other) && KeyValueEntry.ListEquals(Headers, other.Headers)
         && Body.ContentEquals(other.Body) && AuthSpec.AreEqual(Auth, other.Auth)
         && CertificateSpec.AreEqual(Certificate, other.Certificate) && Settings.ContentEquals(other.Settings)
-        && Description == other.Description && Scripts.SameAs(other.Scripts);
+        && Description == other.Description && Scripts.Equals(other.Scripts) && ScriptSettings == other.ScriptSettings;
 
     internal bool UrlEquals(HttpRequestSpec other) =>
         Url == other.Url && KeyValueEntry.ListEquals(QueryParams, other.QueryParams)

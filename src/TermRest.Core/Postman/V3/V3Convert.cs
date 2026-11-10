@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using TermRest.Core.Json;
+using TermRest.Core.Scripting;
 
 namespace TermRest.Core.Postman.V3;
 
@@ -15,7 +16,7 @@ internal static class V3Convert
     public const string CollectionKind = "collection";
 
     internal static readonly string[] RequestOrder =
-        ["$kind", "id", "name", "description", "url", "method", "headers", "queryParams", "pathVariables", "body", "auth", "scripts", "settings", "examples", "order"];
+        ["$kind", "id", "name", "description", "url", "method", "headers", "queryParams", "pathVariables", "body", "auth", "scripts", "termrest", "settings", "examples", "order"];
 
     internal static readonly string[] DefinitionOrder = ["$kind", "id", "name", "description", "auth", "variables", "scripts", "order"];
 
@@ -45,6 +46,11 @@ internal static class V3Convert
         if (events.Count > 0)
         {
             item["event"] = events;
+        }
+
+        if (v3["termrest"] is JsonObject termrest)
+        {
+            item["termrest"] = termrest.DeepClone();
         }
 
         if (SettingsToV21(v3["settings"]) is { } settings)
@@ -209,7 +215,11 @@ internal static class V3Convert
         },
     };
 
-    /// <summary>v3 scripts → v2.1 events. Script types other than HTTP ones keep their v3 name as the event name.</summary>
+    /// <summary>
+    /// v3 scripts → v2.1 events. Script types other than HTTP ones keep their v3 name as the event name. Scripts in
+    /// TermRest's other languages than JavaScript become disabled events, as TermRest writes them in v2.1 files: Postman
+    /// would run them as JavaScript.
+    /// </summary>
     public static JsonArray ScriptsToEvents(JsonNode? node)
     {
         var events = new JsonArray();
@@ -223,10 +233,11 @@ internal static class V3Convert
                 _ => type,
             };
             var code = script["code"].GetString() ?? "";
+            var language = script["language"].GetString() ?? "text/javascript";
             var body = new JsonObject
             {
                 ["exec"] = PostmanJson.ToJsonArray(code.Split('\n').Select(l => (JsonNode?)JsonValue.Create(l))),
-                ["type"] = script["language"].GetString() ?? "text/javascript",
+                ["type"] = language,
             };
             foreach (var extra in (string[])["packages", "requests"])
             {
@@ -236,7 +247,13 @@ internal static class V3Convert
                 }
             }
 
-            events.Add((JsonNode)new JsonObject { ["listen"] = listen, ["script"] = body, ["x-v3-type"] = type });
+            var e = new JsonObject { ["listen"] = listen, ["script"] = body, ["x-v3-type"] = type };
+            if (ScriptLanguage.FromType(language) != ScriptLanguage.JavaScript && listen is "prerequest" or "test")
+            {
+                e["disabled"] = true;
+            }
+
+            events.Add((JsonNode)e);
         }
 
         return events;
@@ -304,6 +321,7 @@ internal static class V3Convert
         Set(v3, "body", BodyToV3(request["body"] as JsonObject, template?["body"]), RequestOrder);
         Set(v3, "auth", AuthToV3(request["auth"] as JsonObject, template?["auth"]), RequestOrder);
         Set(v3, "scripts", EventsToScripts(item["event"] as JsonArray, template?["scripts"], http: false), RequestOrder);
+        Set(v3, "termrest", item["termrest"] is JsonObject { Count: > 0 } termrest ? termrest.DeepClone() : null, RequestOrder);
         Set(v3, "settings", SettingsToV3(item["protocolProfileBehavior"] as JsonObject, template?["settings"]), RequestOrder);
         return v3;
     }
@@ -520,7 +538,10 @@ internal static class V3Convert
         return result;
     }
 
-    /// <summary>v2.1 events → v3 scripts (<c>beforeRequest</c>/<c>afterResponse</c>, or <c>http:…</c> on folders).</summary>
+    /// <summary>
+    /// v2.1 events → v3 scripts (<c>beforeRequest</c>/<c>afterResponse</c>, or <c>http:…</c> on folders): one per type and
+    /// language, each written over the script of that type and language the file had.
+    /// </summary>
     public static JsonArray? EventsToScripts(JsonArray? events, JsonNode? template, bool http)
     {
         var templates = (template as JsonArray)?.OfType<JsonObject>().ToList() ?? [];
@@ -537,8 +558,13 @@ internal static class V3Convert
             var script = e["script"] as JsonObject;
             var exec = script?["exec"];
             var code = exec is JsonArray lines ? string.Join('\n', lines.Select(l => l.GetString() ?? "")) : exec.GetString() ?? "";
-            var previous = templates.FirstOrDefault(t => t["type"].GetString() == type);
-            if (code.Length == 0 && previous is null)
+            var language = ScriptLanguage.FromType(script?["type"].GetString());
+            var previous = templates.FirstOrDefault(t => t["type"].GetString() == type && ScriptLanguage.FromType(t["language"].GetString()) == language);
+            if (previous is not null)
+            {
+                templates.Remove(previous);
+            }
+            else if (code.Length == 0)
             {
                 continue; // Postman exports keep empty script events; v3 files do not need them
             }
@@ -548,8 +574,8 @@ internal static class V3Convert
             result.SetOrdered("code", code, ScriptOrder);
 
             // A script's language comes with its code; an empty one keeps the language the file has (Postman's: JavaScript).
-            var language = code.Trim().Length == 0 && previous?["language"] is { } kept ? kept : script?["type"] ?? previous?["language"];
-            result.SetOrdered("language", language?.DeepClone() ?? "text/javascript", ScriptOrder);
+            var languageType = code.Trim().Length == 0 && previous?["language"] is { } kept ? kept : script?["type"] ?? previous?["language"];
+            result.SetOrdered("language", languageType?.DeepClone() ?? "text/javascript", ScriptOrder);
             foreach (var extra in (string[])["packages", "requests"])
             {
                 if (script?[extra] is JsonObject { Count: > 0 } value)

@@ -239,7 +239,7 @@ public sealed class PostmanCollection
     public bool SetScripts(FolderNode folder, ScriptSet scripts)
     {
         var current = GetScripts(folder);
-        if (scripts.SameAs(current))
+        if (scripts.Equals(current))
         {
             return false;
         }

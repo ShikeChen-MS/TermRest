@@ -1,6 +1,7 @@
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Postman.V3;
+using TermRest.Core.Scripting;
 using TermRest.Core.Yaml;
 using Xunit;
 
@@ -71,8 +72,9 @@ public class PostmanV3CorpusTests
                 touched.Body = new RequestBody { Mode = BodyMode.Raw, Raw = "touch" };
                 touched.Auth = new AuthSpec { Type = "noauth" };
                 touched.Settings = new RequestSettings { StrictSsl = !(spec.Settings.StrictSsl ?? true) };
-                touched.PreRequestScript += "//";
-                touched.TestScript += "//";
+                touched.Scripts = new ScriptSet(spec.Scripts.Languages.Select(s => s with { PreRequest = s.PreRequest + "//", Test = s.Test + "//" })
+                    .DefaultIfEmpty(new LanguageScripts(ScriptLanguage.JavaScript, "//", "//")));
+                touched.ScriptSettings = new ScriptSettings(ScriptLanguage.PowerShell, false, true);
                 touched.Description = (spec.Description ?? "") + "x";
                 collection.UpdateRequest(node, touched);
                 collection.UpdateRequest(node, spec);

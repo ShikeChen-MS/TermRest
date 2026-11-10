@@ -16,7 +16,7 @@ public class JavaScriptScriptingTests
     private readonly CancellationToken _ct = TestContext.Current.CancellationToken;
 
     private static HttpRequestSpec JavaScript(string url, string preRequest = "", string test = "") =>
-        new() { Url = url, PreRequestScript = preRequest, TestScript = test, ScriptLanguage = ScriptLanguage.JavaScript };
+        new() { Url = url, Scripts = new ScriptSet(preRequest, test, ScriptLanguage.JavaScript) };
 
     private static (ApiWorkspace Workspace, PostmanCollection Collection) NewWorkspace()
     {
@@ -43,15 +43,14 @@ public class JavaScriptScriptingTests
         {
             Url = "{{base}}?q=1",
             Headers = [new() { Key = "Authorization", Value = "Bearer {{token}}" }],
-            ScriptLanguage = ScriptLanguage.JavaScript,
-            PreRequestScript = """
+            Scripts = new ScriptSet(language: ScriptLanguage.JavaScript, preRequest: """
                 pm.request.method = 'put';
                 pm.request.url.query.add({ key: 'added', value: '1' });
                 pm.request.body.update(JSON.stringify({ name: pm.variables.replaceIn('{{who}}') }));
                 pm.request.headers.upsert({ key: 'Content-Type', value: 'application/json' });
                 pm.variables.set('started', Date.now());
                 """,
-            TestScript = """
+            test: """
                 const sent = pm.response.json();
                 pm.test('the pre-request scripts changed the request', () => {
                     pm.expect(sent.method).to.equal('PUT');
@@ -67,7 +66,7 @@ public class JavaScriptScriptingTests
                 postman.setEnvironmentVariable('legacy', 'yes');
                 pm.collectionVariables.set('last_status', pm.response.code);
                 console.log('token is', pm.environment.get('token'), 'in', pm.environment.name, { n: 1 });
-                """,
+                """),
         });
         collection.Save();
         using var runner = new RequestRunner(workspace);
@@ -261,37 +260,73 @@ public class JavaScriptScriptingTests
     }
 
     [Fact]
-    public async Task Python_and_javascript_scripts_run_in_order_and_share_variables()
+    public async Task A_request_runs_its_scripts_in_the_first_language_of_the_order_that_has_them_all()
     {
         var python = TestPython.Require();
         var node = TestJavaScript.Require();
         await using var server = await EchoServer.StartAsync();
         var (workspace, collection) = NewWorkspace();
-        var environment = workspace.CreateEnvironment("dev");
-        workspace.ActiveEnvironment = environment;
-        collection.SetScripts(collection.RootNode, new ScriptSet(
-            "pm.environment.set('step', 'js');\npm.request.headers.add({ key: 'X-From-Js', value: '1' });",
-            "pm.test('javascript test', () => pm.expect(pm.response.json().headers['x-from-python']).to.equal('js+py'));",
-            ScriptLanguage.JavaScript));
-        var request = collection.AddRequest(collection.RootNode, "Mixed", new HttpRequestSpec
+        collection.SetScripts(collection.RootNode, new ScriptSet([
+            new LanguageScripts(ScriptLanguage.JavaScript, "pm.variables.set('ran', 'js');", "pm.test('collection js', () => {});"),
+            new LanguageScripts(ScriptLanguage.Python, "tr.variables.set('ran', 'python')", "tr.test('collection python', lambda: None)"),
+        ]));
+        var folder = collection.AddFolder(collection.RootNode, "Users");
+        var both = collection.AddRequest(folder, "Both", new HttpRequestSpec
         {
             Url = server.Url("echo"),
-            ScriptLanguage = ScriptLanguage.Python,
-            PreRequestScript = "tr.request.headers.set('X-From-Python', tr.environment.get('step') + '+py')",
-            TestScript = "@tr.test('python test')\ndef _():\n    assert tr.response.json()['headers']['x-from-js'] == '1'",
+            Scripts = new ScriptSet([
+                new LanguageScripts(ScriptLanguage.JavaScript, "", "pm.test('request js', () => pm.expect(pm.variables.get('ran')).to.equal('js'));"),
+                new LanguageScripts(ScriptLanguage.Python, "", "tr.test('request python', lambda: None)"),
+            ]),
+        });
+        var javaScriptOnly = collection.AddRequest(folder, "JavaScript only", new HttpRequestSpec
+        {
+            Url = server.Url("echo"),
+            Scripts = new ScriptSet("", "pm.test('request js', () => pm.expect(pm.variables.get('ran')).to.equal('js'));", ScriptLanguage.JavaScript),
         });
         using var runner = new RequestRunner(workspace);
         runner.SetPythonInterpreter(python);
         runner.SetJavaScriptRuntime(node);
 
-        var exchange = await runner.SendAsync(collection, request, request.ReadSpec(), null, _ct);
+        // Python comes first: its scripts run, and only they, in one runtime.
+        var inPython = await runner.SendAsync(collection, both, both.ReadSpec(), null, _ct);
+        Assert.True(inPython.Scripts!.Succeeded, inPython.Scripts.Describe());
+        Assert.Equal(["collection python", "request python"], inPython.Scripts.Tests.Select(t => t.Name));
+        Assert.Equal(["Python"], runner.RunningRuntimes);
+        Assert.Equal(["Language: Python, the first of your language order with all the scripts of this request."], inPython.Scripts.Notes);
 
-        var results = exchange.Scripts!;
-        Assert.True(results.Succeeded, results.Describe());
-        Assert.Equal(4, results.Ran);
-        Assert.Equal(["javascript test", "python test"], results.Tests.Select(t => t.Name));
-        Assert.Equal(2, runner.RunningRuntimes.Count);
-        Assert.Contains("Python", runner.RunningRuntimes);
+        // A request whose test is only in JavaScript runs all its scripts in JavaScript, the collection's included.
+        var inJavaScript = await runner.SendAsync(collection, javaScriptOnly, javaScriptOnly.ReadSpec(), null, _ct);
+        Assert.True(inJavaScript.Scripts!.Succeeded, inJavaScript.Scripts.Describe());
+        Assert.Equal(["collection js", "request js"], inJavaScript.Scripts.Tests.Select(t => t.Name));
+        Assert.Equal(
+            "Language: JavaScript, the first of your language order with all the scripts of this request (Python lacks the post-response script of " +
+            "request 'Users/JavaScript only').",
+            inJavaScript.Scripts.Notes[0]);
+
+        // Another order; a language chosen by the request; scripts turned off.
+        runner.ScriptLanguageOrder = [ScriptLanguage.JavaScript];
+        var reordered = await runner.SendAsync(collection, both, both.ReadSpec(), null, _ct);
+        Assert.Equal(["collection js", "request js"], reordered.Scripts!.Tests.Select(t => t.Name));
+        var chosen = both.ReadSpec();
+        chosen.ScriptSettings = new ScriptSettings(ScriptLanguage.Python);
+        Assert.Equal(["collection python", "request python"], (await runner.SendAsync(collection, both, chosen, null, _ct)).Scripts!.Tests.Select(t => t.Name));
+        var wrong = javaScriptOnly.ReadSpec();
+        wrong.ScriptSettings = new ScriptSettings(ScriptLanguage.Python);
+        var refused = await runner.SendAsync(collection, javaScriptOnly, wrong, null, _ct);
+        Assert.Null(refused.Response);
+        Assert.Equal(0, refused.Scripts!.Ran);
+        Assert.Equal(
+            "Not sent: This request runs its scripts in Python (its Scripts tab), but there is no Python version of the post-response script of request " +
+            "'Users/JavaScript only'. Write it in Python, choose another language, or turn post-response scripts off in its Scripts tab.",
+            refused.ErrorMessage);
+        wrong.ScriptSettings = wrong.ScriptSettings with { PostResponse = false };
+        var preRequestOnly = await runner.SendAsync(collection, javaScriptOnly, wrong, null, _ct);
+        Assert.Equal(200, preRequestOnly.Response!.StatusCode);
+        Assert.Empty(preRequestOnly.Scripts!.Tests);
+        Assert.Equal(1, preRequestOnly.Scripts.Ran);
+        Assert.Contains("Post-response scripts are turned off for this request (its Scripts tab): those of collection 'API', request 'Users/JavaScript only' did not run.",
+            preRequestOnly.Scripts.Notes);
     }
 
     [Fact]

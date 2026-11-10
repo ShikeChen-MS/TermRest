@@ -3,6 +3,7 @@ using TermRest.Core.Http;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Postman.V3;
+using TermRest.Core.Scripting;
 using TermRest.Core.Tests.Infrastructure;
 using TermRest.Core.Variables;
 using TermRest.Core.Workspace;
@@ -45,7 +46,7 @@ public class PostmanV3Tests
         Assert.Equal(["limit=50 on", "cursor={{cursor}} off"], list.QueryParams.Select(q => $"{q.Key}={q.Value} {(q.Enabled ? "on" : "off")}"));
         Assert.Equal("From the previous page", list.QueryParams[1].Description);
         Assert.Equal(["Accept: application/json"], list.Headers.Select(h => $"{h.Key}: {h.Value}"));
-        Assert.Equal("pm.test('ok', () => pm.response.to.have.status(200));", list.TestScript);
+        Assert.Equal("pm.test('ok', () => pm.response.to.have.status(200));", list.Scripts.For(ScriptLanguage.JavaScript).Test);
         Assert.Null(list.Auth);
 
         var create = collection.FindRequest("Create widget")!.ReadSpec();
@@ -504,8 +505,7 @@ public class PostmanV3Tests
                 }
 
                 Assert.Equal(expected.AuthDescription, actual.AuthDescription);
-                Assert.Equal(request.ReadSpec().PreRequestScript, node.ReadSpec().PreRequestScript);
-                Assert.Equal(request.ReadSpec().TestScript, node.ReadSpec().TestScript);
+                Assert.Equal(request.ReadSpec().Scripts, node.ReadSpec().Scripts);
             }
         }
 

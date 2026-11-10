@@ -8,11 +8,11 @@ using System.Text.Json.Nodes;
 namespace TermRest.Core.Scripting;
 
 /// <summary>
-/// A process of the user's own runtime (Python, Node.js or Bun for JavaScript, .NET for C#) that runs scripts. It is
-/// started for the first script, reused for the next ones (starting a runtime takes a tenth of a second or more; a
-/// running one answers in about a millisecond), and ends once it has been idle for <see cref="IdleTimeout"/>: scripting
-/// costs nothing until it is used, and little once it is not. A script that takes longer than the timeout, or a
-/// cancelled one, ends the process; the next run starts a new one. C# scripts are built into a program first
+/// A process of the user's own runtime (Python, Node.js or Bun for JavaScript, .NET for C#, PowerShell) that runs
+/// scripts. It is started for the first script, reused for the next ones (starting a runtime takes a tenth of a second
+/// or more; a running one answers in milliseconds), and ends once it has been idle for <see cref="IdleTimeout"/>:
+/// scripting costs nothing until it is used, and little once it is not. A script that takes longer than the timeout, or
+/// a cancelled one, ends the process; the next run starts a new one. C# scripts are built into a program first
 /// (<see cref="CSharpPrograms"/>), which the process runs; other scripts start another program.
 /// </summary>
 public sealed class ScriptWorker : IDisposable
@@ -44,10 +44,10 @@ public sealed class ScriptWorker : IDisposable
         _idleTimer = new Timer(_ => StopWhenIdle());
     }
 
-    /// <summary>The runtime's executable, for example a venv's <c>python</c>, <c>node</c> or <c>dotnet</c>.</summary>
+    /// <summary>The runtime's executable, for example a venv's <c>python</c>, <c>node</c>, <c>dotnet</c> or <c>pwsh</c>.</summary>
     public string Runtime { get; }
 
-    /// <summary>What to call the runtime in messages: Python, Node.js, Bun or .NET.</summary>
+    /// <summary>What to call the runtime in messages: Python, Node.js, Bun, .NET or PowerShell.</summary>
     public string Name { get; }
 
     public TimeSpan IdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
@@ -66,6 +66,12 @@ public sealed class ScriptWorker : IDisposable
         if (language == ScriptLanguage.CSharp)
         {
             return new(runtime, ".NET", workingDirectory, [], null, CSharpWorkerCode.ReplyMarker, new CSharpPrograms(runtime, workingDirectory));
+        }
+
+        if (language == ScriptLanguage.PowerShell)
+        {
+            return new(runtime, "PowerShell", workingDirectory, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PowerShellWorkerCode.Bootstrap],
+                PowerShellWorkerCode.Preamble, PowerShellWorkerCode.ReplyMarker);
         }
 
         // Node.js (V8) halves its memory with a small young generation and size-optimized code: 35 MB private instead

@@ -30,6 +30,26 @@ public sealed class UserSettings
     [JsonPropertyName("csharpRuntimes")]
     public Dictionary<string, string>? CSharpRuntimes { get; set; }
 
+    /// <summary>The PowerShell (<c>pwsh</c>, 7 or later) chosen for each workspace folder to run its PowerShell scripts.</summary>
+    public Dictionary<string, string>? PowerShellRuntimes { get; set; }
+
+    /// <summary>
+    /// The order in which the languages of a request's scripts are tried, for every workspace: a request whose Scripts
+    /// tab chooses no language runs its scripts in the first language that has all of them. Null: the default order
+    /// (<see cref="ScriptLanguage.All"/>).
+    /// </summary>
+    public List<string>? ScriptLanguageOrder { get; set; }
+
+    /// <summary>The language order, with every language (see <see cref="ScriptLanguage.Order"/>).</summary>
+    public IReadOnlyList<string> GetScriptLanguageOrder() => ScriptLanguage.Order(ScriptLanguageOrder);
+
+    /// <summary>Sets the language order; the default order is not stored.</summary>
+    public void SetScriptLanguageOrder(IEnumerable<string> order)
+    {
+        var complete = ScriptLanguage.Order(order);
+        ScriptLanguageOrder = complete.SequenceEqual(ScriptLanguage.All) ? null : [.. complete];
+    }
+
     /// <summary>The runtime chosen for scripts in <paramref name="language"/> in the workspace in <paramref name="workspaceRoot"/>, if any.</summary>
     public string? GetScriptRuntime(string language, string workspaceRoot) =>
         Runtimes(language)?.FirstOrDefault(p => SameFolder(p.Key, workspaceRoot)).Value is { Length: > 0 } runtime ? runtime : null;
@@ -56,6 +76,7 @@ public sealed class UserSettings
     {
         ScriptLanguage.Python => PythonInterpreters,
         ScriptLanguage.CSharp => CSharpRuntimes,
+        ScriptLanguage.PowerShell => PowerShellRuntimes,
         _ => JavaScriptRuntimes,
     };
 
@@ -68,6 +89,9 @@ public sealed class UserSettings
                 break;
             case ScriptLanguage.CSharp:
                 CSharpRuntimes = runtimes;
+                break;
+            case ScriptLanguage.PowerShell:
+                PowerShellRuntimes = runtimes;
                 break;
             default:
                 JavaScriptRuntimes = runtimes;
