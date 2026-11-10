@@ -33,6 +33,7 @@
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestPython.cs" Link="Infrastructure\Shared\TestPython.cs" />
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestJavaScript.cs" Link="Infrastructure\Shared\TestJavaScript.cs" />
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestCSharp.cs" Link="Infrastructure\Shared\TestCSharp.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestPowerShell.cs" Link="Infrastructure\Shared\TestPowerShell.cs" />
   </ItemGroup>
 
 </Project>

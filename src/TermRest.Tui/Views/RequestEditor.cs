@@ -5,6 +5,7 @@ using Terminal.Gui.Views;
 using TermRest.Core.Import;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
+using TermRest.Core.Scripting;
 
 namespace TermRest.Tui.Views;
 
@@ -106,13 +107,11 @@ internal sealed class RequestEditor : View
         bodyTab.Add(_body);
 
         var scriptsTab = new View { Title = "Scripts", Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
-        _scripts = new ScriptsEditor();
+        _scripts = new ScriptsEditor(forRequest: true);
         _scripts.Changed += (_, _) =>
         {
-            var scripts = _scripts.Scripts;
-            Spec.PreRequestScript = scripts.PreRequest;
-            Spec.TestScript = scripts.Test;
-            Spec.ScriptLanguage = scripts.Language;
+            Spec.Scripts = _scripts.Scripts;
+            Spec.ScriptSettings = _scripts.Settings;
             MarkModified();
         };
         scriptsTab.Add(_scripts);
@@ -205,6 +204,23 @@ internal sealed class RequestEditor : View
     /// <summary>The Scripts tab (for tests).</summary>
     internal ScriptsEditor ScriptsTab => _scripts;
 
+    /// <summary>What would run with the request's scripts (supplied by the main window, which knows its collection and folders).</summary>
+    public Func<ScriptSet, ScriptSettings, ScriptPlan?>? ScriptPlanner
+    {
+        get => _scripts.Planner;
+        set => _scripts.Planner = value;
+    }
+
+    /// <summary>The language new scripts are written in: the first of the user's order.</summary>
+    public string DefaultScriptLanguage
+    {
+        get => _scripts.DefaultLanguage;
+        set => _scripts.DefaultLanguage = value;
+    }
+
+    /// <summary>Shows again what the request's scripts run (after its collection's scripts or the language order changed).</summary>
+    public void RefreshScripts() => _scripts.Refresh();
+
     /// <summary>Whether requests are being recorded: the Body tab then says how body files are recorded.</summary>
     public void SetRecording(bool recording) => _body.Recording = recording;
 
@@ -225,7 +241,7 @@ internal sealed class RequestEditor : View
             _headers.SetEntries(spec.Headers);
             _auth.Load(spec.Auth);
             _body.Load(spec.Body);
-            _scripts.Load(spec.Scripts);
+            _scripts.Load(spec.Scripts, spec.ScriptSettings);
             _strictSsl.Value = spec.Settings.StrictSsl switch { true => 1, false => 2, null => 0 };
             _followRedirects.Value = spec.Settings.FollowRedirects switch { true => 1, false => 2, null => 0 };
             _description.SetText(spec.Description ?? "");

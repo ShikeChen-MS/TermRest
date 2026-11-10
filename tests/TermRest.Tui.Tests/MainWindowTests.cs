@@ -774,8 +774,8 @@ public sealed class MainWindowTests : IDisposable
         setup.SetScripts(setup.RootNode, new ScriptSet("tr.request.url += '&from=collection'", "", ScriptLanguage.Python));
         var node = setup.FindRequest("Basics/GET with query")!;
         var spec = node.ReadSpec();
-        spec.ScriptLanguage = ScriptLanguage.Python;
-        spec.TestScript = "@tr.test('the collection script added a parameter')\ndef _():\n    assert 'from=collection' in tr.response.json()['query']\nprint('checked', tr.response.status)";
+        spec.Scripts = new ScriptSet("", "@tr.test('the collection script added a parameter')\ndef _():\n    assert 'from=collection' in tr.response.json()['query']\nprint('checked', tr.response.status)",
+            ScriptLanguage.Python);
         setup.UpdateRequest(node, spec);
         setup.Save();
         using var ui = new Harness(_directory, runner =>
@@ -814,11 +814,16 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
-    public void The_scripts_tab_edits_a_requests_scripts_and_their_language()
+    public void The_scripts_tab_keeps_a_script_per_language_and_says_which_language_runs()
     {
         var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
         using var ui = new Harness(_directory);
         var token = ui.App.Begin(ui.Window);
+        Point OnRunIn(string text)
+        {
+            var runIn = ui.Find("Run in");
+            return new Point(ui.Screen().Split('\n')[runIn.Y].IndexOf(text, runIn.X, StringComparison.Ordinal), runIn.Y);
+        }
 
         ui.Click("POST POST JSON");
         ui.Click("Scripts");
@@ -826,29 +831,50 @@ public sealed class MainWindowTests : IDisposable
         var label = ui.Find("Pre-request (before sending)");
         ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 2, label.Y + 1)));
         ui.Type("print(1)");
+        var python = ui.Screen();
         var typed = ui.Window.Editor.Spec.Clone();
-        ui.App.InjectKey(Key.S.WithCtrl);
-        var savedPython = PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!.ReadSpec();
+
+        // Another language shows its own scripts: the Python one is kept.
         ui.Click("○ JavaScript");
         var javaScript = ui.Screen();
-        ui.App.InjectKey(Key.S.WithCtrl);
-        var savedJavaScript = PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!.ReadSpec();
-        var javaScriptFile = File.ReadAllText(path);
-        ui.Click("○ C#");
-        var csharp = ui.Screen();
+        var test = ui.Find("Post-response (tests)");
+        ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(test.X + 2, test.Y + 1)));
+        ui.Type("pm.test('js', () => {});");
+        var mixed = ui.Screen();
+        var status = ui.Window.Editor.ScriptsTab.Status;
+
+        // Turning pre-request scripts off leaves the JavaScript test, which runs; then the request chooses PowerShell.
+        ui.Click("Pre-request (before sending)");
+        var off = ui.Window.Editor.ScriptsTab.Status;
+        ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(OnRunIn("PowerShell")));
+        var chosen = ui.Screen();
         ui.App.InjectKey(Key.S.WithCtrl);
         ui.App.End(token!);
 
         OnScreen("◉ Python", tab);
         OnScreen("Run by your Python (Tools › Scripts…)", tab);
-        Assert.Equal(("print(1)", ScriptLanguage.Python), (typed.PreRequestScript, typed.ScriptLanguage));
-        Assert.Equal(("print(1)", ScriptLanguage.Python), (savedPython.PreRequestScript, savedPython.ScriptLanguage));
+        OnScreen("→ runs no scripts", tab);
+        OnScreen("◉ Python •", python);
+        OnScreen("☑ Pre-request (before sending)", python);
+        OnScreen("→ runs Python", python);
+        Assert.Equal(new ScriptSet("print(1)", "", ScriptLanguage.Python), typed.Scripts);
         OnScreen("Run by your Node.js or Bun (Tools › Scripts…) with Postman's pm object", javaScript);
-        Assert.Equal(ScriptLanguage.JavaScript, savedJavaScript.ScriptLanguage);
-        Assert.Contains("text/javascript", javaScriptFile, StringComparison.Ordinal);
-        OnScreen("Built and run by your .NET 10 SDK (Tools › Scripts…) with the tr object", csharp);
-        Assert.Equal(ScriptLanguage.CSharp, PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!.ReadSpec().ScriptLanguage);
-        Assert.Contains("text/x-csharp", File.ReadAllText(path), StringComparison.Ordinal);
+        OnScreen("◉ JavaScript •", mixed);
+        Assert.Equal("✗ no language has them all", status);
+        Assert.Equal("→ runs JavaScript", off);
+        OnScreen("☐ Pre-request (before sending)", chosen);
+        OnScreen("◉ PowerShell", chosen);
+        Assert.Equal("✗ 1 script lacks PowerShell", ui.Window.Editor.ScriptsTab.Status);
+        OnScreen("Run in   ○ Auto", chosen); // no line of the hint spills into the next row
+
+        var saved = PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!;
+        Assert.Equal(new ScriptSet([new LanguageScripts(ScriptLanguage.Python, "print(1)", ""), new LanguageScripts(ScriptLanguage.JavaScript, "", "pm.test('js', () => {});")]),
+            saved.ReadSpec().Scripts);
+        Assert.Equal(new ScriptSettings(ScriptLanguage.PowerShell, PreRequest: false), saved.ReadSpec().ScriptSettings);
+        Assert.Equal(
+            """[{"listen":"prerequest","script":{"exec":["print(1)"],"type":"text/x-python"},"disabled":true},""" +
+            """{"listen":"test","script":{"exec":["pm.test('js', () => {});"],"type":"text/javascript","packages":{}}}]""",
+            saved.Json["event"]!.ToJsonString(new System.Text.Json.JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
     }
 
     [Fact]
@@ -859,8 +885,9 @@ public sealed class MainWindowTests : IDisposable
         var setup = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
         var request = setup.FindRequest("Basics/GET with query")!;
         var spec = request.ReadSpec();
-        spec.ScriptLanguage = ScriptLanguage.CSharp;
-        spec.TestScript = $"// {Guid.NewGuid():N}\ntr.Test(\"status is 200\", () => tr.AssertEqual(200, tr.Response.Status));\nConsole.WriteLine(\"query \" + tr.Response.Json()[\"query\"]);";
+        spec.Scripts = new ScriptSet("",
+            $"// {Guid.NewGuid():N}\ntr.Test(\"status is 200\", () => tr.AssertEqual(200, tr.Response.Status));\nConsole.WriteLine(\"query \" + tr.Response.Json()[\"query\"]);",
+            ScriptLanguage.CSharp);
         setup.UpdateRequest(request, spec);
         setup.Save();
         using var ui = new Harness(_directory, runner =>
@@ -898,6 +925,54 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
+    public async Task PowerShell_scripts_run_in_the_chosen_pwsh()
+    {
+        var pwsh = TestPowerShell.Require();
+        await using var server = await LocalEchoServer.StartAsync();
+        var setup = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        var request = setup.FindRequest("Basics/GET with query")!;
+        var spec = request.ReadSpec();
+        spec.Scripts = new ScriptSet(
+            "$tr.Request.Headers.Set('X-From', 'pwsh')",
+            "$tr.Test('status is 200', { $tr.AssertEqual(200, $tr.Response.Status) })\nWrite-Host ('sent ' + $tr.Request.Headers.Get('X-From'))",
+            ScriptLanguage.PowerShell);
+        setup.UpdateRequest(request, spec);
+        setup.Save();
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.SetPowerShellRuntime(pwsh);
+        });
+        var ran = "";
+        var deadline = DateTime.UtcNow.AddSeconds(60);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            ui.App.InjectKey(Key.F5);
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            var screen = ui.Screen();
+            if (screen.Contains("tests 1/1 passed", StringComparison.Ordinal) || DateTime.UtcNow > deadline)
+            {
+                ran = screen;
+                ui.App.RequestStop();
+                return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("tests 1/1 passed", ran);
+        var scripts = ui.Window.ResponsePane.ScriptsText;
+        Assert.Contains("✓ status is 200", scripts, StringComparison.Ordinal);
+        Assert.Contains("[test · request 'Basics/GET with query'] sent pwsh", scripts, StringComparison.Ordinal);
+        Assert.Equal(["PowerShell"], ui.Runner.RunningRuntimes);
+    }
+
+    [Fact]
     public async Task Postman_javascript_scripts_are_skipped_until_a_runtime_is_chosen_then_run()
     {
         var node = TestJavaScript.Require();
@@ -905,8 +980,8 @@ public sealed class MainWindowTests : IDisposable
         var setup = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
         var node1 = setup.FindRequest("Basics/GET with query")!;
         var spec = node1.ReadSpec();
-        spec.ScriptLanguage = ScriptLanguage.JavaScript;
-        spec.TestScript = "pm.test('status is 200', () => pm.response.to.have.status(200));\nconsole.log('query', pm.response.json().query);";
+        spec.Scripts = new ScriptSet("", "pm.test('status is 200', () => pm.response.to.have.status(200));\nconsole.log('query', pm.response.json().query);",
+            ScriptLanguage.JavaScript);
         setup.UpdateRequest(node1, spec);
         setup.Save();
         using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo");
@@ -1047,10 +1122,49 @@ public sealed class MainWindowTests : IDisposable
         OnScreen("None chosen: Python scripts do not run.", dialog);
         OnScreen("None chosen: JavaScript scripts do not run.", dialog);
         OnScreen("None chosen: C# scripts do not run.", dialog);
+        OnScreen("None chosen: PowerShell scripts do not run.", dialog);
         Assert.True(found.Contains("✓ .NET SDK", StringComparison.Ordinal), $"{dialog}\n----\n{found}");
         Assert.Equal("dotnet", UserSettings.Load(settings).GetScriptRuntime(ScriptLanguage.CSharp, ui.Workspace.RootPath));
         Assert.Equal("dotnet", ui.Runner.CSharpRuntime);
         Assert.Null(ui.Runner.PythonInterpreter);
+    }
+
+    [Fact]
+    public void The_scripts_dialog_orders_the_languages_for_every_workspace()
+    {
+        var settings = TestFiles.NewTempDirectory();
+        using var ui = new Harness(_directory);
+        string before = "", after = "";
+        Point Up(int row) => ui.Screen().Split('\n')
+            .SelectMany((line, y) => Enumerable.Range(0, line.Length).Where(x => string.CompareOrdinal(line, x, "⟦ ▲ ⟧", 0, 5) == 0).Select(x => new Point(x + 2, y)))
+            .ElementAt(row);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+            {
+                before = ui.Screen();
+
+                // PowerShell, the last row, moves up twice: it becomes second.
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(Up(3)));
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(Up(2)));
+                after = ui.Screen();
+                ui.Click("► Save ◄");
+                return false;
+            });
+            ScriptsDialog.ShowRuntimes(ui.App, ui.Workspace, ui.Runner, settings);
+            ui.App.RequestStop();
+            return false;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("4 PowerShell", before);
+        OnScreen("▲ ▼ change the order, for all workspaces", before);
+        OnScreen("2 PowerShell", after);
+        OnScreen("3 JavaScript", after);
+        IReadOnlyList<string> order = [ScriptLanguage.Python, ScriptLanguage.PowerShell, ScriptLanguage.JavaScript, ScriptLanguage.CSharp];
+        Assert.Equal(order, UserSettings.Load(settings).GetScriptLanguageOrder());
+        Assert.Equal(order, ui.Runner.ScriptLanguageOrder);
     }
 
     [Fact]

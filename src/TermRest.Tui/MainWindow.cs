@@ -10,6 +10,7 @@ using TermRest.Core.Import;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Recording;
+using TermRest.Core.Scripting;
 using TermRest.Core.Workspace;
 using TermRest.Tui.Dialogs;
 using TermRest.Tui.Theming;
@@ -99,6 +100,10 @@ internal sealed class MainWindow : Runnable
 
             // Where a relative body file is looked for when sending: the folder of the collection sending it.
             BaseDirectory = () => (_collection ?? _scratch)?.BaseDirectory ?? Environment.CurrentDirectory,
+
+            // The request's scripts run with those of its collection and folders, in one language.
+            ScriptPlanner = (scripts, settings) => _collection is { } collection ? _runner.PlanScripts(collection, _node, scripts, settings) : null,
+            DefaultScriptLanguage = _runner.ScriptLanguageOrder[0],
         };
         _requestFrame.Add(_editor);
 
@@ -752,9 +757,10 @@ internal sealed class MainWindow : Runnable
 
         var collection = folder.Collection;
         var owner = folder is CollectionRootNode ? $"collection '{collection.Name}'" : $"folder '{folder.PathInCollection}'";
-        if (ScriptsDialog.Edit(App!, owner, collection.GetScripts(folder)) is { } scripts && collection.SetScripts(folder, scripts))
+        if (ScriptsDialog.Edit(App!, owner, collection.GetScripts(folder), _runner.ScriptLanguageOrder[0]) is { } scripts && collection.SetScripts(folder, scripts))
         {
             _tree.RefreshItem(collection);
+            _editor.RefreshScripts();
             UpdateTitles();
             Notify($"Scripts of {owner} changed (Ctrl+S saves the collection).");
         }
@@ -763,24 +769,36 @@ internal sealed class MainWindow : Runnable
     private void ShowScriptSettings()
     {
         ScriptsDialog.ShowRuntimes(App!, _workspace, _runner);
-        Notify($"Scripts: Python {_runner.PythonInterpreter ?? "not chosen"} · JavaScript {_runner.JavaScriptRuntime ?? "not chosen"} · C# {_runner.CSharpRuntime ?? "not chosen"}");
+        _editor.DefaultScriptLanguage = _runner.ScriptLanguageOrder[0];
+        _editor.RefreshScripts();
+        Notify("Script languages, in order: " + string.Join(", ", _runner.ScriptLanguageOrder.Select(language =>
+            $"{ScriptLanguage.Label(language)} ({_runner.GetRuntime(language) ?? "no runtime"})")));
     }
 
     private void ShowScriptingHelp() => Ui.ShowText(App!, "Scripting", ScriptingHelp);
 
     internal const string ScriptingHelp = """
         Scripts run in a runtime you choose in Tools › Scripts… for each workspace: Python for Python scripts, Node.js
-        or Bun for JavaScript (Postman's pm.* scripts), the .NET SDK (10 or later) for C#. TermRest carries no script
-        engine: one process per runtime runs the scripts, starting for the first one and stopping after 5 idle minutes.
-        Each phase may take up to 30 seconds. Scripts whose runtime is not chosen do not run: the response's Scripts tab
-        says so.
+        or Bun for JavaScript (Postman's pm.* scripts), the .NET SDK (10 or later) for C#, PowerShell (7 or later) for
+        PowerShell. TermRest carries no script engine: one process per runtime runs the scripts, starting for the first
+        one and stopping after 5 idle minutes. Each phase may take up to 30 seconds. Scripts whose runtime is not chosen
+        do not run: the response's Scripts tab says so.
 
         When they run
           Pre-request scripts run before the request is prepared, then post-response (test) scripts once the response
           has arrived. Each phase runs the scripts of the collection, then its folders (outermost first), then the
-          request; the languages can be mixed. A pre-request script that fails stops the request: it is not sent.
-          Edit collection and folder scripts with right-click › Scripts…, and choose the language in the Scripts tab.
+          request, one at a time. A pre-request script that fails stops the request: it is not sent.
+          Edit collection and folder scripts with right-click › Scripts…, and a request's in its Scripts tab.
           Values scripts set are kept until TermRest closes (Postman's "current values"): files never change.
+
+        One language per request
+          A collection, folder or request can have a pre-request and a post-response script in each language (Language
+          shows them; a • marks those with scripts). A request runs the scripts of one language only, in one runtime:
+          the one its Scripts tab chooses (Run in), or with Auto the first language of your order (Tools › Scripts…,
+          ▲ ▼) that has all the scripts it runs. Scripts in other languages are kept, and do not run.
+          The boxes above a request's scripts say whether its pre-request and post-response scripts run, its
+          collection's and folders' too: ticked when there are some. Untick one to skip them; tick one without scripts
+          and the request needs one. When no language has all the scripts a request runs, it is not sent.
 
         Python: the tr object
           tr.environment, tr.collection_variables, tr.globals
@@ -831,6 +849,22 @@ internal sealed class MainWindow : Runnable
               tr.AssertEqual(201, tr.Response.Status);
               tr.AssertEqual("Ada", tr.Response.Json()["name"]);
           });
+
+        PowerShell: the $tr object, as in C#
+          $tr.Environment, $tr.CollectionVariables, $tr.Globals   .Get(name) .Set(name, value) .Unset .Has .ToHashtable
+          $tr.Variables  reads every scope; .Set() is for this request only; .ReplaceIn('{{base}}/x').
+          $tr.Request    .Method, .Url, .Headers (.Get .Set .Add .Remove .Items()), .Body: change them before sending.
+          $tr.Response   .Status (or .Code), .Reason, .Headers, .Time (ms), .Size, .Text(), .Json() (ConvertFrom-Json),
+                       .Content().
+          $tr.Test(name, { … }), $tr.Assert(condition), $tr.AssertEqual(expected, actual), $tr.Info.
+          Output, Write-Host and warnings go to the Scripts tab (output inside $tr.Test blocks is dropped: use Write-Host
+          there). Errors stop the script ($ErrorActionPreference is Stop). Your profile is not loaded; modules load as
+          you import them.
+
+          $tr.Test('returns the new item', {
+              $tr.AssertEqual(201, $tr.Response.Status)
+              $tr.AssertEqual('Ada', $tr.Response.Json().name)
+          })
 
         The runtimes run in the workspace folder, so scripts can import your own modules from it. Scripts run with your
         permissions: choose runtimes only for workspaces whose collections you trust.
@@ -1372,8 +1406,8 @@ internal sealed class MainWindow : Runnable
         if (intoCurrent)
         {
             spec.Description = _editor.Spec.Description;
-            spec.PreRequestScript = _editor.Spec.PreRequestScript;
-            spec.TestScript = _editor.Spec.TestScript;
+            spec.Scripts = _editor.Spec.Scripts;
+            spec.ScriptSettings = _editor.Spec.ScriptSettings;
             _editor.Replace(spec);
         }
         else

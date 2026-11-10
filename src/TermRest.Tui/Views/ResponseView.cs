@@ -87,9 +87,10 @@ internal sealed class ResponseView : View
     private const string NoScripts =
         "No scripts ran for this request.\n\n"
         + "Scripts run before a request is sent and after its response arrives: set variables, sign requests, check\n"
-        + "responses with tests. Write them in Python, JavaScript (Postman's pm.* scripts) or C# in the request's Scripts\n"
-        + "tab, or for a whole collection or folder (right-click it › Scripts…). Choose the runtimes that run them (Python,\n"
-        + "Node.js or Bun, the .NET SDK) in Tools › Scripts…; Help › Scripting shows the tr and pm objects.";
+        + "responses with tests. Write them in Python, JavaScript (Postman's pm.* scripts), C# or PowerShell in the\n"
+        + "request's Scripts tab, or for a whole collection or folder (right-click it › Scripts…). Choose the runtimes that\n"
+        + "run them (Python, Node.js or Bun, the .NET SDK, PowerShell) in Tools › Scripts…; Help › Scripting shows the tr\n"
+        + "and pm objects.";
 
     /// <summary>Raised with short user-facing notices (copied, saved, …).</summary>
     public event EventHandler<string>? Notice;

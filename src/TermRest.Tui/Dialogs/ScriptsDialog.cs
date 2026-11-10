@@ -12,12 +12,21 @@ namespace TermRest.Tui.Dialogs;
 /// <summary>Scripts of a collection or folder, and the runtimes that run scripts (Tools › Scripts).</summary>
 internal static class ScriptsDialog
 {
-    /// <summary>Edits the scripts that run around every request in a collection or folder; null when cancelled.</summary>
-    public static ScriptSet? Edit(IApplication app, string owner, ScriptSet scripts)
+    /// <summary>
+    /// Edits the scripts that run around every request in a collection or folder; null when cancelled. New scripts are
+    /// written in <paramref name="defaultLanguage"/> unless another language is chosen.
+    /// </summary>
+    public static ScriptSet? Edit(IApplication app, string owner, ScriptSet scripts, string defaultLanguage)
     {
         using var dialog = new Dialog { Title = $"Scripts of {owner}", Width = Dim.Percent(90), Height = Dim.Percent(80) };
-        dialog.Add(new Label { X = 1, Y = 0, Width = Dim.Fill(1), Text = "They run for every request inside, before the scripts of its folders and of the request itself." });
-        var editor = new ScriptsEditor { X = 1, Y = 2, Width = Dim.Fill(1), Height = Dim.Fill(1) };
+        dialog.Add(new Label
+        {
+            X = 1,
+            Y = 0,
+            Width = Dim.Fill(1),
+            Text = "They run for every request inside, before those of its folders and its own, when the request runs scripts in their language.",
+        });
+        var editor = new ScriptsEditor { X = 1, Y = 2, Width = Dim.Fill(1), Height = Dim.Fill(1), DefaultLanguage = defaultLanguage };
         editor.Load(scripts);
         dialog.Add(editor);
         dialog.AddButton(new Button { Text = "Cancel" });
@@ -28,27 +37,57 @@ internal static class ScriptsDialog
     }
 
     /// <summary>
-    /// Chooses the runtimes that run this workspace's scripts, Python, Node.js or Bun, and the .NET SDK (kept in the
-    /// user's settings, not in the workspace), and shows what scripts left behind: variables set in this session, and
-    /// running runtimes.
+    /// Chooses the runtimes that run this workspace's scripts, Python, Node.js or Bun, the .NET SDK and PowerShell (kept
+    /// in the user's settings, not in the workspace), and the order in which a request's languages are tried (for every
+    /// workspace); shows what scripts left behind: variables set in this session, and running runtimes.
     /// </summary>
     public static void ShowRuntimes(IApplication app, ApiWorkspace workspace, RequestRunner runner, string? userDirectory = null)
     {
         using var dialog = new Dialog { Title = "Scripts", Width = Dim.Percent(80) };
         var settings = UserSettings.Load(userDirectory);
-        var y = 1;
-        var fields = ScriptLanguage.All.ToDictionary(language => language, language => AddRuntime(app, dialog, workspace, runner, language, settings, ref y));
+        var rows = settings.GetScriptLanguageOrder().Select(language => AddRuntime(app, dialog, workspace, runner, language, settings)).ToList();
+        void Place()
+        {
+            for (var i = 0; i < rows.Count; i++)
+            {
+                rows[i].Place(i, rows.Count);
+            }
+
+            dialog.SetNeedsLayout();
+        }
+
+        foreach (var row in rows)
+        {
+            Ui.OnPress(row.Up, () => Move(row, -1));
+            Ui.OnPress(row.Down, () => Move(row, 1));
+        }
+
+        void Move(RuntimeRow row, int by)
+        {
+            var index = rows.IndexOf(row);
+            if (index + by >= 0 && index + by < rows.Count)
+            {
+                rows.RemoveAt(index);
+                rows.Insert(index + by, row);
+                Place();
+            }
+        }
+
+        Place();
+        var y = 1 + (rows.Count * 3);
         dialog.Add(new Label
         {
             X = 14,
             Y = y,
             Width = Dim.Fill(1),
-            Height = 3,
-            Text = "A command (python3, node, bun, dotnet) or a path, relative to the workspace (.venv/bin/python).\n"
-                   + "The packages installed for it (pip, npm; NuGet with #:package in C#) are yours to use.\n"
-                   + "Kept in your settings, for this workspace only: never in the workspace.",
+            Height = 5,
+            Text = "A command (python3, node, bun, dotnet, pwsh) or a path, relative to the\n"
+                   + "workspace (.venv/bin/python), kept in your settings for this workspace only.\n"
+                   + "Its packages and modules (pip, npm, NuGet, PowerShell modules) are yours.\n"
+                   + "▲ ▼ change the order, for all workspaces: a request runs its scripts in the\n"
+                   + "first language that has all of them, unless its Scripts tab chooses one.",
         });
-        y += 4;
+        y += 6;
         dialog.Add(new Label
         {
             X = 1,
@@ -97,44 +136,71 @@ internal static class ScriptsDialog
         }
 
         var user = UserSettings.Load(userDirectory);
-        foreach (var (language, field) in fields)
+        foreach (var row in rows)
         {
-            user.SetScriptRuntime(language, workspace.RootPath, field.Text);
+            user.SetScriptRuntime(row.Language, workspace.RootPath, row.Field.Text);
         }
 
+        user.SetScriptLanguageOrder(rows.Select(r => r.Language));
         user.Save(userDirectory);
         foreach (var language in ScriptLanguage.All)
         {
             runner.SetRuntime(language, user.GetScriptRuntime(language, workspace.RootPath));
         }
+
+        runner.ScriptLanguageOrder = user.GetScriptLanguageOrder();
     }
 
-    /// <summary>A runtime's row: its path with Browse…, then Find and Check with what they found.</summary>
-    private static TextField AddRuntime(IApplication app, Dialog dialog, ApiWorkspace workspace, RequestRunner runner, string language,
-        UserSettings settings, ref int y)
+    /// <summary>A language's row: its place in the order, its runtime with Browse…, ▲ ▼, then Find and Check with what they found.</summary>
+    private sealed record RuntimeRow(string Language, Label Name, TextField Field, Button Browse, Button Up, Button Down, Button Find, Button Check, Label Status)
+    {
+        /// <summary>Puts the row in place <paramref name="index"/> of <paramref name="count"/>.</summary>
+        public void Place(int index, int count)
+        {
+            var y = 1 + (index * 3);
+            Name.Text = $"{index + 1} {ScriptLanguage.Label(Language)}";
+            foreach (var view in (View[])[Name, Field, Browse, Up, Down])
+            {
+                view.Y = y;
+            }
+
+            foreach (var view in (View[])[Find, Check, Status])
+            {
+                view.Y = y + 1;
+            }
+
+            Up.Enabled = index > 0;
+            Down.Enabled = index < count - 1;
+        }
+    }
+
+    /// <summary>A runtime's row (see <see cref="RuntimeRow"/>).</summary>
+    private static RuntimeRow AddRuntime(IApplication app, Dialog dialog, ApiWorkspace workspace, RequestRunner runner, string language,
+        UserSettings settings)
     {
         var name = language switch
         {
             ScriptLanguage.Python => "Python",
             ScriptLanguage.CSharp => "dotnet (.NET SDK 10 or later)",
+            ScriptLanguage.PowerShell => "pwsh (PowerShell 7 or later)",
             _ => "Node.js or Bun",
         };
         var current = settings.GetScriptRuntime(language, workspace.RootPath) ?? "";
-        var field = Ui.AddRow(dialog, ScriptLanguage.Label(language), new TextField { Text = current, Width = Dim.Fill(13) }, y, 12);
-        var browse = new Button { Text = "Browse…", X = Pos.AnchorEnd(12), Y = y };
-        dialog.Add(browse);
-        y += 1;
-        var find = new Button { Text = "Find", X = 14, Y = y };
-        var check = new Button { Text = "Check", X = Pos.Right(find) + 1, Y = y };
+        var label = new Label { Text = ScriptLanguage.Label(language), X = 1, Width = 12 };
+        var field = new TextField { Text = current, X = 14, Width = Dim.Fill(25) };
+        var browse = new Button { Text = "Browse…", X = Pos.AnchorEnd(24) };
+        var up = new Button { Text = "▲", X = Pos.AnchorEnd(12) };
+        var down = new Button { Text = "▼", X = Pos.AnchorEnd(6) };
+        dialog.Add(label, field, browse, up, down);
+        var find = new Button { Text = "Find", X = 14 };
+        var check = new Button { Text = "Check", X = Pos.Right(find) + 1 };
         var status = new Label
         {
             X = Pos.Right(check) + 2,
-            Y = y,
             Width = Dim.Fill(1),
             Text = current.Length == 0 ? $"None chosen: {ScriptLanguage.Label(language)} scripts do not run." : "",
         };
         dialog.Add(find, check, status);
-        y += 2;
 
         var checking = 0;
 
@@ -201,12 +267,13 @@ internal static class ScriptsDialog
                 {
                     ScriptLanguage.Python => "No Python found in the workspace (.venv, venv, env) or on PATH.",
                     ScriptLanguage.CSharp => "No .NET SDK 10 or later found (dotnet on PATH, ~/.dotnet).",
+                    ScriptLanguage.PowerShell => "No PowerShell 7 or later found (pwsh on PATH).",
                     _ => "Neither node nor bun was found on PATH.",
                 }, null);
             }
 
             return ("✓ " + found.Description, found.Runtime);
         }));
-        return field;
+        return new RuntimeRow(language, label, field, browse, up, down, find, check, status);
     }
 }

@@ -2,6 +2,7 @@ using System.CommandLine;
 using TermRest.Core.Http;
 using TermRest.Core.Postman;
 using TermRest.Core.Recording;
+using TermRest.Core.Scripting;
 using TermRest.Core.Workspace;
 
 namespace TermRest.Cli;
@@ -35,6 +36,17 @@ internal sealed class RequestOptions
         Description = "The dotnet (.NET SDK 10 or later) that builds and runs the collection's C# scripts, e.g. dotnet (default: the one chosen for this workspace in the full-screen UI)",
     };
 
+    public Option<string?> PowerShell { get; } = new("--powershell")
+    {
+        Description = "The pwsh (PowerShell 7 or later) that runs the collection's PowerShell scripts, e.g. pwsh (default: the one chosen for this workspace in the full-screen UI)",
+    };
+
+    public Option<string?> ScriptOrder { get; } = new("--script-order")
+    {
+        Description = "The order in which script languages are tried for requests that choose none (the first with all of a request's scripts runs them), " +
+                      "e.g. powershell,javascript; the others follow (default: your order in the full-screen UI, Tools › Scripts…)",
+    };
+
     public Option<bool> NoScripts { get; } = new("--no-scripts") { Description = "Do not run pre-request and test scripts" };
 
     public void AddTo(Command command)
@@ -46,6 +58,8 @@ internal sealed class RequestOptions
         command.Options.Add(Python);
         command.Options.Add(JavaScript);
         command.Options.Add(CSharp);
+        command.Options.Add(PowerShell);
+        command.Options.Add(ScriptOrder);
         command.Options.Add(NoScripts);
     }
 
@@ -135,6 +149,18 @@ internal sealed class RequestOptions
             }
         }
 
+        var scriptOrder = new List<string>();
+        foreach (var name in (parseResult.GetValue(ScriptOrder) ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (ScriptLanguage.Parse(name) is not { } language)
+            {
+                Output.Error($"--script-order: '{name}' is not a script language (python, javascript, csharp or powershell).");
+                return null;
+            }
+
+            scriptOrder.Add(language);
+        }
+
         var runner = new RequestRunner(workspace)
         {
             StrictSslOverride = parseResult.GetValue(insecure) ? false : null,
@@ -144,7 +170,8 @@ internal sealed class RequestOptions
 
         if (runner.ScriptsEnabled)
         {
-            runner.ConfigureScripts(parseResult.GetValue(Python), parseResult.GetValue(JavaScript), parseResult.GetValue(CSharp));
+            runner.ConfigureScripts(parseResult.GetValue(Python), parseResult.GetValue(JavaScript), parseResult.GetValue(CSharp), parseResult.GetValue(PowerShell),
+                scriptOrder: scriptOrder);
         }
 
         if (parseResult.GetValue(Environment) is { } environment)
