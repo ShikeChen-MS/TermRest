@@ -176,6 +176,7 @@ A runtime answers in about a millisecond once started; starting takes 0.1–0.3 
 
 - **A request's scripts** are in its *Scripts* tab: *Language* shows the scripts of a language, and a `•` marks the languages that have some.
 - **A collection's or folder's scripts:** right-click it in the tree › *Scripts…* (or *Request › Collection or folder scripts…*). They run for every request inside.
+- **Syntax colors:** the script editors color the syntax of the language shown: comments, strings, numbers and constants, keywords, function calls, types, and PowerShell's variables and parameters, in the [color theme](#color-themes)'s script colors. This is plain highlighting, with no completion or error checking.
 - **Order:** each phase runs the scripts of the collection, then the folders (outermost first), then the request, one at a time: each script sees the variables and request changes of the ones before it.
 - **A failing pre-request script stops the request.** This covers an exception, a syntax or compile error, and a timeout. The request is not sent, nor added to the history or a recording, and the error is shown with the script's line.
 - **Time limit:** each phase may take 30 seconds (building C# scripts does not count); the runtime is then stopped and started again for the next script.
@@ -355,8 +356,8 @@ TermRest runs scripts the way a terminal runs commands: it starts the runtime yo
 Choose a theme in *Tools › Color theme…*. Moving through the list previews each theme live on the whole UI; *Use theme* keeps it and *Cancel* restores the previous one. The choice applies to all your workspaces. Tick *Use only in this workspace* to store it in the workspace's `.termrest/settings.json` instead, for example to give a production workspace a red menu bar.
 
 - **Built in:** Terminal.Gui's themes (Default uses your terminal's own colors; Dark, Light, TurboPascal 5, Anders, 8-Bit, Green Phosphor, Amber Phosphor) and TermRest's Dracula, Gruvbox Dark, High Contrast, Monokai, Nord, Solarized Dark and Solarized Light.
-- **Method and status colors:** every theme colors the request methods in the tree (GET, POST, PUT, PATCH, DELETE, others) and the response status (2xx/3xx, 4xx, 5xx).
-- **Custom themes** are JSON files. *Copy as custom theme…* (or `termrest themes copy`) writes a copy of any theme for you to edit, and *Reload theme files* picks up your edits without a restart. A theme file names a `base` theme and changes some of its palette colors. Every color of the UI is derived from the palette's 20 colors. For full control, `schemes` sets single roles of Terminal.Gui's color schemes:
+- **Method, status and script colors:** every theme colors the request methods in the tree (GET, POST, PUT, PATCH, DELETE, others), the response status (2xx/3xx, 4xx, 5xx), and the syntax of scripts.
+- **Custom themes** are JSON files. *Copy as custom theme…* (or `termrest themes copy`) writes a copy of any theme for you to edit, and *Reload theme files* picks up your edits without a restart. A theme file names a `base` theme and changes some of its palette colors. Every color of the UI is derived from the palette's 28 colors. For full control, `schemes` sets single roles of Terminal.Gui's color schemes:
 
   ```jsonc
   {
@@ -373,7 +374,7 @@ Choose a theme in *Tools › Color theme…*. Moving through the list previews e
   }
   ```
 
-  Palette colors: `background`, `text`, `muted`, `accent` (hot keys), `selection`, `selectionText`, `input` (fields and tables), `bar`, `barText`, `dialog`, `dialogText`, `success`, `warning`, `error`, `get`, `post`, `put`, `patch`, `delete`, `otherMethods`. Schemes: `Base`, `Menu`, `Dialog`, `Error`, `Accent`, `Success`, `Warning`. Roles: `Normal`, `HotNormal`, `Focus`, `HotFocus`, `Active`, `HotActive`, `Highlight`, `Editable`, `ReadOnly`, `Disabled`. Mistakes such as an unknown key or an invalid color are listed in the dialog and by `termrest themes`, and the rest of the file still applies.
+  Palette colors: `background`, `text`, `muted`, `accent` (hot keys), `selection`, `selectionText`, `input` (fields and tables), `bar`, `barText`, `dialog`, `dialogText`, `success`, `warning`, `error`, `get`, `post`, `put`, `patch`, `delete`, `otherMethods`, and for scripts `syntaxComment`, `syntaxKeyword` (with PowerShell's operators such as `-eq`), `syntaxString`, `syntaxNumber` (with constants such as `true` and `None`), `syntaxVariable` (PowerShell's `$name`), `syntaxFunction` (with PowerShell's commands and Python's decorators), `syntaxType` and `syntaxParameter` (PowerShell's `-Name`). A script color set to `None`, or too close to the editor's background to read, is drawn in the editor's text color. Schemes: `Base`, `Menu`, `Dialog`, `Error`, `Accent`, `Success`, `Warning`. Roles: `Normal`, `HotNormal`, `Focus`, `HotFocus`, `Active`, `HotActive`, `Highlight`, `Editable`, `ReadOnly`, `Disabled`. Mistakes such as an unknown key or an invalid color are listed in the dialog and by `termrest themes`, and the rest of the file still applies.
 - **Where theme files go:** your own themes are in the `themes` folder of your TermRest configuration folder. That is `%APPDATA%\TermRest` on Windows, `~/Library/Application Support/TermRest` on macOS, and `$XDG_CONFIG_HOME/termrest` (default `~/.config/termrest`) on Linux. Set `TERMREST_CONFIG_DIR` to move it. Themes in a workspace's `.termrest/themes` folder are shared with everyone who uses the workspace. A custom theme with the name of a built-in one replaces it.
 - **Which theme is used:** `--theme <name>` for one session, else `$TERMREST_THEME`, else the workspace's choice (`theme` in `.termrest/settings.json`), else yours (`settings.json` in the configuration folder), else Default.
 
@@ -693,7 +694,7 @@ TERMREST_TEST_POWERSHELL=<pwsh> dotnet test    # the PowerShell (7+) for PowerSh
 
 Notes:
 
-- Terminal.Gui 2.5's `TextView` is marked obsolete in favour of the separate `Terminal.Gui.Editor` package. That package has not shipped a build for 2.5 yet, so TermRest uses `TextView` behind a small `TextArea` wrapper, which makes the later switch (syntax highlighting, folding) a one-file change.
+- Terminal.Gui 2.5's `TextView` is marked obsolete in favour of the separate `Terminal.Gui.Editor` package. That package has not shipped a build for 2.5 yet, so TermRest uses `TextView` behind a small `TextArea` wrapper, which makes the later switch (folding, for one) a one-file change. `TextArea` also colors scripts: small hand-written lexers (`src/TermRest.Tui/Syntax`) color one line at a time from what the line above leaves open (a string or a comment), so an edit recolors only the lines down to the last one in view.
 - Mouse responsiveness: the UI runs Terminal.Gui's main loop at 60 passes per second (its default is 25) and, on Windows, asks for 1 ms timer resolution while it runs (`TimerResolution`), because Windows rounds the loop's and the input poll's sleeps up to 15.6 ms ticks. The request and response tabs use `TabPanel` instead of Terminal.Gui's `Tabs`, which lays out and draws every page on each redraw; it looks the same and makes clicks, drags and resizes about twice as fast to repaint.
 - Each request uses a fresh connection, so timing and TLS details are exact. Cookies persist for the session (**Tools › Clear cookies**).
 
@@ -701,7 +702,7 @@ Notes:
 
 - **Next:** OAuth 2.0 token acquisition, including Entra ID client credentials with a certificate; response search and JSON path filtering; saving responses as Postman examples, and showing them in v3 collections.
 - **Phase 2:**
-  - Syntax-highlighted editor, for bodies and scripts.
+  - Syntax highlighting of request and response bodies (scripts have it).
   - Proxy authentication.
   - Code snippets.
 - **Packaging:** winget, Homebrew, `.deb`/`.rpm`, and signed binaries.
