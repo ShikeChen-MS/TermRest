@@ -320,6 +320,21 @@ public sealed class HttpExecutorTests : IDisposable
     }
 
     [Fact]
+    public async Task A_client_certificate_is_not_reported_as_requested_when_the_server_does_not_ask_for_one()
+    {
+        await using var server = await EchoServer.StartAsync(_pki.Server);
+        var entry = new CertificateEntry { Name = "unasked", Cert = new FileSource { Src = "client.pem" }, Key = new FileSource { Src = "client.key" } };
+        entry.Matches = [$"https://localhost:{server.BaseUri.Port}/*"];
+        using var provider = new ClientCertificateProvider(new CertificateRegistry(_pki.Directory) { Entries = [entry] });
+
+        var exchange = await new HttpExecutor().SendAsync(Prepare(new HttpRequestSpec { Url = server.Url("echo") }, new ExecutionDefaults { CaBundlePath = _pki.CaPemPath }, provider), _ct);
+
+        Assert.Equal(200, exchange.Response?.StatusCode);
+        var tls = exchange.Tls.Single();
+        Assert.False(tls.ClientCertificateRequested, tls.Describe());
+    }
+
+    [Fact]
     public async Task Request_pinned_certificate_is_used()
     {
         await using var server = await EchoServer.StartAsync(_pki.Server, requireClientCertificate: true);

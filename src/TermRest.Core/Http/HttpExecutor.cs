@@ -379,8 +379,9 @@ public sealed class HttpExecutor
 
         public X509Certificate2? SelectClientCertificate(ClientCertificateSelection? selection, X509Certificate? remoteCertificate, string[] acceptableIssuers)
         {
-            // The platform calls this once before the handshake (no remote certificate yet) and again when the
-            // server actually requests a client certificate.
+            // Windows and macOS call this once before the handshake (no remote certificate yet) and again when the
+            // server actually requests a client certificate. Linux calls it only before the handshake and reuses its
+            // answer, so the request shows only in the certificate sent (see CollectTls).
             if (remoteCertificate is not null || acceptableIssuers.Length > 0)
             {
                 lock (_gate)
@@ -555,6 +556,14 @@ public sealed class HttpExecutor
                                 using var copy = X509CertificateLoader.LoadCertificate(local.GetRawCertData());
                                 info.ClientCertificate = CertificateSummary.From(copy);
                                 info.ClientCertificateOrigin = request.ClientCertificate?.Origin ?? "selected by the OS";
+
+                                // A client sends its certificate only when the server asks for one, and except on
+                                // macOS LocalCertificate is the certificate sent (there, the one chosen, sent or not).
+                                // This also tells on Linux, where the selection callback never sees the request.
+                                if (!OperatingSystem.IsMacOS())
+                                {
+                                    info.ClientCertificateRequested = true;
+                                }
                             }
                         }
                     }
