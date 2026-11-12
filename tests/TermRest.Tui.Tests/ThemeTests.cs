@@ -123,6 +123,34 @@ public sealed class ThemeTests : IDisposable
     }
 
     [Fact]
+    public void Built_in_themes_color_scripts_so_they_can_be_read()
+    {
+        foreach (var theme in ThemeCatalog.BuiltIn.Where(t => t.Name != "8-Bit"))
+        {
+            var editor = theme.Schemes["Base"].Editable.Background;
+            foreach (var color in (Color[])[theme.Palette.SyntaxComment, theme.Palette.SyntaxKeyword])
+            {
+                Assert.False(color.Equals(Color.None), $"{theme.Name} has no script colors");
+                Assert.True(editor.Equals(Color.None) || ThemePalette.Contrast(color, editor) >= 1.5, $"{theme.Name}: {color} on {editor}");
+            }
+        }
+    }
+
+    [Fact]
+    public void Theme_files_change_script_colors_without_replacing_the_base_theme_s_schemes()
+    {
+        WriteTheme("dark-scripts.json", """{ "name": "Dark scripts", "base": "Dark", "palette": { "syntaxKeyword": "Orange", "syntaxComment": "None" } }""");
+        var errors = new List<string>();
+
+        var theme = ThemeCatalog.Find(ThemeCatalog.Load(null, errors, _userDirectory), "Dark scripts")!;
+
+        Assert.Empty(errors);
+        Assert.Equal((Color.Parse("Orange"), Color.None), (theme.Palette.SyntaxKeyword, theme.Palette.SyntaxComment));
+        Assert.Equal(BuiltIn("Dark").Palette.SyntaxString, theme.Palette.SyntaxString);
+        Assert.Equal(BuiltIn("Dark").Schemes["Base"], theme.Schemes["Base"]);
+    }
+
+    [Fact]
     public void Problems_in_theme_files_are_reported_and_the_rest_still_works()
     {
         WriteTheme("broken.json", "{ \"name\": ");

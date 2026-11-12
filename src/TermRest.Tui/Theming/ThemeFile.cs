@@ -84,8 +84,11 @@ internal sealed class ThemeFile
                 continue;
             }
 
-            // Status and method colors only affect their own schemes; the others replace the base theme's schemes.
-            surfaceChanged |= !entry.Get(palette).Equals(color) && entry.Key is not ("success" or "warning" or "get" or "post" or "put" or "patch" or "delete" or "otherMethods");
+            // Status, method and script colors only affect their own schemes and the script editors; the others replace
+            // the base theme's schemes.
+            surfaceChanged |= !entry.Get(palette).Equals(color)
+                              && entry.Key is not ("success" or "warning" or "get" or "post" or "put" or "patch" or "delete" or "otherMethods")
+                              && !ThemePalette.IsSyntaxKey(entry.Key);
             palette = entry.With(palette, color);
         }
 

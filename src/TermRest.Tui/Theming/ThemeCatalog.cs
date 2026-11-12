@@ -211,7 +211,7 @@ public static class ThemeCatalog
                 continue;
             }
 
-            var palette = ThemePalette.FromSchemes(schemes, StatusAndMethodColors(name, schemes));
+            var palette = ThemePalette.FromSchemes(schemes, TermRestColors(name, schemes));
             var all = schemes.ToDictionary(p => p.Key, p => new Scheme(p.Value), StringComparer.Ordinal);
             all[SuccessScheme] = palette.StatusScheme(palette.Success);
             all[WarningScheme] = palette.StatusScheme(palette.Warning);
@@ -242,18 +242,25 @@ public static class ThemeCatalog
         _ => "A Terminal.Gui theme.",
     };
 
-    /// <summary>Colors for response statuses and HTTP methods that suit a Terminal.Gui theme.</summary>
-    private static ThemePalette StatusAndMethodColors(string name, Dictionary<string, Scheme> schemes)
+    /// <summary>TermRest's own colors (response statuses, HTTP methods, scripts) to suit a Terminal.Gui theme.</summary>
+    private static ThemePalette TermRestColors(string name, Dictionary<string, Scheme> schemes)
     {
         if (name is "Green Phosphor" or "Amber Phosphor" or "8-Bit")
         {
             var text = schemes["Base"].Normal.Foreground;
-            return new ThemePalette { Success = text, Warning = text, Get = text, Post = text, Put = text, Patch = text, Delete = text, OtherMethods = text };
+            var monochrome = new ThemePalette { Success = text, Warning = text, Get = text, Post = text, Put = text, Patch = text, Delete = text, OtherMethods = text };
+
+            // A phosphor screen has brightness only: comments dim, keywords bright.
+            return name == "8-Bit" ? monochrome : monochrome with
+            {
+                SyntaxComment = schemes["Base"].Disabled.Foreground,
+                SyntaxKeyword = C(name == "Green Phosphor" ? "#99ffc2" : "#ffe08a"),
+            };
         }
 
         var background = schemes["Base"].Normal.Background;
         var light = name == "Light" || (!background.Equals(Color.None) && !background.IsDarkColor());
-        return light
+        var colors = light
             ? new ThemePalette
             {
                 Success = C("#1b7f2a"), Warning = C("#a35c00"), Get = C("#1b7f2a"), Post = C("#a35c00"), Put = C("#1d4ed8"),
@@ -264,7 +271,34 @@ public static class ThemeCatalog
                 Success = C("BrightGreen"), Warning = C("BrightYellow"), Get = C("BrightGreen"), Post = C("BrightYellow"), Put = C("BrightCyan"),
                 Patch = C("BrightMagenta"), Delete = C("BrightRed"), OtherMethods = C("Gray"),
             };
+        return colors.WithSyntaxOf(SyntaxColors(schemes["Base"].Editable.Background));
     }
+
+    /// <summary>Script colors that are easy to read on an editor's <paramref name="background"/> (None: the terminal's, taken as dark).</summary>
+    private static ThemePalette SyntaxColors(Color background) =>
+        (background.Equals(Color.None) ? 0 : ThemePalette.Luminance(background)) switch
+        {
+            // Dark: VS Code's Dark+ colors.
+            < 0.05 => new ThemePalette
+            {
+                SyntaxComment = C("#6a9955"), SyntaxKeyword = C("#569cd6"), SyntaxString = C("#ce9178"), SyntaxNumber = C("#b5cea8"),
+                SyntaxVariable = C("#9cdcfe"), SyntaxFunction = C("#dcdcaa"), SyntaxType = C("#4ec9b0"), SyntaxParameter = C("#c586c0"),
+            },
+
+            // Mid gray, like Default's and Anders' fields: light colors.
+            < 0.4 => new ThemePalette
+            {
+                SyntaxComment = C("Silver"), SyntaxKeyword = C("Yellow"), SyntaxString = C("#a0ffa0"), SyntaxNumber = C("#ffc0ff"),
+                SyntaxVariable = C("#c0ffff"), SyntaxFunction = C("#ffe0a0"), SyntaxType = C("#a0e0ff"), SyntaxParameter = C("#ffd0d0"),
+            },
+
+            // Light: VS Code's Light+ colors.
+            _ => new ThemePalette
+            {
+                SyntaxComment = C("#008000"), SyntaxKeyword = C("#0000ff"), SyntaxString = C("#a31515"), SyntaxNumber = C("#098658"),
+                SyntaxVariable = C("#001080"), SyntaxFunction = C("#795e26"), SyntaxType = C("#267f99"), SyntaxParameter = C("#af00db"),
+            },
+        };
 
     /// <summary>TermRest's palette themes.</summary>
     private static IEnumerable<(string Name, string Description, ThemePalette Palette)> Palettes()
@@ -276,6 +310,8 @@ public static class ThemeCatalog
             Bar = C("#21222c"), BarText = C("#f8f8f2"), Dialog = C("#343746"), DialogText = C("#f8f8f2"),
             Success = C("#50fa7b"), Warning = C("#ffb86c"), Error = C("#ff5555"),
             Get = C("#50fa7b"), Post = C("#ffb86c"), Put = C("#8be9fd"), Patch = C("#bd93f9"), Delete = C("#ff5555"), OtherMethods = C("#f1fa8c"),
+            SyntaxComment = C("#6272a4"), SyntaxKeyword = C("#ff79c6"), SyntaxString = C("#f1fa8c"), SyntaxNumber = C("#bd93f9"),
+            SyntaxVariable = C("#bd93f9"), SyntaxFunction = C("#50fa7b"), SyntaxType = C("#8be9fd"), SyntaxParameter = C("#ffb86c"),
         });
         yield return ("Gruvbox Dark", "Warm retro colors, from the Gruvbox palette.", new ThemePalette
         {
@@ -284,6 +320,8 @@ public static class ThemeCatalog
             Bar = C("#3c3836"), BarText = C("#ebdbb2"), Dialog = C("#3c3836"), DialogText = C("#ebdbb2"),
             Success = C("#b8bb26"), Warning = C("#fabd2f"), Error = C("#fb4934"),
             Get = C("#b8bb26"), Post = C("#fe8019"), Put = C("#83a598"), Patch = C("#d3869b"), Delete = C("#fb4934"), OtherMethods = C("#8ec07c"),
+            SyntaxComment = C("#928374"), SyntaxKeyword = C("#fb4934"), SyntaxString = C("#b8bb26"), SyntaxNumber = C("#d3869b"),
+            SyntaxVariable = C("#83a598"), SyntaxFunction = C("#8ec07c"), SyntaxType = C("#fabd2f"), SyntaxParameter = C("#fe8019"),
         });
         yield return ("High Contrast", "Maximum contrast: white on black, yellow focus.", new ThemePalette
         {
@@ -292,6 +330,8 @@ public static class ThemeCatalog
             Bar = C("Black"), BarText = C("White"), Dialog = C("Black"), DialogText = C("White"),
             Success = C("BrightGreen"), Warning = C("BrightYellow"), Error = C("BrightRed"),
             Get = C("BrightGreen"), Post = C("BrightYellow"), Put = C("BrightCyan"), Patch = C("BrightMagenta"), Delete = C("BrightRed"), OtherMethods = C("White"),
+            SyntaxComment = C("#b0b0b0"), SyntaxKeyword = C("#5fd7ff"), SyntaxString = C("#87ff87"), SyntaxNumber = C("#ff87ff"),
+            SyntaxVariable = C("#ffaf5f"), SyntaxFunction = C("#ffff5f"), SyntaxType = C("#5fffd7"), SyntaxParameter = C("#d7afff"),
         });
         yield return ("Monokai", "The classic Monokai editor colors.", new ThemePalette
         {
@@ -300,6 +340,8 @@ public static class ThemeCatalog
             Bar = C("#3e3d32"), BarText = C("#f8f8f2"), Dialog = C("#3e3d32"), DialogText = C("#f8f8f2"),
             Success = C("#a6e22e"), Warning = C("#e6db74"), Error = C("#f92672"),
             Get = C("#a6e22e"), Post = C("#fd971f"), Put = C("#66d9ef"), Patch = C("#ae81ff"), Delete = C("#f92672"), OtherMethods = C("#e6db74"),
+            SyntaxComment = C("#75715e"), SyntaxKeyword = C("#f92672"), SyntaxString = C("#e6db74"), SyntaxNumber = C("#ae81ff"),
+            SyntaxVariable = C("#ae81ff"), SyntaxFunction = C("#a6e22e"), SyntaxType = C("#66d9ef"), SyntaxParameter = C("#fd971f"),
         });
         yield return ("Nord", "Cool arctic blues, from the Nord palette.", new ThemePalette
         {
@@ -308,6 +350,8 @@ public static class ThemeCatalog
             Bar = C("#3b4252"), BarText = C("#e5e9f0"), Dialog = C("#3b4252"), DialogText = C("#e5e9f0"),
             Success = C("#a3be8c"), Warning = C("#ebcb8b"), Error = C("#bf616a"),
             Get = C("#a3be8c"), Post = C("#ebcb8b"), Put = C("#81a1c1"), Patch = C("#b48ead"), Delete = C("#bf616a"), OtherMethods = C("#8fbcbb"),
+            SyntaxComment = C("#616e88"), SyntaxKeyword = C("#81a1c1"), SyntaxString = C("#a3be8c"), SyntaxNumber = C("#b48ead"),
+            SyntaxVariable = C("#ebcb8b"), SyntaxFunction = C("#88c0d0"), SyntaxType = C("#8fbcbb"), SyntaxParameter = C("#d08770"),
         });
         yield return ("Solarized Dark", "Ethan Schoonover's Solarized, dark.", new ThemePalette
         {
@@ -316,6 +360,8 @@ public static class ThemeCatalog
             Bar = C("#073642"), BarText = C("#93a1a1"), Dialog = C("#073642"), DialogText = C("#93a1a1"),
             Success = C("#859900"), Warning = C("#b58900"), Error = C("#dc322f"),
             Get = C("#859900"), Post = C("#b58900"), Put = C("#268bd2"), Patch = C("#6c71c4"), Delete = C("#dc322f"), OtherMethods = C("#2aa198"),
+            SyntaxComment = C("#586e75"), SyntaxKeyword = C("#859900"), SyntaxString = C("#2aa198"), SyntaxNumber = C("#d33682"),
+            SyntaxVariable = C("#6c71c4"), SyntaxFunction = C("#268bd2"), SyntaxType = C("#b58900"), SyntaxParameter = C("#cb4b16"),
         });
         yield return ("Solarized Light", "Ethan Schoonover's Solarized, light.", new ThemePalette
         {
@@ -324,6 +370,8 @@ public static class ThemeCatalog
             Bar = C("#eee8d5"), BarText = C("#586e75"), Dialog = C("#eee8d5"), DialogText = C("#586e75"),
             Success = C("#859900"), Warning = C("#cb4b16"), Error = C("#dc322f"),
             Get = C("#859900"), Post = C("#cb4b16"), Put = C("#268bd2"), Patch = C("#6c71c4"), Delete = C("#dc322f"), OtherMethods = C("#2aa198"),
+            SyntaxComment = C("#93a1a1"), SyntaxKeyword = C("#859900"), SyntaxString = C("#2aa198"), SyntaxNumber = C("#d33682"),
+            SyntaxVariable = C("#6c71c4"), SyntaxFunction = C("#268bd2"), SyntaxType = C("#b58900"), SyntaxParameter = C("#cb4b16"),
         });
     }
 

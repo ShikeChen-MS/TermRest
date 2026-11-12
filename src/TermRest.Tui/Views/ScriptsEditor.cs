@@ -7,9 +7,9 @@ namespace TermRest.Tui.Views;
 /// <summary>
 /// Pre-request and post-response scripts in each language: the Scripts tab of a request, and the scripts of a collection
 /// or folder (<see cref="Dialogs.ScriptsDialog"/>). <c>Language</c> chooses the scripts shown (a • marks the languages
-/// that have some). A request's tab also says how it runs them: in which language (<c>Run in</c>: Auto is the first of
-/// the user's order with all of them), and whether its pre-request and post-response scripts run, its collection's and
-/// folders' too (the boxes above them).
+/// that have some), with that language's syntax colored. A request's tab also says how it runs them: in which language
+/// (<c>Run in</c>: Auto is the first of the user's order with all of them), and whether its pre-request and post-response
+/// scripts run, its collection's and folders' too (the boxes above them).
 /// </summary>
 internal sealed class ScriptsEditor : View
 {
@@ -71,8 +71,8 @@ internal sealed class ScriptsEditor : View
             top = 3;
         }
 
-        _preRequest = new TextArea { X = 0, Y = top + 1, Width = Dim.Percent(50), Height = Dim.Fill() };
-        _test = new TextArea { X = Pos.Right(_preRequest) + 1, Y = top + 1, Width = Dim.Fill(), Height = Dim.Fill() };
+        _preRequest = new TextArea { X = 0, Y = top + 1, Width = Dim.Percent(50), Height = Dim.Fill(), SyntaxLanguage = _editing };
+        _test = new TextArea { X = Pos.Right(_preRequest) + 1, Y = top + 1, Width = Dim.Fill(), Height = Dim.Fill(), SyntaxLanguage = _editing };
         _preRequest.UserEdited += (_, _) => OnEdited();
         _test.UserEdited += (_, _) => OnEdited();
         if (forRequest)
@@ -156,6 +156,7 @@ internal sealed class ScriptsEditor : View
             _language.Labels = LanguageLabels();
             _language.Value = ScriptLanguage.Rank(language);
             var scripts = _scripts.GetValueOrDefault(language);
+            _preRequest.SyntaxLanguage = _test.SyntaxLanguage = language;
             _preRequest.SetText(scripts?.PreRequest ?? "");
             _test.SetText(scripts?.Test ?? "");
         }

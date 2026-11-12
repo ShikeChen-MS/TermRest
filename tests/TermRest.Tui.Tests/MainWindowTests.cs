@@ -878,6 +878,52 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
+    public void Scripts_are_colored_by_their_language_in_the_theme_s_script_colors()
+    {
+        var dracula = ThemeCatalog.Find(ThemeCatalog.BuiltIn, "Dracula")!;
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        Attribute keyword, plain, comment, command, parameter, variable, unreadable;
+        try
+        {
+            ThemeCatalog.Apply(dracula);
+            ui.Click("POST POST JSON");
+            ui.Click("Scripts");
+            var editor = ui.Find("Pre-request (before sending)") + new Size(2, 1);
+            ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(editor));
+            ui.Type("if ok: # done");
+            var python = ui.Find("if ok: # done");
+            (keyword, plain, comment) = (CellAt(ui, python.X, python.Y), CellAt(ui, python.X + 3, python.Y), CellAt(ui, python.X + 7, python.Y));
+
+            ui.Click("○ PowerShell");
+            ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(editor));
+            ui.Type("Get-Item -Path $x");
+            var powerShell = ui.Find("Get-Item -Path $x");
+            (command, parameter, variable) = (CellAt(ui, powerShell.X, powerShell.Y), CellAt(ui, powerShell.X + 9, powerShell.Y), CellAt(ui, powerShell.X + 15, powerShell.Y));
+
+            // A script color that would not show on the editor's background is drawn in the text color.
+            ThemeCatalog.Apply(new ColorTheme { Name = "Unreadable", Palette = dracula.Palette with { SyntaxParameter = dracula.Palette.Input }, Schemes = dracula.Schemes });
+            ui.Screen();
+            unreadable = CellAt(ui, powerShell.X + 9, powerShell.Y);
+        }
+        finally
+        {
+            ui.App.InjectKey(Key.S.WithCtrl); // saved, so closing does not ask about unsaved changes
+            ui.App.End(token!);
+            ThemeCatalog.Apply(ThemeCatalog.BuiltIn[0]);
+        }
+
+        var palette = dracula.Palette;
+        Assert.Equal(new Attribute(palette.SyntaxKeyword, palette.Input), keyword);
+        Assert.Equal(new Attribute(palette.Text, palette.Input), plain);
+        Assert.Equal(new Attribute(palette.SyntaxComment, palette.Input), comment);
+        Assert.Equal(new Attribute(palette.SyntaxFunction, palette.Input), command);
+        Assert.Equal(new Attribute(palette.SyntaxParameter, palette.Input), parameter);
+        Assert.Equal(new Attribute(palette.SyntaxVariable, palette.Input), variable);
+        Assert.Equal(new Attribute(palette.Text, palette.Input), unreadable);
+    }
+
+    [Fact]
     public async Task CSharp_scripts_are_built_and_run_by_the_chosen_dotnet()
     {
         var dotnet = TestCSharp.Require();

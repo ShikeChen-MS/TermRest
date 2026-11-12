@@ -1,4 +1,5 @@
 using Terminal.Gui.Drawing;
+using TermRest.Tui.Syntax;
 using Attribute = Terminal.Gui.Drawing.Attribute;
 
 namespace TermRest.Tui.Theming;
@@ -69,6 +70,30 @@ public sealed record ThemePalette
     /// <summary>Other method labels (HEAD, OPTIONS …).</summary>
     public Color OtherMethods { get; init; } = Color.None;
 
+    /// <summary>Comments in scripts. Script colors left at None are drawn like the rest of the script.</summary>
+    public Color SyntaxComment { get; init; } = Color.None;
+
+    /// <summary>Keywords in scripts, and PowerShell's operators (-eq …).</summary>
+    public Color SyntaxKeyword { get; init; } = Color.None;
+
+    /// <summary>Strings in scripts.</summary>
+    public Color SyntaxString { get; init; } = Color.None;
+
+    /// <summary>Numbers and constants (true, null, None …) in scripts.</summary>
+    public Color SyntaxNumber { get; init; } = Color.None;
+
+    /// <summary>PowerShell's variables ($name).</summary>
+    public Color SyntaxVariable { get; init; } = Color.None;
+
+    /// <summary>Functions called or defined in scripts, PowerShell's commands and Python's decorators.</summary>
+    public Color SyntaxFunction { get; init; } = Color.None;
+
+    /// <summary>Types in scripts: the names after class or new, PowerShell's [types].</summary>
+    public Color SyntaxType { get; init; } = Color.None;
+
+    /// <summary>PowerShell's parameters (-Name).</summary>
+    public Color SyntaxParameter { get; init; } = Color.None;
+
     /// <summary>The palette's colors by their name in theme files (camelCase).</summary>
     internal static IReadOnlyList<(string Key, Func<ThemePalette, Color> Get, Func<ThemePalette, Color, ThemePalette> With)> Keys { get; } =
     [
@@ -92,7 +117,55 @@ public sealed record ThemePalette
         ("patch", p => p.Patch, (p, c) => p with { Patch = c }),
         ("delete", p => p.Delete, (p, c) => p with { Delete = c }),
         ("otherMethods", p => p.OtherMethods, (p, c) => p with { OtherMethods = c }),
+        ("syntaxComment", p => p.SyntaxComment, (p, c) => p with { SyntaxComment = c }),
+        ("syntaxKeyword", p => p.SyntaxKeyword, (p, c) => p with { SyntaxKeyword = c }),
+        ("syntaxString", p => p.SyntaxString, (p, c) => p with { SyntaxString = c }),
+        ("syntaxNumber", p => p.SyntaxNumber, (p, c) => p with { SyntaxNumber = c }),
+        ("syntaxVariable", p => p.SyntaxVariable, (p, c) => p with { SyntaxVariable = c }),
+        ("syntaxFunction", p => p.SyntaxFunction, (p, c) => p with { SyntaxFunction = c }),
+        ("syntaxType", p => p.SyntaxType, (p, c) => p with { SyntaxType = c }),
+        ("syntaxParameter", p => p.SyntaxParameter, (p, c) => p with { SyntaxParameter = c }),
     ];
+
+    /// <summary>Whether a palette key is a script color (which only the script editors use, not the schemes).</summary>
+    internal static bool IsSyntaxKey(string key) => key.StartsWith("syntax", StringComparison.Ordinal);
+
+    /// <summary>This palette with the script colors of <paramref name="other"/>.</summary>
+    internal ThemePalette WithSyntaxOf(ThemePalette other) =>
+        Keys.Where(k => IsSyntaxKey(k.Key)).Aggregate(this, (palette, k) => k.With(palette, k.Get(other)));
+
+    /// <summary>The color of script text of <paramref name="kind"/> (None: like the rest of the script).</summary>
+    internal Color SyntaxColor(SyntaxKind kind) => kind switch
+    {
+        SyntaxKind.Comment => SyntaxComment,
+        SyntaxKind.Keyword => SyntaxKeyword,
+        SyntaxKind.String => SyntaxString,
+        SyntaxKind.Number => SyntaxNumber,
+        SyntaxKind.Variable => SyntaxVariable,
+        SyntaxKind.Function => SyntaxFunction,
+        SyntaxKind.Type => SyntaxType,
+        SyntaxKind.Parameter => SyntaxParameter,
+        _ => Color.None,
+    };
+
+    /// <summary>The contrast ratio of two colors as WCAG defines it: 1 for the same color, up to 21 for black and white.</summary>
+    internal static double Contrast(Color a, Color b)
+    {
+        var (la, lb) = (Luminance(a), Luminance(b));
+        return (Math.Max(la, lb) + 0.05) / (Math.Min(la, lb) + 0.05);
+    }
+
+    /// <summary>The relative luminance of a color: 0 for black, 1 for white.</summary>
+    internal static double Luminance(Color color)
+    {
+        return (0.2126 * Linear(color.R)) + (0.7152 * Linear(color.G)) + (0.0722 * Linear(color.B));
+
+        static double Linear(byte channel)
+        {
+            var value = channel / 255.0;
+            return value <= 0.04045 ? value / 12.92 : Math.Pow((value + 0.055) / 1.055, 2.4);
+        }
+    }
 
     /// <summary>The color of an HTTP method's label.</summary>
     public Color MethodColor(string method) => method.ToUpperInvariant() switch
@@ -134,13 +207,16 @@ public sealed record ThemePalette
     /// <summary>The scheme of a response status shown in <paramref name="color"/>.</summary>
     internal Scheme StatusScheme(Color color) => new(new Attribute(color, Background, TextStyle.Bold));
 
-    /// <summary>A palette that matches existing schemes (for themes defined by their schemes, like Terminal.Gui's own).</summary>
-    internal static ThemePalette FromSchemes(IReadOnlyDictionary<string, Scheme> schemes, ThemePalette statusAndMethods)
+    /// <summary>
+    /// A palette that matches existing schemes (for themes defined by their schemes, like Terminal.Gui's own), with the
+    /// status, method and script colors of <paramref name="termRestColors"/>.
+    /// </summary>
+    internal static ThemePalette FromSchemes(IReadOnlyDictionary<string, Scheme> schemes, ThemePalette termRestColors)
     {
         var main = schemes["Base"];
         var menu = schemes["Menu"];
         var dialog = schemes["Dialog"];
-        return statusAndMethods with
+        return termRestColors with
         {
             Background = main.Normal.Background,
             Text = main.Normal.Foreground,

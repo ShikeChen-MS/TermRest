@@ -3,6 +3,7 @@ using Terminal.Gui.App;
 using Terminal.Gui.Drawing;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
+using TermRest.Core.Scripting;
 using TermRest.Core.Workspace;
 using TermRest.Tui.Theming;
 using TermRest.Tui.Views;
@@ -18,6 +19,9 @@ internal static class ThemeDialog
 {
     private static readonly string[] SampleMethods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
 
+    /// <summary>A script with every kind of script color.</summary>
+    private const string SampleScript = "# Script colors\n[int]$expected = 200\nif ($tr.Response.Status -eq $expected) { Write-Host \"ok\" -NoNewline }";
+
     /// <summary>Returns the theme chosen, or null when cancelled (the previous theme is restored then).</summary>
     public static ColorTheme? Show(IApplication app, ApiWorkspace workspace, string? userDirectory = null)
     {
@@ -32,7 +36,7 @@ internal static class ThemeDialog
         list.SetSource(names);
         var details = new TextArea { X = Pos.Right(list) + 2, Y = 1, Width = Dim.Fill(1), Height = 8, ReadOnly = true, WordWrap = true, ScrollBars = false };
 
-        // The main-area colors with the method and status colors of the theme (the dialog itself shows dialog colors).
+        // The main-area colors with the method, status and script colors of the theme (the dialog itself shows dialog colors).
         var preview = new FrameView { Title = "Preview", X = Pos.Right(list) + 2, Y = Pos.Bottom(details), Width = Dim.Fill(1), Height = Dim.Fill(4), SchemeName = "Base" };
         var methods = SampleMethods
             .Select(m => new Label { Text = m, Y = 0 })
@@ -48,7 +52,9 @@ internal static class ThemeDialog
         var field = new TextField { Text = "An input field", X = 1, Y = 4, Width = 24 };
         var disabled = new Label { Text = "Disabled text", X = Pos.Right(field) + 3, Y = 4, Enabled = false };
         var button = new Button { Text = "Button", X = 1, Y = 6 };
-        preview.Add([.. methods, success, warning, failure, field, disabled, button]);
+        var script = new TextArea { X = 1, Y = 8, Width = Dim.Fill(1), Height = 3, CanFocus = false, ScrollBars = false, SyntaxLanguage = ScriptLanguage.PowerShell };
+        script.SetText(SampleScript);
+        preview.Add([.. methods, success, warning, failure, field, disabled, button, script]);
 
         var workspaceOnly = new CheckBox
         {
