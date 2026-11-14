@@ -95,7 +95,7 @@ internal static class ValidateCommand
                     Output.Status($"✓ {path}: {summary}; every file converts losslessly", true);
 
                     // Unreadable files are reported as load warnings; hidden non-HTTP requests are fine.
-                    return collection.LoadWarnings.All(w => w.Contains("non-HTTP", StringComparison.Ordinal));
+                    return !collection.HasUnreadableFiles;
                 }
 
                 Output.Status($"✗ {path}: {summary}; {problems.Count} file(s) would change when edited", false);

@@ -99,7 +99,7 @@ internal static class ConvertCommand
 
         // Files that could not be read (a definition with the collection's auth, variables and scripts, say) would be
         // missing from the converted collection; the note about hidden non-HTTP requests is no such problem.
-        if (source.LoadWarnings.Any(w => !w.Contains("non-HTTP", StringComparison.Ordinal)))
+        if (source.HasUnreadableFiles)
         {
             Output.Error($"Files of '{source.Name}' could not be read (see the warnings above), so nothing was written: the converted collection would lack what they hold.");
             return 1;

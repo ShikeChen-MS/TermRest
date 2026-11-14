@@ -73,13 +73,16 @@ public class RedactionTests
     [Fact]
     public void Extra_names_from_the_settings_are_compared_without_case_and_separators()
     {
-        var extra = SecretNames.NormalizeAll(["Tenant-Key", "ssn"]);
+        var extra = SecretNames.NormalizeAll(["Tenant-Key", "ssn", "Access-Control-Allow-Credentials"]);
 
         Assert.True(SecretNames.IsSecret("x_tenant_key", NameKind.Field, extra));
         Assert.True(SecretNames.IsSecret("X-Tenant-Key", NameKind.Header, extra));
         Assert.True(SecretNames.IsSecret("SSN", NameKind.Header, extra));
         Assert.False(SecretNames.IsSecret("tenant", NameKind.Field, extra));
         Assert.False(SecretNames.IsSecret("tenant_key_id", NameKind.Field, extra));
+
+        // Names added in the settings win over those known not to be credentials.
+        Assert.True(SecretNames.IsSecret("Access-Control-Allow-Credentials", NameKind.Header, extra));
     }
 
     [Fact]

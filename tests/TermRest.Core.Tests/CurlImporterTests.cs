@@ -449,6 +449,19 @@ public class CurlImporterTests
     }
 
     [Fact]
+    public void A_powershell_value_that_ends_in_a_backslash_ends_at_its_quote()
+    {
+        // In PowerShell's "…" only ` escapes: \" is a backslash and the closing quote, where the other shells read a quote.
+        var result = CurlImporter.Import("""
+            curl.exe --data-raw "C:\temp\" `
+              https://h/upload
+            """);
+
+        Assert.Equal(ShellDialect.PowerShell, result.Dialect);
+        Assert.Equal(("https://h/upload", "C:\\temp\\"), (result.Spec.Url, result.Spec.Body.Raw));
+    }
+
+    [Fact]
     public void Browser_escapes_of_emoji_keep_the_character()
     {
         // Firefox and Chrome escape text one UTF-16 unit at a time: 😀 is \ud83d\ude00. A lone half is still dropped.

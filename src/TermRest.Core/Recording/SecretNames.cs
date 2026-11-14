@@ -65,12 +65,13 @@ public static class SecretNames
 
     /// <summary>
     /// Whether values named <paramref name="name"/> are credentials. <paramref name="extraNames"/> (normalized) are
-    /// matched like the built-in endings: "tenantkey" matches X-Tenant-Key and tenant_key.
+    /// matched like the built-in endings: "tenantkey" matches X-Tenant-Key and tenant_key. They win over the names known
+    /// not to be credentials (Access-Control-Allow-Credentials), which only change the built-in rules.
     /// </summary>
     public static bool IsSecret(string? name, NameKind kind, IReadOnlySet<string>? extraNames = null)
     {
         var normalized = Normalize(name);
-        if (normalized.Length == 0 || NotSecret.Contains(normalized, StringComparer.Ordinal))
+        if (normalized.Length == 0)
         {
             return false;
         }
@@ -78,6 +79,11 @@ public static class SecretNames
         if (extraNames is not null && extraNames.Any(extra => normalized.EndsWith(extra, StringComparison.Ordinal)))
         {
             return true;
+        }
+
+        if (NotSecret.Contains(normalized, StringComparer.Ordinal))
+        {
+            return false;
         }
 
         if (kind == NameKind.QueryParameter && QueryOnly.Contains(normalized, StringComparer.Ordinal))

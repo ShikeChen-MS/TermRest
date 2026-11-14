@@ -128,6 +128,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             V3 = definition.File?.Json, Baseline = Snapshot(root),
         };
         var hidden = storage.LoadChildren(directory, root, warnings, trees);
+        var unreadable = warnings.Count > 0;
         if (hidden > 0)
         {
             warnings.Add($"{hidden} non-HTTP request(s) (GraphQL, gRPC, WebSocket …) are not shown; their files are left untouched.");
@@ -138,12 +139,14 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             if (System.IO.Directory.EnumerateFileSystemEntries(leftover).Any())
             {
                 warnings.Add($"{Path.GetFileName(leftover)}: a save that did not finish left files here; move them back into the collection.");
+                unreadable = true;
             }
         }
 
         storage._style = YamlStyle.Detect(trees);
         var collection = PostmanCollection.FromStorage(root, directory, storage);
         collection.LoadWarnings.AddRange(warnings);
+        collection.HasUnreadableFiles = unreadable;
         return collection;
     }
 

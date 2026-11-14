@@ -97,12 +97,15 @@ public sealed class CommandLineTests
             ("postman/collections/Api/.resources/definition.yaml", "<<<<<<< HEAD\n$kind: collection\n=======\n$kind: collection\ndescription: theirs\n>>>>>>> theirs\n"),
             ("postman/collections/Api/Ping.request.yaml", HttpRequestYaml(server.BaseUrl + "/echo/ping")),
             ("postman/collections/Sockets/.resources/definition.yaml", "$kind: collection\n"),
-            ("postman/collections/Sockets/Stream.request.yaml", "$kind: websocket-request\nurl: wss://h/stream\n"));
+            ("postman/collections/Sockets/Stream.request.yaml", "$kind: websocket-request\nurl: wss://h/stream\n"),
+            ("postman/collections/Named/Ping.request.yaml", HttpRequestYaml(server.BaseUrl + "/echo/ping")),
+            ("postman/collections/Named/non-HTTP.request.yaml", "<<<<<<< HEAD\n$kind: http-request\n=======\n$kind: http-request\nurl: https://h/theirs\n>>>>>>> theirs\n"));
         var broken = Path.Combine(root, "postman", "collections", "Api");
 
         var run = await Termrest.RunAsync(["run", broken]);
         var send = await Termrest.RunAsync(["send", broken, "Ping"]);
         var hiddenRequestsOnly = await Termrest.RunAsync(["run", Path.Combine(root, "postman", "collections", "Sockets")]);
+        var namedLikeTheNote = await Termrest.RunAsync(["run", Path.Combine(root, "postman", "collections", "Named")]);
 
         // The request itself passes, but the collection's definition (its auth and scripts) was not read.
         Assert.True(run.ExitCode == 1, run.ToString());
@@ -111,6 +114,10 @@ public sealed class CommandLineTests
         Assert.True(send.ExitCode == 1, send.ToString());
         Assert.Contains("/echo/ping", send.Text, StringComparison.Ordinal);
         Assert.True(hiddenRequestsOnly.ExitCode == 0, hiddenRequestsOnly.ToString());
+
+        // A file whose name holds "non-HTTP" is no note about hidden requests.
+        Assert.True(namedLikeTheNote.ExitCode == 1, namedLikeTheNote.ToString());
+        Assert.Contains("non-HTTP.request.yaml", namedLikeTheNote.Error, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -527,12 +534,18 @@ public sealed class CommandLineTests
             ("postman/collections/Api/.resources/definition.yaml", "<<<<<<< HEAD\n$kind: collection\n=======\n$kind: collection\ndescription: theirs\n>>>>>>> theirs\n"),
             ("postman/collections/Api/Ping.request.yaml", HttpRequestYaml("https://h/ping")),
             ("postman/collections/Sockets/Ping.request.yaml", HttpRequestYaml("https://h/ping")),
-            ("postman/collections/Sockets/Stream.request.yaml", "$kind: websocket-request\nurl: wss://h/stream\n"));
+            ("postman/collections/Sockets/Stream.request.yaml", "$kind: websocket-request\nurl: wss://h/stream\n"),
+            ("postman/collections/Named/Ping.request.yaml", HttpRequestYaml("https://h/ping")),
+            ("postman/collections/Named/non-HTTP.request.yaml", "<<<<<<< HEAD\n$kind: http-request\n=======\n$kind: http-request\nurl: https://h/theirs\n>>>>>>> theirs\n"));
         var api = Path.Combine(root, "api.postman_collection.json");
         var sockets = Path.Combine(root, "sockets.postman_collection.json");
+        var named = Path.Combine(root, "named.postman_collection.json");
+        var namedFolder = Path.Combine(root, "postman", "collections", "Named");
 
         var broken = await Termrest.RunAsync(["convert", Path.Combine(root, "postman", "collections", "Api"), "-o", api]);
         var hiddenRequestsOnly = await Termrest.RunAsync(["convert", Path.Combine(root, "postman", "collections", "Sockets"), "-o", sockets]);
+        var namedLikeTheNote = await Termrest.RunAsync(["convert", namedFolder, "-o", named]);
+        var validated = await Termrest.RunAsync(["validate", namedFolder]);
 
         // The collection's definition (its auth, variables and scripts) was not read: converting it would lose them.
         Assert.True(broken.ExitCode == 1, broken.ToString());
@@ -540,6 +553,11 @@ public sealed class CommandLineTests
         Assert.False(File.Exists(api));
         Assert.True(hiddenRequestsOnly.ExitCode == 0, hiddenRequestsOnly.ToString());
         Assert.True(File.Exists(sockets));
+
+        // A file whose name holds "non-HTTP" is no note about hidden requests.
+        Assert.True(namedLikeTheNote.ExitCode == 1, namedLikeTheNote.ToString());
+        Assert.False(File.Exists(named));
+        Assert.True(validated.ExitCode == 1, validated.ToString());
     }
 
     [Fact]

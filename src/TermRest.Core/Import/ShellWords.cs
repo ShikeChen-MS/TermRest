@@ -23,7 +23,7 @@ public static class ShellWords
 {
     /// <summary>
     /// Guesses the shell from continuation characters and Windows-only escapes outside quoted values (see
-    /// <see cref="FindMarks"/>); defaults to POSIX.
+    /// <see cref="FindMarks"/> and <see cref="HasPowerShellContinuation"/>); defaults to POSIX.
     /// </summary>
     public static ShellDialect Detect(string text)
     {
@@ -41,6 +41,11 @@ public static class ShellWords
         if (marks.Backslash)
         {
             return ShellDialect.Posix;
+        }
+
+        if (HasPowerShellContinuation(text))
+        {
+            return ShellDialect.PowerShell;
         }
 
         var start = text.TrimStart();
@@ -129,6 +134,44 @@ public static class ShellWords
         }
 
         return i;
+    }
+
+    /// <summary>
+    /// Whether a ` ends a line outside quoted values as PowerShell reads them: '…' ('' inside one ends it and starts another)
+    /// and "…", where only ` escapes. A \ before the closing quote is a character there ("C:\temp\"), where
+    /// <see cref="FindMarks"/> takes the value for one that goes on, past the ` that ends its line.
+    /// </summary>
+    private static bool HasPowerShellContinuation(string text)
+    {
+        for (var i = 0; i < text.Length; i++)
+        {
+            switch (text[i])
+            {
+                case '`':
+                    if (NewlineLength(text, i + 1) > 0)
+                    {
+                        return true;
+                    }
+
+                    i++;
+                    break;
+                case '\'':
+                    i = QuotedEnd(text, i + 1, '\'', "");
+                    break;
+                case '"':
+                    i = QuotedEnd(text, i + 1, '"', "`");
+                    break;
+                case '#' when i == 0 || IsBlank(text[i - 1]):
+                    while (i + 1 < text.Length && text[i + 1] != '\n')
+                    {
+                        i++;
+                    }
+
+                    break;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>Length of the line break starting at <paramref name="index"/> (LF or CRLF), or 0.</summary>

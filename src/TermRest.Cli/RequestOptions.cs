@@ -287,7 +287,7 @@ internal sealed class RequestOptions
     /// </summary>
     public static bool ReportUnreadableFiles(PostmanCollection collection)
     {
-        if (collection.LoadWarnings.All(w => w.Contains("non-HTTP", StringComparison.Ordinal)))
+        if (!collection.HasUnreadableFiles)
         {
             return false;
         }

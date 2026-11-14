@@ -52,6 +52,13 @@ public sealed class PostmanCollection
     public List<string> LoadWarnings { get; } = [];
 
     /// <summary>
+    /// Whether files of the collection could not be read (their warnings are in <see cref="LoadWarnings"/>): it may lack
+    /// requests, or the auth, variables and scripts of a definition. The note about non-HTTP requests that are not shown is
+    /// no such problem.
+    /// </summary>
+    public bool HasUnreadableFiles { get; internal set; }
+
+    /// <summary>
     /// For a v3 collection: the column at which new and changed values are wrapped when saving (0: never); null (the
     /// default) follows the collection's files. See <see cref="Workspace.WorkspaceSettings.YamlLineWidth"/>. JSON
     /// collections ignore it.
