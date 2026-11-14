@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text.Json.Nodes;
 using TermRest.Core.Http;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
@@ -194,6 +196,80 @@ public class PowerShellScriptingTests
     }
 
     [Fact]
+    public async Task Host_output_keeps_its_place_among_the_script_output_without_colors()
+    {
+        var pwsh = TestPowerShell.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetPowerShellRuntime(pwsh);
+
+        var exchange = await runner.SendAsync(collection, null, PowerShell(server.Url("echo"), test: """
+            Write-Host 'before'
+            [pscustomobject] @{ id = 1; name = 'Ada' } | Format-Table id, name | Out-Host
+            [Console]::Write('console ')
+            [Console]::WriteLine('line')
+            Write-Host 'after'
+            """), _ct);
+
+        Assert.True(exchange.Scripts!.Error is null, exchange.Scripts.Describe());
+        var lines = exchange.Scripts.Logs.Select(l => l.Text.TrimEnd()).Where(l => l.Length > 0).ToList();
+        Assert.Equal("before", lines[0]);
+        Assert.Contains("id name", lines); // PowerShell 7.2 and later color table headers on a terminal
+        Assert.Equal(["console line", "after"], lines.TakeLast(2));
+        Assert.DoesNotContain(lines, l => l.Contains('\u001b', StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Console_writes_from_parallel_blocks_and_thread_jobs_reach_the_scripts_output()
+    {
+        var pwsh = TestPowerShell.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetPowerShellRuntime(pwsh);
+
+        // They run in runspaces of their own, where a PowerShell class's methods can't run: such a console writer made them
+        // wait for the script, which waited for them, until the time limit stopped PowerShell.
+        var exchange = await runner.SendAsync(collection, null, PowerShell(server.Url("echo"), test: """
+            'a', 'b' | ForEach-Object -Parallel { [Console]::WriteLine("parallel $_") } -ThrottleLimit 2
+            Start-ThreadJob { [Console]::Error.WriteLine('thread job') } | Receive-Job -Wait -AutoRemoveJob
+            Write-Host 'after'
+            """), _ct);
+
+        Assert.True(exchange.Scripts!.Error is null, exchange.Scripts.Describe());
+        var lines = exchange.Scripts.Logs.Select(l => l.Text).ToList();
+        Assert.Equal(["parallel a", "parallel b", "thread job"], lines.SkipLast(1).Order());
+        Assert.Equal("after", lines[^1]);
+    }
+
+    [Fact]
+    public async Task Guids_dates_chars_and_uris_set_in_scripts_are_their_text()
+    {
+        var pwsh = TestPowerShell.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetPowerShellRuntime(pwsh);
+
+        var exchange = await runner.SendAsync(collection, null, PowerShell(server.Url("echo"), preRequest: """
+            $tr.Request.Headers.Set('X-Id', [guid] '3f2504e0-4f89-11d3-9a0c-0305e82c3301')
+            $tr.CollectionVariables.Set('when', [DateTimeOffset]::new(2024, 1, 2, 3, 4, 5, [TimeSpan]::Zero))
+            $tr.CollectionVariables.Set('letter', [char] 'a')
+            $tr.CollectionVariables.Set('site', [uri] 'https://example.org/a%20b')
+            $tr.CollectionVariables.Set('flags', [ordered] @{ on = $true })
+            $tr.CollectionVariables.Set('day', [DateOnly]::new(2024, 1, 2))
+            $tr.CollectionVariables.Set('at', [TimeOnly]::new(3, 4, 5))
+            """), _ct);
+
+        Assert.True(exchange.Scripts!.Error is null, exchange.Scripts.Describe());
+        Assert.Equal("3f2504e0-4f89-11d3-9a0c-0305e82c3301", JsonNode.Parse(exchange.Response!.Body)!["headers"]!["x-id"]!.GetValue<string>());
+        var stored = runner.Session.For(collection);
+        Assert.Equal(("2024-01-02T03:04:05.0000000+00:00", "a", "https://example.org/a%20b", """{"on":true}"""), (stored["when"], stored["letter"], stored["site"], stored["flags"]));
+        Assert.Equal(("2024-01-02", "03:04:05.0000000"), (stored["day"], stored["at"]));
+    }
+
+    [Fact]
     public async Task Programs_that_scripts_start_cannot_disturb_the_worker()
     {
         var pwsh = TestPowerShell.Require();
@@ -212,12 +288,138 @@ public class PowerShellScriptingTests
             $taken = if ($IsWindows) { cmd.exe /c echo taken } else { /bin/sh -c 'echo taken' }
             Write-Host "a child's output, taken: $taken"
             [Console]::WriteLine('captured ünïcödé ✓')
+            if ($IsLinux) {
+                $stat = [System.IO.File]::ReadAllText('/proc/self/stat')
+                $session = [int] $stat.Substring($stat.LastIndexOf(')') + 2).Split(' ')[3]
+                $tr.Globals.Set('session', $(if ($session -eq $PID) { 'its own' } else { "TermRest's" }))
+            }
             """, test: "$tr.Test('still answers', { })"), _ct);
 
         Assert.Equal(200, exchange.Response!.StatusCode);
         Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
         Assert.Equal(["a child reads []", "a child's output, taken: taken", "captured ünïcödé ✓"], exchange.Scripts.Logs.Select(l => l.Text));
         Assert.Equal(["still answers"], exchange.Scripts.Tests.Select(t => t.Name));
+
+        // Nor can they open TermRest's terminal (/dev/tty) to ask for a password over its screen: PowerShell is in a session
+        // of its own, which has none (this test may run without a terminal, so trying to open it would tell nothing).
+        Assert.Equal(OperatingSystem.IsLinux() ? "its own" : null, runner.Session.Globals.GetValueOrDefault("session"));
+    }
+
+    [Fact]
+    public async Task Exit_break_and_continue_end_the_script_not_PowerShell()
+    {
+        var pwsh = TestPowerShell.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        collection.SetScripts(collection.RootNode, new ScriptSet("Write-Host 'collection'\n$tr.Globals.Set('pid', $PID)\nbreak\nWrite-Host 'not reached'", "",
+            ScriptLanguage.PowerShell));
+        var folder = collection.AddFolder(collection.RootNode, "Users");
+        collection.SetScripts(folder, new ScriptSet("if ($true) { continue }\nWrite-Host 'not reached'", "", ScriptLanguage.PowerShell));
+        var request = collection.AddRequest(folder, "Exit", PowerShell(server.Url("echo"),
+            preRequest: "Write-Host 'request'\nif ($tr.Request.Method -eq 'GET') { exit }\nWrite-Host 'not reached'",
+            test: "function Stop { exit 0 }\n$tr.Test('before', { })\nStop\n$tr.Test('not reached', { })"));
+        using var runner = new RequestRunner(workspace);
+        runner.SetPowerShellRuntime(pwsh);
+
+        // Each ends its own script quietly, as exit does a script file (and sys.exit() a Python script): the next ones run.
+        var exchange = await runner.SendAsync(collection, request, request.ReadSpec(), null, _ct);
+
+        Assert.Equal(200, exchange.Response!.StatusCode);
+        Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
+        Assert.Equal(4, exchange.Scripts.Ran);
+        Assert.Equal(["collection", "request"], exchange.Scripts.Logs.Select(l => l.Text));
+        Assert.Equal(["before"], exchange.Scripts.Tests.Select(t => t.Name));
+
+        // An exit code other than 0 fails the script, and the same PowerShell keeps running.
+        var failed = await runner.SendAsync(collection, null, PowerShell(server.Url("echo"), preRequest: "$tr.Globals.Set('again', $PID)\nexit 3"), _ct);
+        Assert.Null(failed.Response);
+        Assert.Equal(("request", "ExitException: 3"), (failed.Scripts!.Error!.Script, failed.Scripts.Error.Message));
+        Assert.Equal(runner.Session.Globals["pid"], runner.Session.Globals["again"]);
+    }
+
+    [Fact]
+    public async Task PowerShell_keeps_only_the_output_it_shows()
+    {
+        var pwsh = TestPowerShell.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetPowerShellRuntime(pwsh);
+
+        // A script that writes without end: what is not shown is counted, not kept in memory.
+        var exchange = await runner.SendAsync(collection, null, PowerShell(server.Url("echo"), test: """
+            'first'
+            $before = [GC]::GetTotalMemory($true)
+            foreach ($i in 1..200000) { "line $i " + ('x' * 100) }
+            foreach ($i in 1..50000) { [Console]::WriteLine("console $i " + ('x' * 100)) }
+            $tr.Globals.Set('kept', [GC]::GetTotalMemory($true) - $before)
+            """), _ct);
+
+        Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
+        Assert.Equal(1000, exchange.Scripts.Logs.Count);
+        Assert.Equal(("first", "line 999 " + new string('x', 100)), (exchange.Scripts.Logs[0].Text, exchange.Scripts.Logs[^1].Text));
+        Assert.Contains("249001 more lines the test scripts printed are not shown.", exchange.Scripts.Notes);
+        Assert.True(long.Parse(runner.Session.Globals["kept"]!, CultureInfo.InvariantCulture) < 12_000_000, runner.Session.Globals["kept"]);
+    }
+
+    [Fact]
+    public async Task Halves_of_emoji_do_not_break_the_answer()
+    {
+        var pwsh = TestPowerShell.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetPowerShellRuntime(pwsh);
+
+        // A line cut at 4,000 characters, not inside an emoji, and a script's own substring of one (not text: it becomes U+FFFD).
+        var exchange = await runner.SendAsync(collection, null, PowerShell(server.Url("echo"), test: """
+            Write-Host (('a' * 3999) + '😀')
+            $half = '😀'.Substring(0, 1)
+            Write-Host ('half ' + $half + ' and a whole 😀')
+            $tr.Test('test ' + $half, { })
+            $tr.Globals.Set('name ' + $half, $half)
+            """), _ct);
+
+        Assert.Equal(200, exchange.Response!.StatusCode);
+        Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
+        Assert.Equal([new string('a', 3999), "half \uFFFD and a whole 😀"], exchange.Scripts.Logs.Select(l => l.Text));
+        Assert.Equal(["test \uFFFD"], exchange.Scripts.Tests.Select(t => t.Name));
+        Assert.Equal("\uFFFD", runner.Session.Globals["name \uFFFD"]);
+    }
+
+    [Fact]
+    public async Task A_body_set_to_bytes_or_a_hashtable_is_sent_as_text()
+    {
+        var pwsh = TestPowerShell.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetPowerShellRuntime(pwsh);
+        async Task<string> SentBody(string preRequest)
+        {
+            var spec = PowerShell(server.Url("echo"), preRequest: preRequest);
+            spec.Method = "POST";
+            spec.Body = new RequestBody { Mode = BodyMode.Raw, Raw = "original" };
+            var exchange = await runner.SendAsync(collection, null, spec, _ct);
+            Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
+            return JsonNode.Parse(exchange.Response!.Body)!["body"]!.GetValue<string>();
+        }
+
+        Assert.Equal("Zoë ✓", await SentBody("$tr.Request.Body = [Text.Encoding]::UTF8.GetBytes('Zoë ✓')"));
+        Assert.Equal("""{"name":"Zoë","n":1}""", await SentBody("$tr.Request.Body = [ordered] @{ name = 'Zoë'; n = 1 }"));
+
+        // A request the scripts left unusable is not sent, and what they did is kept, as in the other languages.
+        var broken = await runner.SendAsync(collection, null, PowerShell(server.Url("echo"), preRequest: """
+            'before'
+            $tr.Test('ran', { })
+            $tr.CollectionVariables.Set('kept', 'yes')
+            $tr.Request.Headers = $null
+            """), _ct);
+        Assert.Null(broken.Response);
+        Assert.StartsWith("The pre-request scripts left a request that cannot be sent: ", broken.Scripts!.Error!.Message, StringComparison.Ordinal);
+        Assert.Equal(["before"], broken.Scripts.Logs.Select(l => l.Text));
+        Assert.Equal(["ran"], broken.Scripts.Tests.Select(t => t.Name));
+        Assert.Equal("yes", runner.Session.For(collection)["kept"]);
     }
 
     [Fact]
@@ -281,19 +483,22 @@ public class PowerShellScriptingTests
     public async Task PowerShell_is_found_and_must_be_PowerShell_7_or_later()
     {
         var pwsh = TestPowerShell.Require();
-        var (ok, message) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.PowerShell, pwsh, Path.GetTempPath(), _ct);
+        var (ok, message) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.PowerShell, pwsh, _ct);
         Assert.True(ok, message);
         Assert.Matches(@"^PowerShell \d+\.\d+\.\d+\S* · \S", message);
-        var (missing, why) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.PowerShell, "no-such-pwsh-here", Path.GetTempPath(), _ct);
+        var (missing, why) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.PowerShell, "no-such-pwsh-here", _ct);
         Assert.False(missing);
         Assert.Contains("could not be started", why, StringComparison.Ordinal);
-        Assert.NotNull(await ScriptRuntimeLocator.FindAsync(ScriptLanguage.PowerShell, TestFiles.NewTempDirectory(), r => r, _ct));
+        if (ScriptRuntimeLocator.Candidates(ScriptLanguage.PowerShell, Path.GetTempPath()).Contains(pwsh)) // not one that TERMREST_TEST_POWERSHELL names elsewhere
+        {
+            Assert.NotNull(await ScriptRuntimeLocator.FindAsync(ScriptLanguage.PowerShell, TestFiles.NewTempDirectory(), r => r, _ct));
+        }
 
         // Windows PowerShell (5.1) is not PowerShell 7.
         var windowsPowerShell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
         if (OperatingSystem.IsWindows() && File.Exists(windowsPowerShell))
         {
-            var (old, text) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.PowerShell, windowsPowerShell, Path.GetTempPath(), _ct);
+            var (old, text) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.PowerShell, windowsPowerShell, _ct);
             Assert.False(old);
             Assert.Matches(@"^PowerShell 5\.1\.\S+ is too old: scripts need PowerShell 7\.0 or later \(.+powershell\.exe\)\.$", text);
         }

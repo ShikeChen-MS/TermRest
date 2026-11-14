@@ -5,6 +5,7 @@
     <Project Path="src/TermRest.Tui/TermRest.Tui.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/TermRest.Cli.Tests/TermRest.Cli.Tests.csproj" />
     <Project Path="tests/TermRest.Core.Tests/TermRest.Core.Tests.csproj" />
     <Project Path="tests/TermRest.Tui.Tests/TermRest.Tui.Tests.csproj" />
   </Folder>

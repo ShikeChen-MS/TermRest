@@ -10,6 +10,9 @@ internal sealed class PowerShellLexer : SyntaxLexer
 {
     public static readonly PowerShellLexer Instance = new();
 
+    /// <summary>The longest ${name} colored as a variable.</summary>
+    private const int MaxBracedName = 1024;
+
     private static readonly FrozenSet<string>.AlternateLookup<ReadOnlySpan<char>> Keywords = Words(
         "begin break catch class continue data default do dynamicparam else elseif end enum exit filter finally for foreach function hidden if in param process return static switch throw trap try until using while",
         ignoreCase: true);
@@ -32,6 +35,7 @@ internal sealed class PowerShellLexer : SyntaxLexer
             _ => 0,
         };
         var name = SyntaxKind.Plain; // the next name: a function after function, a type after class
+        var typeBudget = (4 * line.Length) + 256; // characters [types] may scan: failing ones scan to the line end
         while (i < line.Length)
         {
             var c = line[i];
@@ -88,7 +92,7 @@ internal sealed class PowerShellLexer : SyntaxLexer
                 continue;
             }
 
-            if (c == '[' && !(i > 0 && (IsWordPart(line[i - 1]) || line[i - 1] is ']' or ')')) && TypeEnd(line, i) is var typeEnd and > 0)
+            if (c == '[' && !(i > 0 && (IsWordPart(line[i - 1]) || line[i - 1] is ']' or ')')) && TypeEnd(line, i, ref typeBudget) is var typeEnd and > 0)
             {
                 kinds[i..typeEnd].Fill(SyntaxKind.Type);
                 i = typeEnd;
@@ -222,7 +226,8 @@ internal sealed class PowerShellLexer : SyntaxLexer
         var c = At(line, i + 1);
         if (c == '{')
         {
-            var close = line[(i + 2)..].IndexOf('}');
+            // Its closing brace is looked for this far only: on a long line of unclosed ${, each would search to its end.
+            var close = line[(i + 2)..][..Math.Min(MaxBracedName, line.Length - i - 2)].IndexOf('}');
             return close < 0 ? -1 : i + 3 + close;
         }
 
@@ -240,8 +245,11 @@ internal sealed class PowerShellLexer : SyntaxLexer
         return At(line, end) == ':' && IsWordStart(At(line, end + 1)) ? WordEnd(line, end + 1) : end; // $env:Path, $script:count
     }
 
-    /// <summary>The end of the type at <paramref name="i"/> ([int], [System.IO.File], [string[]]), or -1 if it is not one.</summary>
-    private static int TypeEnd(ReadOnlySpan<char> line, int i)
+    /// <summary>
+    /// The end of the type at <paramref name="i"/> ([int], [System.IO.File], [string[]]), or -1 if it is not one or
+    /// <paramref name="budget"/> (characters left to scan on this line) runs out.
+    /// </summary>
+    private static int TypeEnd(ReadOnlySpan<char> line, int i, ref int budget)
     {
         if (!IsWordStart(At(line, i + 1)))
         {
@@ -249,7 +257,7 @@ internal sealed class PowerShellLexer : SyntaxLexer
         }
 
         var depth = 0;
-        for (var j = i; j < line.Length; j++)
+        for (var j = i; j < line.Length && budget-- > 0; j++)
         {
             var c = line[j];
             if (c == '[')

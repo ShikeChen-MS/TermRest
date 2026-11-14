@@ -10,6 +10,9 @@ namespace TermRest.Core.Certificates;
 /// </summary>
 public sealed class CertificateRegistry
 {
+    /// <summary>What <see cref="FilePath"/> held when it was last read or written; null when it did not exist then.</summary>
+    private FileStamp? _stamp;
+
     public CertificateRegistry(string baseDirectory, string? filePath = null)
     {
         BaseDirectory = baseDirectory;
@@ -24,20 +27,34 @@ public sealed class CertificateRegistry
 
     public static CertificateRegistry Load(string path, string baseDirectory)
     {
-        var (text, _) = TextFile.Read(path);
+        var (text, _) = TextFile.Read(path, out var stamp);
         var entries = JsonSerializer.Deserialize(text, CoreJsonContext.Default.ListCertificateEntry)
             ?? throw new InvalidDataException($"'{path}' does not contain a certificate list.");
-        return new CertificateRegistry(baseDirectory, path) { Entries = entries };
+        return new CertificateRegistry(baseDirectory, path) { Entries = entries, _stamp = stamp };
     }
 
     public static CertificateRegistry LoadOrEmpty(string path, string baseDirectory) =>
         File.Exists(path) ? Load(path, baseDirectory) : new CertificateRegistry(baseDirectory, path);
 
-    public void Save(string? path = null)
+    /// <summary>
+    /// Writes the entries to <paramref name="path"/> (default <see cref="FilePath"/>). Saving over <see cref="FilePath"/>
+    /// is refused with a <see cref="FileChangedException"/> when another program (a git pull, another TermRest) changed
+    /// or created it since it was read: that would undo its changes.
+    /// </summary>
+    /// <param name="overwriteChanged">Write the file even when it changed on disk.</param>
+    public void Save(string? path = null, bool overwriteChanged = false)
     {
         path ??= FilePath ?? throw new InvalidOperationException("The registry has no file path.");
+        var fullPath = Path.GetFullPath(path);
+        if (!overwriteChanged && FilePath is not null && string.Equals(fullPath, Path.GetFullPath(FilePath), StringComparison.OrdinalIgnoreCase)
+            && File.Exists(fullPath) && (_stamp is null || _stamp.HasChanged(fullPath)))
+        {
+            throw new FileChangedException([fullPath]);
+        }
+
         var json = JsonSerializer.Serialize(Entries, CoreJsonContext.Default.ListCertificateEntry);
-        TextFile.WriteAtomic(path, json.Replace("\r\n", "\n", StringComparison.Ordinal), new TextFileInfo(false, true, false));
+        TextFile.WriteAtomic(path, json.Replace("\r\n", "\n", StringComparison.Ordinal), new TextFileInfo(false, true, false), out var stamp);
+        _stamp = stamp;
         FilePath = path;
     }
 

@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using TermRest.Core.Model;
 
@@ -8,16 +9,29 @@ public sealed record ClientCertificateSelection(CertificateEntry Entry, LoadedCe
 {
     /// <summary>Captured at selection time, so diagnostics never touch a certificate that was reloaded (disposed) meanwhile.</summary>
     public CertificateSummary Summary { get; } = Certificate.Summary;
+
+    /// <summary>
+    /// The folder relative paths of <see cref="Entry"/> are resolved against: the workspace root for a registered
+    /// certificate, the collection's folder for one pinned on a request (null: unknown).
+    /// </summary>
+    public string? BaseDirectory { get; init; }
+
+    /// <summary>The full path of the file a path of <see cref="Entry"/> refers to: the file the certificate was loaded from.</summary>
+    public string ResolvePath(string src) => BaseDirectory is null ? src : ClientCertificateProvider.ResolvePath(BaseDirectory, src);
 }
 
 /// <summary>
 /// Chooses and loads the client certificate for a request: a certificate pinned on the request wins, then the most
-/// specific registry match. Loaded certificates are cached until their files change.
+/// specific registry match. Loaded certificates, and the workspace CA bundle, are cached until their files change.
 /// </summary>
 public sealed class ClientCertificateProvider(CertificateRegistry registry) : IDisposable
 {
-    private readonly Dictionary<string, LoadedCertificate> _cache = new(StringComparer.Ordinal);
+    // Keyed by source (see BuildCacheKey); a replaced certificate or bundle may still be in use by a request in flight,
+    // so it is retired and released with the provider.
+    private readonly Dictionary<string, (string Version, LoadedCertificate Certificate)> _cache = new(StringComparer.Ordinal);
     private readonly List<LoadedCertificate> _retired = [];
+    private readonly Dictionary<string, ((DateTime, long) Version, X509Certificate2Collection? Bundle, string? Error)> _trustBundles = new(StringComparer.Ordinal);
+    private readonly List<X509Certificate2Collection> _retiredBundles = [];
     private readonly Lock _gate = new();
 
     public CertificateRegistry Registry { get; } = registry;
@@ -60,14 +74,14 @@ public sealed class ClientCertificateProvider(CertificateRegistry registry) : ID
     public LoadedCertificate Load(CertificateEntry entry, string baseDirectory, Func<string?, string?>? resolveSecret = null)
     {
         var passphrase = resolveSecret is null ? entry.Passphrase : resolveSecret(entry.Passphrase);
-        string Resolve(string src) => Path.IsPathRooted(src) ? src : Path.GetFullPath(Path.Combine(baseDirectory, src));
+        string Resolve(string src) => ResolvePath(baseDirectory, src);
 
-        var key = BuildCacheKey(entry, Resolve, passphrase);
+        var (source, version) = BuildCacheKey(entry, Resolve, passphrase);
         lock (_gate)
         {
-            if (_cache.TryGetValue(key, out var cached))
+            if (_cache.TryGetValue(source, out var cached) && cached.Version == version)
             {
-                return cached;
+                return cached.Certificate;
             }
         }
 
@@ -81,16 +95,55 @@ public sealed class ClientCertificateProvider(CertificateRegistry registry) : ID
 
         lock (_gate)
         {
-            foreach (var stale in _cache.Where(kv => kv.Key.StartsWith(entry.Name + "|", StringComparison.Ordinal)).ToList())
+            if (_cache.TryGetValue(source, out var stale))
             {
-                _cache.Remove(stale.Key);
-                _retired.Add(stale.Value);
+                _retired.Add(stale.Certificate);
             }
 
-            _cache[key] = loaded;
+            _cache[source] = (version, loaded);
         }
 
         return loaded;
+    }
+
+    /// <summary>
+    /// Loads (or returns the cached) extra CA bundle, parsed again only when the file changes. Throws
+    /// <see cref="CertificateLoadException"/>, also for a failure cached until then.
+    /// </summary>
+    public X509Certificate2Collection LoadTrustBundle(string path)
+    {
+        var file = new FileInfo(Path.GetFullPath(path));
+        var version = file.Exists ? (file.LastWriteTimeUtc, file.Length) : default;
+        lock (_gate)
+        {
+            if (_trustBundles.TryGetValue(file.FullName, out var cached) && cached.Version == version)
+            {
+                return cached.Bundle ?? throw new CertificateLoadException(cached.Error!);
+            }
+        }
+
+        X509Certificate2Collection? bundle = null;
+        string? error = null;
+        try
+        {
+            bundle = CertificateLoader.LoadTrustBundle(path);
+        }
+        catch (CertificateLoadException ex)
+        {
+            error = ex.Message;
+        }
+
+        lock (_gate)
+        {
+            if (_trustBundles.TryGetValue(file.FullName, out var stale) && stale.Bundle is { } replaced)
+            {
+                _retiredBundles.Add(replaced);
+            }
+
+            _trustBundles[file.FullName] = (version, bundle, error);
+        }
+
+        return bundle ?? throw new CertificateLoadException(error!);
     }
 
     private ClientCertificateSelection? TrySelect(CertificateEntry entry, string baseDirectory, string origin, Func<string?, string?> resolveSecret, ICollection<string> warnings)
@@ -108,7 +161,7 @@ public sealed class ClientCertificateProvider(CertificateRegistry registry) : ID
                 warnings.Add($"Client certificate '{entry.Name}' is not valid until {summary.NotBefore:yyyy-MM-dd}.");
             }
 
-            return new ClientCertificateSelection(entry, loaded, origin);
+            return new ClientCertificateSelection(entry, loaded, origin) { BaseDirectory = baseDirectory };
         }
         catch (CertificateLoadException ex)
         {
@@ -117,9 +170,18 @@ public sealed class ClientCertificateProvider(CertificateRegistry registry) : ID
         }
     }
 
-    private static string BuildCacheKey(CertificateEntry entry, Func<string, string> resolve, string? passphrase)
+    /// <summary>The full path of a certificate file: a relative <paramref name="src"/> is relative to <paramref name="baseDirectory"/>.</summary>
+    internal static string ResolvePath(string baseDirectory, string src) =>
+        Path.IsPathRooted(src) ? src : Path.GetFullPath(Path.Combine(baseDirectory, src));
+
+    /// <summary>
+    /// Where a certificate comes from (its kind and files, or its store selector) and the version of that source (file
+    /// times, passphrase): entries sharing a name do not evict each other, and a changed source replaces its certificate.
+    /// </summary>
+    private static (string Source, string Version) BuildCacheKey(CertificateEntry entry, Func<string, string> resolve, string? passphrase)
     {
-        var builder = new StringBuilder(entry.Name).Append('|').Append(entry.Kind);
+        var source = new StringBuilder().Append(entry.Kind);
+        var version = new StringBuilder();
         void AppendFile(string? src)
         {
             if (src is null)
@@ -128,7 +190,8 @@ public sealed class ClientCertificateProvider(CertificateRegistry registry) : ID
             }
 
             var path = resolve(src);
-            builder.Append('|').Append(path).Append('@').Append(File.Exists(path) ? File.GetLastWriteTimeUtc(path).Ticks : 0);
+            source.Append('|').Append(path);
+            version.Append(File.Exists(path) ? File.GetLastWriteTimeUtc(path).Ticks : 0).Append('|');
         }
 
         AppendFile(entry.Cert?.Src);
@@ -136,28 +199,38 @@ public sealed class ClientCertificateProvider(CertificateRegistry registry) : ID
         AppendFile(entry.Pfx?.Src);
         if (entry.Store is { } store)
         {
-            builder.Append('|').Append(store.Location).Append('\\').Append(store.StoreName).Append('|').Append(store.Thumbprint).Append('|').Append(store.Subject);
+            source.Append('|').Append(store.Location).Append('\\').Append(store.StoreName).Append('|').Append(store.Thumbprint).Append('|').Append(store.Subject);
         }
 
         if (!string.IsNullOrEmpty(passphrase))
         {
-            builder.Append('|').Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(passphrase))));
+            version.Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(passphrase))));
         }
 
-        return builder.ToString();
+        return (source.ToString(), version.ToString());
     }
 
     public void Dispose()
     {
         lock (_gate)
         {
-            foreach (var certificate in _cache.Values.Concat(_retired))
+            foreach (var certificate in _cache.Values.Select(c => c.Certificate).Concat(_retired))
             {
                 certificate.Dispose();
             }
 
+            foreach (var bundle in _trustBundles.Values.Select(b => b.Bundle).OfType<X509Certificate2Collection>().Concat(_retiredBundles))
+            {
+                foreach (var ca in bundle)
+                {
+                    ca.Dispose();
+                }
+            }
+
             _cache.Clear();
             _retired.Clear();
+            _trustBundles.Clear();
+            _retiredBundles.Clear();
         }
     }
 }

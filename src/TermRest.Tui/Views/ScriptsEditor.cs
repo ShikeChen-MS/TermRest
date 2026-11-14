@@ -1,6 +1,7 @@
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using TermRest.Core.Scripting;
+using TermRest.Tui.Dialogs;
 
 namespace TermRest.Tui.Views;
 
@@ -40,7 +41,7 @@ internal sealed class ScriptsEditor : View
                 Edit(ScriptLanguage.All[index]);
             }
         };
-        _hint = new Label { X = 0, Y = 1, Width = Dim.Fill(), Height = 1, Text = "" };
+        _hint = new Label { HotKeySpecifier = Ui.NoHotKey, X = 0, Y = 1, Width = Dim.Fill(), Height = 1, Text = "" };
         Add(new Label { Text = "Language", X = 0, Y = 0 }, _language, _hint);
         var top = 2;
         if (forRequest)
@@ -66,15 +67,18 @@ internal sealed class ScriptsEditor : View
                     OnChanged();
                 }
             };
-            _status = new Label { X = Pos.Right(_runIn) + 2, Y = 2, Width = Dim.Fill(), Height = 1, Text = "" };
+            _status = new Label { HotKeySpecifier = Ui.NoHotKey, X = Pos.Right(_runIn) + 2, Y = 2, Width = Dim.Fill(), Height = 1, Text = "" };
             Add(new Label { Text = "Run in", X = 0, Y = 2, Width = 9 }, _runIn, _status);
             top = 3;
         }
 
         _preRequest = new TextArea { X = 0, Y = top + 1, Width = Dim.Percent(50), Height = Dim.Fill(), SyntaxLanguage = _editing };
         _test = new TextArea { X = Pos.Right(_preRequest) + 1, Y = top + 1, Width = Dim.Fill(), Height = Dim.Fill(), SyntaxLanguage = _editing };
-        _preRequest.UserEdited += (_, _) => OnEdited();
-        _test.UserEdited += (_, _) => OnEdited();
+
+        // The other script as stored, not read back from its editor (a full read per key): Terminal.Gui keeps characters
+        // composed (NFC), so the script left alone would change.
+        _preRequest.UserEdited += (_, text) => OnEdited(text, _scripts.GetValueOrDefault(_editing)?.Test ?? "");
+        _test.UserEdited += (_, text) => OnEdited(_scripts.GetValueOrDefault(_editing)?.PreRequest ?? "", text);
         if (forRequest)
         {
             _runPreRequest = new CheckBox { Text = "Pre-request (before sending)", X = 0, Y = top };
@@ -197,10 +201,10 @@ internal sealed class ScriptsEditor : View
         bool Runs(ScriptPhase phase) => plan?.Runs(phase) ?? _settings.Runs(phase) ?? scripts.Has(phase);
     }
 
-    private void OnEdited()
+    private void OnEdited(string preRequest, string test)
     {
         var had = _scripts.TryGetValue(_editing, out var before) && !before.IsEmpty;
-        _scripts[_editing] = new LanguageScripts(_editing, _preRequest.GetText(), _test.GetText());
+        _scripts[_editing] = new LanguageScripts(_editing, preRequest, test);
         if (had == _scripts[_editing].IsEmpty)
         {
             _loading = true;

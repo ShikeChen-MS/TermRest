@@ -75,6 +75,22 @@ internal static partial class CSharpWorkerCode
             text.Append(directive).Append('\n');
         }
 
+        // Global usings apply to the whole program, as they do in a file-based app (where they also reach #:include files):
+        // they come before the namespaces, once each.
+        var globalUsings = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (id, script) in parts)
+        {
+            foreach (var (line, directive) in script.GlobalUsings.Where(u => globalUsings.Add(u.Text)))
+            {
+                text.Append("\n#line ").Append(line).Append(" \"").Append(ScriptFile).Append(id).Append("\"\n").Append(directive);
+            }
+        }
+
+        if (globalUsings.Count > 0)
+        {
+            text.Append("\n#line default\n");
+        }
+
         foreach (var (id, script) in parts)
         {
             text.Append("\nnamespace TermRestScripts.S").Append(id).Append("\n{\n")
@@ -102,12 +118,16 @@ internal static partial class CSharpWorkerCode
         return text.Append("        };\n    }\n}\n\n").Append(Runtime).ToString();
     }
 
-    /// <summary>The directives and <c>using</c> directives at the start of a script, and the rest (the method's body).</summary>
-    private static (List<string> Directives, List<(int Line, string Text)> Usings, string Body) Split(string code, string workspaceRoot)
+    /// <summary>
+    /// The directives, <c>using</c> directives and <c>global using</c> directives at the start of a script, and the rest (the
+    /// method's body).
+    /// </summary>
+    private static (List<string> Directives, List<(int Line, string Text)> Usings, List<(int Line, string Text)> GlobalUsings, string Body) Split(string code, string workspaceRoot)
     {
         var lines = Normalize(code).Split('\n');
         var directives = new List<string>();
         var usings = new List<(int, string)>();
+        var globalUsings = new List<(int, string)>();
         var comment = false;
         for (var i = 0; i < lines.Length; i++)
         {
@@ -139,11 +159,12 @@ internal static partial class CSharpWorkerCode
                 break;
             }
 
-            usings.Add((i + 1, line));
+            // C# allows a global using only before the namespaces (see Generate).
+            (line.StartsWith("global", StringComparison.Ordinal) ? globalUsings : usings).Add((i + 1, line));
             lines[i] = "";
         }
 
-        return (directives, usings, string.Join('\n', lines));
+        return (directives, usings, globalUsings, string.Join('\n', lines));
     }
 
     private static string WithFullPath(string directive, string workspaceRoot)
@@ -159,6 +180,13 @@ internal static partial class CSharpWorkerCode
             ? directive
             : $"#:{match.Groups[1].Value} {Path.GetFullPath(Path.Combine(workspaceRoot, path))}";
     }
+
+    /// <summary>The #:include and #:project directives of a program from <see cref="Generate"/>: which one, and its path.</summary>
+    public static IEnumerable<(string Directive, string Path)> PathsOf(string program) =>
+        program[..Math.Max(0, program.IndexOf("\n\n", StringComparison.Ordinal))].Split('\n')
+            .Select(line => PathDirective().Match(line))
+            .Where(match => match.Success)
+            .Select(match => (match.Groups[1].Value, match.Groups[2].Value.Trim()));
 
     // using X.Y;  using static X.Y;  using A = X.Y<Z>;  (not using statements: using var x = …, using (…), using T x = …)
     [GeneratedRegex(@"^(?:global\s+)?using\s+(?:static\s+[\w.@<>,\s]+|[A-Za-z_@]\w*\s*=\s*[^;]+|[A-Za-z_@][\w.@]*)\s*;\s*(?://.*)?$")]
@@ -338,9 +366,14 @@ internal static partial class CSharpWorkerCode
             public sealed class Variables : Scope
             {
                 private readonly Dictionary<string, string>[] _scopes;
+                private readonly JsonObject _samples;
 
-                internal Variables(Dictionary<string, string> local, JsonObject changes, Dictionary<string, string>[] scopes)
-                    : base(local, changes) => _scopes = scopes;
+                internal Variables(Dictionary<string, string> local, JsonObject changes, Dictionary<string, string>[] scopes, JsonObject samples)
+                    : base(local, changes)
+                {
+                    _scopes = scopes;
+                    _samples = samples;
+                }
 
                 public override string Get(string name, string fallback = null)
                 {
@@ -371,12 +404,16 @@ internal static partial class CSharpWorkerCode
                     return merged;
                 }
 
-                /// <summary>Replaces {{name}} with the variables' values; unknown names stay as they are.</summary>
+                /// <summary>Replaces {{name}} with the variables' values, and Postman's dynamic variables ({{$guid}}…); unknown names stay as they are.</summary>
                 public string ReplaceIn(string text)
                 {
                     for (var i = 0; i < 10 && text is not null; i++)
                     {
-                        var replaced = Host.Reference.Replace(text, m => Get(m.Groups[1].Value.Trim(), m.Value));
+                        var replaced = Host.Reference.Replace(text, m =>
+                        {
+                            var name = m.Groups[1].Value.Trim();
+                            return Get(name) ?? Host.Dynamic(name, _samples) ?? m.Value;
+                        });
                         if (replaced == text)
                         {
                             break;
@@ -683,6 +720,14 @@ internal static partial class CSharpWorkerCode
                         else
                         {
                             var self = NativeLibrary.GetMainProgramHandle();
+
+                            // A session of its own, without TermRest's terminal: programs that scripts start (ssh, sudo, gpg)
+                            // cannot open /dev/tty to ask over TermRest's screen, and fail at once, as they do without a terminal.
+                            if (NativeLibrary.TryGetExport(self, "setsid", out var setsid))
+                            {
+                                Marshal.GetDelegateForFunctionPointer<Setsid>(setsid)();
+                            }
+
                             var dup = Marshal.GetDelegateForFunctionPointer<Dup>(NativeLibrary.GetExport(self, "dup"));
                             var dup2 = Marshal.GetDelegateForFunctionPointer<Dup2>(NativeLibrary.GetExport(self, "dup2"));
                             int inputCopy = dup(0), outputCopy = dup(1);
@@ -718,6 +763,9 @@ internal static partial class CSharpWorkerCode
                 [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
                 private delegate int Dup2(int descriptor, int target);
 
+                [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+                private delegate int Setsid();
+
                 private static JsonObject Run(JsonObject message)
                 {
                     var phase = AsText(message["phase"]) ?? "";
@@ -743,7 +791,7 @@ internal static partial class CSharpWorkerCode
                         new Scope(environment, changes["environment"].AsObject()),
                         new Scope(collection, changes["collection"].AsObject()),
                         new Scope(globals, changes["globals"].AsObject()),
-                        new Variables(local, changes["local"].AsObject(), new[] { local, environment, collection, globals }),
+                        new Variables(local, changes["local"].AsObject(), new[] { local, environment, collection, globals }, message["dynamic"] as JsonObject),
                         request,
                         message["response"] is JsonObject response ? new Response(response) : null,
                         info,
@@ -787,7 +835,8 @@ internal static partial class CSharpWorkerCode
                             var clean = printed.TrimEnd('\r');
                             if (logs.Count < MaxLines)
                             {
-                                logs.Add(new JsonObject { ["script"] = name, ["text"] = clean.Length > 4000 ? clean[..4000] : clean });
+                                // Lines are cut at 4,000 characters, not inside a surrogate pair (an emoji).
+                                logs.Add(new JsonObject { ["script"] = name, ["text"] = clean.Length > 4000 ? clean[..(char.IsHighSurrogate(clean[3999]) ? 3999 : 4000)] : clean });
                             }
                             else
                             {
@@ -852,19 +901,34 @@ internal static partial class CSharpWorkerCode
 
                 internal static string AsText(JsonNode node) => node is JsonValue value && value.TryGetValue<string>(out var text) ? text : node?.ToJsonString();
 
-                /// <summary>Variables and headers are text: strings stay as they are, anything else becomes JSON.</summary>
+                /// <summary>
+                /// Variables and headers are text: strings stay as they are, numbers, dates, GUIDs and the like become their
+                /// text, anything else becomes JSON; one whose JSON is a string is that string, without the quotes.
+                /// </summary>
                 internal static string ToText(object value) => value switch
                 {
                     null => "",
                     string text => text,
                     bool flag => flag ? "true" : "false",
-                    JsonValue node when node.GetValueKind() == JsonValueKind.String => node.GetValue<string>(),
+                    JsonValue node when node.GetValueKind() == JsonValueKind.String => StringOf(node),
                     JsonNode node => node.ToJsonString(Options),
                     DateTime time => time.ToString("O", CultureInfo.InvariantCulture),
                     DateTimeOffset time => time.ToString("O", CultureInfo.InvariantCulture),
+                    DateOnly date => date.ToString("O", CultureInfo.InvariantCulture),
+                    TimeOnly time => time.ToString("O", CultureInfo.InvariantCulture),
+                    Uri uri => uri.OriginalString, // as written: its ToString() unescapes it (a %20 becomes a space)
                     IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
-                    _ => JsonSerializer.Serialize(value, value.GetType(), Options),
+                    _ => Unquoted(JsonSerializer.Serialize(value, value.GetType(), Options)),
                 };
+
+                /// <summary>A JSON string as the string it holds; other JSON as it is.</summary>
+                private static string Unquoted(string json) => json.StartsWith('"') ? JsonSerializer.Deserialize<string>(json, Options) ?? "" : json;
+
+                /// <summary>
+                /// The text of a JSON string value: also of one made from a GUID, a date or a char (new JsonObject { ["id"] =
+                /// Guid.NewGuid() }), which GetValue&lt;string&gt;() refuses.
+                /// </summary>
+                private static string StringOf(JsonValue node) => node.TryGetValue<string>(out var text) ? text : Unquoted(node.ToJsonString(Options));
 
                 internal static bool Same(object expected, object actual)
                 {
@@ -922,7 +986,7 @@ internal static partial class CSharpWorkerCode
 
                 private static object Plain(object value) => value is JsonValue node ? node.GetValueKind() switch
                 {
-                    JsonValueKind.String => node.GetValue<string>(),
+                    JsonValueKind.String => StringOf(node),
                     JsonValueKind.True => true,
                     JsonValueKind.False => false,
                     _ => node,
@@ -936,6 +1000,51 @@ internal static partial class CSharpWorkerCode
                 };
 
                 private static JsonNode Node(object value) => value as JsonNode ?? JsonSerializer.SerializeToNode(value, value.GetType(), Options);
+
+                /// <summary>
+                /// A value of one of Postman's dynamic variables, as requests resolve them, or null for another name; the
+                /// names and words they pick from come with the message.
+                /// </summary>
+                internal static string Dynamic(string name, JsonObject samples)
+                {
+                    const string Alphanumeric = "abcdefghijklmnopqrstuvwxyz0123456789";
+                    string Pick(string key)
+                    {
+                        var values = (samples?[key] as JsonArray)?.Select(AsText).Where(v => v is not null).ToArray() ?? Array.Empty<string>();
+                        return values.Length == 0 ? "" : values[global::System.Security.Cryptography.RandomNumberGenerator.GetInt32(values.Length)];
+                    }
+
+                    static int Next(int limit) => global::System.Security.Cryptography.RandomNumberGenerator.GetInt32(limit);
+                    static string RandomText(int length, string alphabet)
+                    {
+                        var letters = new char[length];
+                        for (var i = 0; i < length; i++)
+                        {
+                            letters[i] = alphabet[Next(alphabet.Length)];
+                        }
+
+                        return new string(letters);
+                    }
+
+                    return name switch
+                    {
+                        "$guid" or "$randomUUID" => Guid.NewGuid().ToString(),
+                        "$timestamp" => DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture),
+                        "$isoTimestamp" => DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture),
+                        "$randomInt" => Next(1001).ToString(CultureInfo.InvariantCulture),
+                        "$randomBoolean" => Next(2) == 1 ? "true" : "false",
+                        "$randomAlphaNumeric" => RandomText(1, Alphanumeric),
+                        "$randomHexadecimal" => RandomText(1, "0123456789abcdef"),
+                        "$randomFirstName" => Pick("firstNames"),
+                        "$randomLastName" => Pick("lastNames"),
+                        "$randomFullName" => Pick("firstNames") + " " + Pick("lastNames"),
+                        "$randomUserName" => Pick("firstNames").ToLowerInvariant() + "." + Pick("lastNames").ToLowerInvariant() + Next(100).ToString(CultureInfo.InvariantCulture),
+                        "$randomEmail" => Pick("firstNames").ToLowerInvariant() + "." + Pick("lastNames").ToLowerInvariant() + "@example.com",
+                        "$randomWord" => Pick("words"),
+                        "$randomPassword" => RandomText(15, Alphanumeric),
+                        _ => null,
+                    };
+                }
 
                 /// <summary>What the running script writes to the console (Console.WriteLine…): its output.</summary>
                 private sealed class Capture : TextWriter

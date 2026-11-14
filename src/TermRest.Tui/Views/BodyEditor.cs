@@ -16,6 +16,9 @@ internal sealed class BodyEditor : View
     private static readonly string[] LanguageLabels = ["JSON", "XML", "Text", "HTML", "JavaScript"];
     private static readonly string?[] FileLanguages = [null, .. Languages];
 
+    /// <summary>How long typing in the file path pauses before the file is looked up: once per typed path, not per key.</summary>
+    private static readonly TimeSpan TypingPause = TimeSpan.FromMilliseconds(300);
+
     private readonly OptionSelector _mode;
     private readonly OptionSelector _language;
     private readonly Button _beautify;
@@ -80,9 +83,9 @@ internal sealed class BodyEditor : View
         _beautify.Accepted += (_, _) => Beautify();
 
         _raw = new TextArea { X = 0, Y = 2, Width = Dim.Fill(), Height = Dim.Fill() };
-        _raw.UserEdited += (_, _) =>
+        _raw.UserEdited += (_, text) =>
         {
-            _body.Raw = _raw.GetText();
+            _body.Raw = text;
             RaiseChanged();
         };
 
@@ -111,7 +114,7 @@ internal sealed class BodyEditor : View
                 _fileCheck++;
                 _body.FileSrc = _filePath.Text;
                 RaiseChanged();
-                DescribeFile();
+                DescribeFile(TypingPause);
             }
         };
         var browse = new Button { Text = "Browse…", X = Pos.AnchorEnd(12), Y = 0 };
@@ -123,7 +126,7 @@ internal sealed class BodyEditor : View
                 ChooseFile(path);
             }
         };
-        _fileStatus = new Label { X = 0, Y = 2, Width = Dim.Fill(), Text = "" };
+        _fileStatus = new Label { HotKeySpecifier = Ui.NoHotKey, X = 0, Y = 2, Width = Dim.Fill(), Text = "" };
         _recordingNotice = new Label
         {
             X = 0,
@@ -143,15 +146,15 @@ internal sealed class BodyEditor : View
 
         _graphQLPanel = new View { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
         _graphQLQuery = new TextArea { X = 0, Y = 1, Width = Dim.Percent(60), Height = Dim.Fill() };
-        _graphQLQuery.UserEdited += (_, _) =>
+        _graphQLQuery.UserEdited += (_, text) =>
         {
-            _body.GraphQLQuery = _graphQLQuery.GetText();
+            _body.GraphQLQuery = text;
             RaiseChanged();
         };
         _graphQLVariables = new TextArea { X = Pos.Right(_graphQLQuery) + 1, Y = 1, Width = Dim.Fill(), Height = Dim.Fill() };
-        _graphQLVariables.UserEdited += (_, _) =>
+        _graphQLVariables.UserEdited += (_, text) =>
         {
-            _body.GraphQLVariables = _graphQLVariables.GetText();
+            _body.GraphQLVariables = text;
             RaiseChanged();
         };
         _graphQLPanel.Add(
@@ -206,6 +209,13 @@ internal sealed class BodyEditor : View
         }
     }
 
+    /// <summary>Looks the body file up again: a relative path starts at the collection's folder, which may have changed.</summary>
+    internal void RefreshFile()
+    {
+        _fileCheck++;
+        DescribeFile();
+    }
+
     /// <summary>
     /// Uses <paramref name="path"/> as the body file. With a type, the file must fit it first: a JSON body takes only
     /// a valid JSON file. Anything else is turned down and the current file stays.
@@ -223,6 +233,7 @@ internal sealed class BodyEditor : View
             if (problem is null)
             {
                 _filePath.Text = path;
+                _fileCheck++; // it was just checked: the lookup the new path started is not needed
                 ShowChecked(path, language);
                 return;
             }
@@ -262,8 +273,12 @@ internal sealed class BodyEditor : View
         }
     }
 
-    /// <summary>What is known without reading the file: whether it is there, and its size.</summary>
-    private void DescribeFile()
+    /// <summary>
+    /// What is known about the file: whether it is there, and its size; with <paramref name="checkContent"/>, also whether
+    /// it fits its type. It is looked up in the background, after <paramref name="delay"/> (the file can be large, or on a
+    /// slow or disconnected network drive), and only the latest lookup is shown.
+    /// </summary>
+    private void DescribeFile(TimeSpan delay = default, bool checkContent = false)
     {
         var src = _body.FileSrc?.Trim() ?? "";
         if (src.Length == 0)
@@ -278,40 +293,65 @@ internal sealed class BodyEditor : View
             return;
         }
 
-        var file = new FileInfo(ResolveFile(src));
-        if (!file.Exists)
+        var path = ResolveFile(src);
+        var language = _body.FileLanguage;
+        if (App is not { } app)
         {
-            ShowFileStatus($"✗ {file.FullName} does not exist.", "Error");
+            ShowFileStatus(LookUp(path, language, checkContent)); // not shown yet: there is no main loop to come back to
             return;
         }
 
-        var type = TypeLabel(_body.FileLanguage);
-        ShowFileStatus($"{file.Name} · {HttpExchange.FormatSize(file.Length)} · {(type is null ? "sent as it is" : $"checked as {type} when sent")}");
+        var check = _fileCheck;
+        ShowFileStatus(checkContent && language is not null ? $"Checking {Path.GetFileName(path)}…" : $"Looking for {path}…");
+        app.AddTimeout(delay, () =>
+        {
+            if (check == _fileCheck)
+            {
+                _ = Task.Run(() => LookUp(path, language, checkContent)).ContinueWith(
+                    task => app.AddTimeout(TimeSpan.Zero, () =>
+                    {
+                        if (check == _fileCheck)
+                        {
+                            ShowFileStatus(task.IsCompletedSuccessfully ? task.Result : ($"✗ {task.Exception?.GetBaseException().Message}", "Error"));
+                        }
+
+                        return false;
+                    }),
+                    TaskScheduler.Default);
+            }
+
+            return false;
+        });
+    }
+
+    /// <summary>
+    /// The file's status, read from the disk: whether it is there and its size, and with <paramref name="checkContent"/>
+    /// whether it fits its type.
+    /// </summary>
+    private static (string Text, string? Scheme) LookUp(string path, string? language, bool checkContent)
+    {
+        var file = new FileInfo(path);
+        if (!file.Exists)
+        {
+            return ($"✗ {file.FullName} does not exist.", "Error");
+        }
+
+        if (checkContent && language is not null)
+        {
+            return BodyFile.Check(path, language) is { } problem
+                ? ($"✗ {problem} It is not sent until it is fixed, or the type is Binary.", "Error")
+                : (Checked(file, language), ThemeCatalog.SuccessScheme);
+        }
+
+        var type = TypeLabel(language);
+        return ($"{file.Name} · {HttpExchange.FormatSize(file.Length)} · {(type is null ? "sent as it is" : $"checked as {type} when sent")}", null);
     }
 
     /// <summary>After the type changed: checks the chosen file right away, so that a mismatch shows before sending.</summary>
     private void CheckChosenFile()
     {
-        var src = _body.FileSrc?.Trim() ?? "";
-        var path = src.Length == 0 || src.Contains("{{", StringComparison.Ordinal) ? null : ResolveFile(src);
-        if (_body.FileLanguage is not { } language || path is null || !File.Exists(path))
-        {
-            _fileCheck++;
-            DescribeFile();
-            return;
-        }
-
-        CheckFile(path, language, problem =>
-        {
-            if (problem is null)
-            {
-                ShowChecked(path, language);
-            }
-            else
-            {
-                ShowFileStatus($"✗ {problem} It is not sent until it is fixed, or the type is Binary.", "Error");
-            }
-        });
+        _fileCheck++;
+        DescribeFile(checkContent: true);
     }
 
     /// <summary>Checks a file in the background (it can be large); <paramref name="done"/> gets the problem, or null.</summary>
@@ -337,11 +377,12 @@ internal sealed class BodyEditor : View
             TaskScheduler.Default);
     }
 
-    private void ShowChecked(string path, string language)
-    {
-        var file = new FileInfo(path);
-        ShowFileStatus($"✓ {file.Name} · {HttpExchange.FormatSize(file.Exists ? file.Length : 0)} · checked as {TypeLabel(language)}", ThemeCatalog.SuccessScheme);
-    }
+    private void ShowChecked(string path, string language) => ShowFileStatus(Checked(new FileInfo(path), language), ThemeCatalog.SuccessScheme);
+
+    private static string Checked(FileInfo file, string language) =>
+        $"✓ {file.Name} · {HttpExchange.FormatSize(file.Exists ? file.Length : 0)} · checked as {TypeLabel(language)}";
+
+    private void ShowFileStatus((string Text, string? Scheme) status) => ShowFileStatus(status.Text, status.Scheme);
 
     private void ShowFileStatus(string text, string? scheme = null)
     {

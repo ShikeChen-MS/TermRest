@@ -15,6 +15,12 @@ public sealed class AppliedAuth
     /// <summary>Credentials answered on a 401 challenge (Digest, NTLM, Negotiate).</summary>
     public NetworkCredential? Credential { get; set; }
 
+    /// <summary>
+    /// The challenge schemes <see cref="Credential"/> answers (Digest; NTLM and Negotiate): never Basic, which would send
+    /// the password in clear text.
+    /// </summary>
+    public string[] CredentialSchemes { get; set; } = [];
+
     public string Description { get; set; } = "No auth";
 
     public List<string> Warnings { get; } = [];
@@ -41,11 +47,19 @@ public static class AuthApplier
             {
                 var user = Get("username");
                 var password = Get("password");
-                var token = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{user}:{password}"));
+                var token = BasicToken(user, password);
                 result.Headers.Add(new("Authorization", $"Basic {token}"));
-                result.Description = $"Basic ({user})";
+
+                // The description leaves out the user name, which can be the credential itself: an API key sent with an empty
+                // or dummy password, as Stripe and Freshdesk take theirs (curl -u sk_test_…:). Without a password, it is a secret.
+                result.Description = "Basic";
                 result.Secrets.Add(password);
                 result.Secrets.Add(token);
+                if (password.Length == 0)
+                {
+                    result.Secrets.Add(user);
+                }
+
                 break;
             }
 
@@ -53,13 +67,16 @@ public static class AuthApplier
             {
                 var token = Get("token");
                 result.Secrets.Add(token);
-                result.Headers.Add(new("Authorization", $"Bearer {token}"));
                 result.Description = "Bearer token";
                 if (token.Length == 0)
                 {
-                    result.Warnings.Add("Bearer token is empty.");
+                    // As in Postman: no header then (an Authorization header the request has stays), as for a token that a
+                    // login request's script sets later.
+                    result.Warnings.Add("Bearer token is empty: the request was sent without it.");
+                    break;
                 }
 
+                result.Headers.Add(new("Authorization", $"Bearer {token}"));
                 break;
             }
 
@@ -94,6 +111,7 @@ public static class AuthApplier
                 var domain = auth.Type == "ntlm" ? Get("domain") : "";
                 result.Secrets.Add(password);
                 result.Credential = string.IsNullOrEmpty(domain) ? new NetworkCredential(user, password) : new NetworkCredential(user, password, domain);
+                result.CredentialSchemes = auth.Type == "ntlm" ? ["NTLM", "Negotiate"] : ["Digest"];
                 result.Description = auth.Type == "ntlm" ? $"NTLM ({(domain.Length > 0 ? domain + "\\" : "")}{user})" : $"Digest ({user})";
                 break;
             }
@@ -130,4 +148,7 @@ public static class AuthApplier
 
         return result;
     }
+
+    /// <summary>The credentials of an <c>Authorization: Basic</c> header (RFC 7617, in UTF-8).</summary>
+    internal static string BasicToken(string user, string password) => Convert.ToBase64String(Encoding.UTF8.GetBytes($"{user}:{password}"));
 }

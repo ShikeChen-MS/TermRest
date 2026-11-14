@@ -81,10 +81,11 @@ public static class CertificateLoader
             EnsureExists(keyPath, "private key");
         }
 
-        var keyText = File.ReadAllText(keyPath ?? certPath);
-        X509Certificate2 leaf;
+        X509Certificate2? leaf = null;
+        var chain = new X509Certificate2Collection();
         try
         {
+            var keyText = File.ReadAllText(keyPath ?? certPath);
             if (keyText.Contains("Proc-Type: 4,ENCRYPTED", StringComparison.Ordinal))
             {
                 throw new CertificateLoadException(
@@ -111,33 +112,34 @@ public static class CertificateLoader
             {
                 leaf = X509Certificate2.CreateFromPemFile(certPath, keyPath);
             }
+
+            var all = new X509Certificate2Collection();
+            all.ImportFromPemFile(certPath);
+            foreach (var certificate in all)
+            {
+                if (certificate.Thumbprint == leaf.Thumbprint)
+                {
+                    certificate.Dispose();
+                }
+                else
+                {
+                    chain.Add(certificate);
+                }
+            }
+
+            return new LoadedCertificate
+            {
+                Certificate = MakeUsableForTls(leaf),
+                Chain = chain,
+                Description = $"PEM {Path.GetFileName(certPath)}",
+            };
         }
-        catch (CryptographicException ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or CryptographicException)
         {
+            leaf?.Dispose();
+            DisposeAll(chain);
             throw new CertificateLoadException($"Could not load PEM certificate/key: {ex.Message}", ex);
         }
-
-        var chain = new X509Certificate2Collection();
-        var all = new X509Certificate2Collection();
-        all.ImportFromPemFile(certPath);
-        foreach (var certificate in all)
-        {
-            if (certificate.Thumbprint == leaf.Thumbprint)
-            {
-                certificate.Dispose();
-            }
-            else
-            {
-                chain.Add(certificate);
-            }
-        }
-
-        return new LoadedCertificate
-        {
-            Certificate = MakeUsableForTls(leaf),
-            Chain = chain,
-            Description = $"PEM {Path.GetFileName(certPath)}",
-        };
     }
 
     public static LoadedCertificate LoadPfx(string pfxPath, string? passphrase)
@@ -147,6 +149,10 @@ public static class CertificateLoader
         try
         {
             collection = X509CertificateLoader.LoadPkcs12CollectionFromFile(pfxPath, passphrase, KeyStorageFlags);
+        }
+        catch (Exception ex) when (ReadError(ex) is { } error)
+        {
+            throw new CertificateLoadException($"Could not open '{Path.GetFileName(pfxPath)}': {error.Message}", ex);
         }
         catch (CryptographicException ex)
         {
@@ -188,16 +194,17 @@ public static class CertificateLoader
         }
 
         using var store = new X509Store(source.StoreName, location);
+        X509Certificate2Collection all;
         try
         {
             store.Open(OpenFlags.ReadOnly | OpenFlags.OpenExistingOnly);
+            all = store.Certificates;
         }
-        catch (CryptographicException ex)
+        catch (Exception ex) when (ex is CryptographicException or IOException or UnauthorizedAccessException)
         {
             throw new CertificateLoadException($"Cannot open certificate store {source.Location}\\{source.StoreName}: {ex.Message}", ex);
         }
 
-        var all = store.Certificates;
         X509Certificate2Collection found;
         if (!string.IsNullOrWhiteSpace(source.Thumbprint))
         {
@@ -280,14 +287,21 @@ public static class CertificateLoader
     {
         EnsureExists(path, "CA bundle");
         var collection = new X509Certificate2Collection();
-        var text = File.ReadAllText(path);
-        if (text.Contains("-----BEGIN CERTIFICATE-----", StringComparison.Ordinal))
+        try
         {
-            collection.ImportFromPemFile(path);
+            var text = File.ReadAllText(path);
+            if (text.Contains("-----BEGIN CERTIFICATE-----", StringComparison.Ordinal))
+            {
+                collection.ImportFromPem(text);
+            }
+            else
+            {
+                collection.Add(X509CertificateLoader.LoadCertificateFromFile(path));
+            }
         }
-        else
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or CryptographicException)
         {
-            collection.Add(X509CertificateLoader.LoadCertificateFromFile(path));
+            throw new CertificateLoadException((ReadError(ex) ?? ex).Message, ex);
         }
 
         return collection;
@@ -329,6 +343,17 @@ public static class CertificateLoader
             throw new CertificateLoadException($"The {what} file '{path}' does not exist.");
         }
     }
+
+    /// <summary>
+    /// The error reading a file behind <paramref name="ex"/>, if any: .NET reports one in a PKCS#12 file as a
+    /// CryptographicException, which would otherwise read as a wrong passphrase.
+    /// </summary>
+    private static Exception? ReadError(Exception ex) => ex switch
+    {
+        IOException or UnauthorizedAccessException => ex,
+        CryptographicException { InnerException: IOException or UnauthorizedAccessException } => ex.InnerException,
+        _ => null,
+    };
 
     private static void DisposeAll(X509Certificate2Collection collection)
     {

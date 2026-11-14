@@ -1,4 +1,5 @@
 using System.CommandLine;
+using TermRest.Core.IO;
 using TermRest.Core.Postman;
 using TermRest.Core.Workspace;
 
@@ -15,7 +16,7 @@ internal static class ConvertCommand
         var to = new Option<string?>("--to") { Description = "Target format: v3 or v2.1 (default: the other one)" };
         var output = new Option<string?>("--output", "-o")
         {
-            Description = "Target folder (v3) or file (v2.1). Default: postman/collections/<name> next to a v2.1 file; <name>.postman_collection.json in a v3 collection's workspace",
+            Description = "Target folder (v3) or file (v2.1). Default: postman/collections/<name> in a v2.1 file's workspace; <name>.postman_collection.json in a v3 collection's workspace",
         };
         var lineWidth = new Option<int?>("--line-width")
         {
@@ -96,27 +97,45 @@ internal static class ConvertCommand
             return 2;
         }
 
+        // Files that could not be read (a definition with the collection's auth, variables and scripts, say) would be
+        // missing from the converted collection; the note about hidden non-HTTP requests is no such problem.
+        if (source.LoadWarnings.Any(w => !w.Contains("non-HTTP", StringComparison.Ordinal)))
+        {
+            Output.Error($"Files of '{source.Name}' could not be read (see the warnings above), so nothing was written: the converted collection would lack what they hold.");
+            return 1;
+        }
+
         if (toV3)
         {
-            var target = output ?? Path.Combine(Path.GetDirectoryName(path)!, ApiWorkspace.PostmanFolder, "collections", SafeName(source.Name));
+            var target = output ?? Path.Combine(ApiWorkspace.RootForFile(path), ApiWorkspace.PostmanFolder, "collections", ApiWorkspace.SafeFileName(source.Name));
             var converted = source.ConvertToV3(target, lineWidth);
             var examples = Directory.EnumerateFiles(target, "*.example.yaml", SearchOption.AllDirectories).Count();
             Output.Status($"✓ {converted.AllRequests().Count()} request(s){(examples > 0 ? $" and {examples} example(s)" : "")} written to {target}{Wrapping(lineWidth)}", true);
+            if (source.SecretValuesLeftOutOfV3() is { Count: > 0 } secrets)
+            {
+                Output.Info($"  The values of secret variables ({string.Join(", ", secrets)}) are not written: Postman's v3 collections keep them out of their files. Set them in an environment.");
+            }
+
             return 0;
         }
 
-        var file = output ?? Path.Combine(source.BaseDirectory, SafeName(source.Name) + PostmanCollection.FileSuffix);
+        var file = output ?? Path.Combine(source.BaseDirectory, ApiWorkspace.SafeFileName(source.Name) + PostmanCollection.FileSuffix);
         if (File.Exists(file))
         {
             Output.Error($"'{file}' already exists; choose another --output.");
             return 2;
         }
 
-        File.WriteAllText(file, source.ExportV21Json());
+        TextFile.WriteAtomic(file, source.ExportV21Json(), newFileMode: TextFile.CopyMode(path)); // as private as its source
         Output.Status($"✓ {source.AllRequests().Count()} request(s) written to {file}", true);
         if (Directory.EnumerateFiles(path, "*.example.yaml", SearchOption.AllDirectories).Any())
         {
             Output.Info("  Saved examples (*.example.yaml) are not included in the v2.1 file.");
+        }
+
+        if (source.CredentialSetsLeftOutOfV21() is { Count: > 0 } owners)
+        {
+            Output.Warning($"The auth of {string.Join(", ", owners)} has credential sets chosen by URL rules, which v2.1 can't hold: the v2.1 file has the first set only, and Postman sends it to every URL.");
         }
 
         return 0;
@@ -134,9 +153,9 @@ internal static class ConvertCommand
 
         var directory = Path.GetDirectoryName(path)!;
         var target = output ?? (toV3
-            ? Path.Combine(directory, ApiWorkspace.PostmanFolder, environment.IsGlobals ? "globals" : "environments",
-                environment.IsGlobals ? "workspace.globals.yaml" : SafeName(environment.Name) + ".environment.yaml")
-            : Path.Combine(directory, SafeName(environment.Name) + (environment.IsGlobals ? PostmanEnvironment.GlobalsSuffix : PostmanEnvironment.EnvironmentSuffix)));
+            ? Path.Combine(ApiWorkspace.RootForFile(path), ApiWorkspace.PostmanFolder, environment.IsGlobals ? "globals" : "environments",
+                environment.IsGlobals ? "workspace.globals.yaml" : ApiWorkspace.SafeFileName(environment.Name) + ".environment.yaml")
+            : Path.Combine(directory, ApiWorkspace.SafeFileName(environment.Name) + (environment.IsGlobals ? PostmanEnvironment.GlobalsSuffix : PostmanEnvironment.EnvironmentSuffix)));
         if (File.Exists(target))
         {
             Output.Error($"'{target}' already exists; choose another --output.");
@@ -145,14 +164,8 @@ internal static class ConvertCommand
 
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(target))!);
         environment.YamlLineWidth = lineWidth;
-        environment.Save(target);
+        environment.Save(target); // as private as its source
         Output.Status($"✓ {environment.Values.Count} value(s) written to {target}{(toV3 ? Wrapping(lineWidth) : "")}", true);
         return 0;
-    }
-
-    private static string SafeName(string name)
-    {
-        var safe = new string(name.Select(c => c is '/' or '\\' or ':' or '*' or '?' or '"' or '<' or '>' or '|' || char.IsControl(c) ? '-' : c).ToArray()).Trim().TrimEnd('.');
-        return safe.Length == 0 ? "collection" : safe;
     }
 }

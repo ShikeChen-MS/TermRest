@@ -92,7 +92,7 @@ internal sealed class PythonLexer : SyntaxLexer
     /// <summary>A string that starts at <paramref name="start"/> (its prefix) with its quotes at <paramref name="quote"/>.</summary>
     private int OpenString(ReadOnlySpan<char> line, Span<SyntaxKind> kinds, int start, int quote, StringStyle style, ref LexState state)
     {
-        var quotes = Run(line, quote, line[quote]) >= 3 ? 3 : 1;
+        var quotes = Repeats(line, quote, line[quote], 3) ? 3 : 1;
         kinds[start..(quote + quotes)].Fill(SyntaxKind.String);
         state = new LexState(LexMode.String, line[quote], (byte)quotes, quotes == 3 ? style | StringStyle.MultiLine : style);
         return StringText(line, kinds, quote + quotes, ref state);
@@ -122,7 +122,7 @@ internal sealed class PythonLexer : SyntaxLexer
                 continue;
             }
 
-            if (c == state.Quote && Run(line, i, c) >= state.Quotes)
+            if (c == state.Quote && Repeats(line, i, c, state.Quotes))
             {
                 kinds[i..(i + state.Quotes)].Fill(SyntaxKind.String);
                 i += state.Quotes;

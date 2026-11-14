@@ -1,9 +1,11 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.IO.Enumeration;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using System.Xml;
 
 namespace TermRest.Core.Scripting;
 
@@ -22,8 +24,31 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
     private static readonly TimeSpan BuildTimeout = TimeSpan.FromMinutes(3);
     private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false);
 
+    /// <summary>
+    /// The files that builds read, by extension or name: code, what is compiled in with it (resources, Razor pages),
+    /// assemblies, and what directs the build (project files, MSBuild's .props and .targets, global.json, NuGet's
+    /// settings). Not the others, which a project's own program may write in its folder whenever it runs (a database, logs).
+    /// </summary>
+    private static readonly HashSet<string>.AlternateLookup<ReadOnlySpan<char>> BuildInputs = new HashSet<string>(
+        [".cs", ".vb", ".fs", ".fsi", ".resx", ".razor", ".cshtml", ".dll", ".csproj", ".vbproj", ".fsproj", ".proj", ".props", ".targets", "global.json", "nuget.config"],
+        StringComparer.OrdinalIgnoreCase).GetAlternateLookup<ReadOnlySpan<char>>();
+
+    /// <summary>
+    /// The files that MSBuild and NuGet look for in the folders above a project, by these names (NuGet takes these three
+    /// spellings of nuget.config where names are case-sensitive). The other files there are not read: they may be many.
+    /// </summary>
+    private static readonly string[] SettingsAbove =
+        ["Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props", "global.json", "nuget.config", "NuGet.config", "NuGet.Config"];
+
     /// <summary>Programs that did not compile, by key: the same code fails again, so it is not built again.</summary>
     private readonly Dictionary<string, List<CSharpError>> _failed = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Programs that did not build while they held scripts besides those that ran (the collection's), by key, whatever the
+    /// error (a package that cannot be restored, a #:project that is not there): this session leaves those scripts out at
+    /// once instead of building them again. A program of the scripts that run alone is built again: they may have been fixed.
+    /// </summary>
+    private readonly Dictionary<string, List<CSharpError>> _failedWithOthers = new(StringComparer.Ordinal);
 
     /// <summary>Whether this TermRest built C# scripts since it last stopped the compiler server.</summary>
     private static int _built;
@@ -61,6 +86,23 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
         return Path.Combine(root, "csharp");
     }
 
+    /// <summary><see cref="CacheDirectory"/>, created when it is not there.</summary>
+    internal static string CreateCacheDirectory()
+    {
+        var cache = CacheDirectory();
+        if (OperatingSystem.IsWindows())
+        {
+            Directory.CreateDirectory(cache);
+        }
+        else
+        {
+            // The scripts' code is in here: for the user only, as the history is.
+            Directory.CreateDirectory(cache, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        return cache;
+    }
+
     /// <summary>
     /// Makes sure a program can run the scripts of <paramref name="message"/>: it holds them and the other scripts
     /// that may run next (<paramref name="related"/>: the collection's), so the next requests need no new build. Each
@@ -91,11 +133,10 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
         var program = codes.Keys.ToHashSet(StringComparer.Ordinal);
         var broken = new Dictionary<string, List<CSharpError>>(StringComparer.Ordinal);
         var watch = Stopwatch.StartNew();
-        var built = false;
         for (var round = 0; round < 8; round++)
         {
-            var (path, errors, compiled) = await BuildAsync(program, codes, cancellationToken).ConfigureAwait(false);
-            built |= compiled;
+            var withOthers = program.Any(id => !needed.Contains(id));
+            var (path, errors, built) = await BuildAsync(program, codes, withOthers, cancellationToken).ConfigureAwait(false);
             if (path is not null)
             {
                 foreach (var script in scripts)
@@ -107,11 +148,22 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
                     }
                 }
 
+                // Only when the program that runs was built now: builds that failed leave nothing to start next time, and a
+                // script of this request that did not build is built again next time (it may have been fixed).
                 var seconds = watch.Elapsed.TotalSeconds.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture);
-                return (path, built ? $"The C# scripts were built ({seconds} s; they start at once next time)." : null);
+                var next = broken.Keys.Any(needed.Contains) ? "" : "; they start at once next time";
+                return (path, built ? $"The C# scripts were built ({seconds} s{next})." : null);
             }
 
             var inScripts = errors.Where(e => e.Script is not null && program.Contains(e.Script)).GroupBy(e => e.Script!).ToList();
+            if (withOthers && inScripts.Any(group => needed.Contains(group.Key)))
+            {
+                // Every script's directives (#:property, #:sdk, #:package) apply to the whole program, so another script of
+                // the collection may break the lines of those that run: built without the others, the errors left are theirs.
+                program.IntersectWith(needed);
+                continue;
+            }
+
             if (inScripts.Count > 0)
             {
                 foreach (var group in inScripts)
@@ -123,7 +175,7 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
                 continue;
             }
 
-            if (program.Any(id => !needed.Contains(id)))
+            if (withOthers)
             {
                 program.IntersectWith(needed); // the cause may be another script of the collection
                 continue;
@@ -141,8 +193,7 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
             var culprits = 0;
             foreach (var id in program.ToList())
             {
-                var (_, alone, compiledAlone) = await BuildAsync([id], codes, cancellationToken).ConfigureAwait(false);
-                built |= compiledAlone;
+                var (_, alone, _) = await BuildAsync([id], codes, withOthers: false, cancellationToken).ConfigureAwait(false);
                 if (alone.Count > 0)
                 {
                     broken[id] = alone;
@@ -176,19 +227,23 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
     /// <summary>
     /// Stops the .NET SDK's C# compiler server when this TermRest built scripts: builds keep it running for 10 minutes
     /// (100 MB or more), as every <c>dotnet build</c> does. It starts again for the next build, which then takes a few
-    /// seconds instead of one. Runs in the background.
+    /// seconds instead of one. Runs in the background, where the builds run: the SDK that built the scripts stops its
+    /// server (in TermRest's current folder, a global.json could choose another SDK).
     /// </summary>
     public static void StopCompilerServer(string dotnet)
     {
-        if (Interlocked.Exchange(ref _built, 0) == 0)
+        if (Interlocked.Exchange(ref _built, 0) == 0 || ScriptRuntimeLocator.Executable(dotnet) is not { } executable)
         {
             return;
         }
 
         try
         {
-            var info = new ProcessStartInfo(dotnet, ["build-server", "shutdown", "--vbcscompiler"])
+            var folder = Path.Combine(CreateCacheDirectory(), "source");
+            Directory.CreateDirectory(folder);
+            var info = new ProcessStartInfo(executable, ["build-server", "shutdown", "--vbcscompiler"])
             {
+                WorkingDirectory = folder,
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -210,17 +265,19 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
                 });
             }
         }
-        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or PlatformNotSupportedException)
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or PlatformNotSupportedException or IOException or UnauthorizedAccessException)
         {
-            // no SDK to ask
+            // no SDK to ask, or no folder to ask it in
         }
     }
 
     /// <summary>The program of these scripts: a copy built before, or a new build. Null with the errors when it does not build.</summary>
+    /// <param name="withOthers">Whether the program holds scripts besides those that run (see <see cref="_failedWithOthers"/>).</param>
     private async Task<(string? Program, List<CSharpError> Errors, bool Built)> BuildAsync(IEnumerable<string> ids, Dictionary<string, string> codes,
-        CancellationToken cancellationToken)
+        bool withOthers, CancellationToken cancellationToken)
     {
         var source = CSharpWorkerCode.Generate(ids.ToDictionary(id => id, id => codes[id], StringComparer.Ordinal), workspaceRoot);
+        source += Inputs(source);
         var key = Convert.ToHexStringLower(SHA256.HashData(Utf8.GetBytes(dotnet + "\n" + source)))[..20];
         var cache = CacheDirectory();
         var copy = Path.Combine(cache, "programs", key);
@@ -231,22 +288,13 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
 
         lock (_failed)
         {
-            if (_failed.TryGetValue(key, out var known))
+            if (_failed.TryGetValue(key, out var known) || (withOthers && _failedWithOthers.TryGetValue(key, out known)))
             {
                 return (null, known, false);
             }
         }
 
-        if (OperatingSystem.IsWindows())
-        {
-            Directory.CreateDirectory(cache);
-        }
-        else
-        {
-            // The scripts' code is in here: for the user only, as the history is.
-            Directory.CreateDirectory(cache, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-        }
-
+        CreateCacheDirectory();
         Directory.CreateDirectory(Path.Combine(cache, "programs"));
         using var gate = await LockAsync(Path.Combine(cache, "build.lock"), cancellationToken).ConfigureAwait(false);
         if (Ready(copy) is { } builtMeanwhile)
@@ -282,26 +330,165 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
             return (Path.Combine(copy, CSharpWorkerCode.AssemblyName + ".dll"), [], true);
         }
 
-        var errors = Errors(output);
+        var errors = Errors(output, workspaceRoot);
         if (errors.Count == 0)
         {
             errors.Add(new CSharpError(null, 0, 0, "", "", $"dotnet run failed (exit code {exitCode}):\n{string.Join('\n', output.TakeLast(8))}".TrimEnd()));
         }
 
-        if (errors.Any(e => e.Code.StartsWith("CS", StringComparison.Ordinal)))
+        // Compiler errors come back with the same code; a failed restore may not, but other scripts are left out then.
+        var compiler = errors.Any(e => e.Code.StartsWith("CS", StringComparison.Ordinal));
+        if (compiler || withOthers)
         {
             lock (_failed)
             {
-                if (_failed.Count > 50)
+                var failed = compiler ? _failed : _failedWithOthers;
+                if (failed.Count > 50)
                 {
-                    _failed.Clear();
+                    failed.Clear();
                 }
 
-                _failed[key] = errors; // compiler errors come back with the same code; a failed restore may not
+                failed[key] = errors;
             }
         }
 
         return (null, errors, true);
+    }
+
+    /// <summary>
+    /// The files that the program's #:include and #:project directives bring in, as they are now (paths, sizes, times), as a
+    /// comment for its end: when one of them changes, so does the program, which is then built again (the SDK too sees a
+    /// changed file) instead of the one built before. For a project, those are the files of its folder, the settings that
+    /// MSBuild and NuGet find in the folders above it (<see cref="SettingsAbove"/>), and the same for the projects that it
+    /// references, in turn. In a project's folder and in an #:include with wildcards, only files that builds read count
+    /// (<see cref="BuildInputs"/>). Paths with MSBuild properties ($(…)) are not known here.
+    /// </summary>
+    private static string Inputs(string source)
+    {
+        var files = new HashSet<string>(StringComparer.Ordinal);
+        var projects = new Queue<string>();
+        foreach (var (directive, path) in CSharpWorkerCode.PathsOf(source).Where(p => !p.Path.Contains("$(", StringComparison.Ordinal)))
+        {
+            var wildcard = path.IndexOfAny(['*', '?']);
+            if (wildcard >= 0)
+            {
+                files.UnionWith(Files(path[..(path[..wildcard].LastIndexOfAny(['/', '\\']) + 1)], Path.GetFileName(path)));
+            }
+            else if (directive == "include" && File.Exists(path))
+            {
+                var file = new FileInfo(path);
+                files.Add($"{path}|{file.Length}|{file.LastWriteTimeUtc.Ticks}");
+            }
+            else
+            {
+                projects.Enqueue(path); // a project file, or a folder with one
+            }
+        }
+
+        var folders = new HashSet<string>(StringComparer.Ordinal);
+        var above = new HashSet<string>(StringComparer.Ordinal);
+        var read = new HashSet<string>(StringComparer.Ordinal);
+        while (projects.TryDequeue(out var path))
+        {
+            var isFile = File.Exists(path);
+            var folder = isFile ? Path.GetDirectoryName(path)! : path;
+            if (folders.Add(folder))
+            {
+                files.UnionWith(Files(folder, "*"));
+
+                // The folders above it, up to the first one already looked at (those above it were, too).
+                for (var parent = Path.GetDirectoryName(folder); parent is not null && above.Add(parent); parent = Path.GetDirectoryName(parent))
+                {
+                    foreach (var name in SettingsAbove)
+                    {
+                        var file = new FileInfo(Path.Combine(parent, name));
+                        if (file.Exists)
+                        {
+                            files.Add($"{file.FullName}|{file.Length}|{file.LastWriteTimeUtc.Ticks}");
+                        }
+                    }
+                }
+            }
+
+            string[] found = isFile ? [path]
+                : Directory.Exists(path) ? Directory.GetFiles(path, "*.*proj", new EnumerationOptions { IgnoreInaccessible = true, AttributesToSkip = 0 })
+                : [];
+            foreach (var project in found)
+            {
+                if (read.Add(project))
+                {
+                    foreach (var reference in References(project))
+                    {
+                        projects.Enqueue(reference);
+                    }
+                }
+            }
+        }
+
+        if (files.Count == 0)
+        {
+            return "";
+        }
+
+        var hash = SHA256.HashData(Utf8.GetBytes(string.Join('\n', files.Order(StringComparer.Ordinal))));
+        return $"\n// Files of #:include and #:project: {Convert.ToHexStringLower(hash)[..20]}\n";
+    }
+
+    /// <summary>
+    /// The projects that a project file references (ProjectReference), with full paths. Those whose path MSBuild works out
+    /// from properties ($(…)) or wildcards are not known here and are left out: their changes build nothing again.
+    /// </summary>
+    private static List<string> References(string project)
+    {
+        var references = new List<string>();
+        try
+        {
+            using var stream = File.OpenRead(project);
+            using var reader = XmlReader.Create(stream, new XmlReaderSettings { DtdProcessing = DtdProcessing.Ignore, XmlResolver = null, IgnoreComments = true });
+            while (reader.Read())
+            {
+                if (reader.NodeType == XmlNodeType.Element && reader.LocalName == "ProjectReference" && reader.GetAttribute("Include") is { } include)
+                {
+                    foreach (var item in include.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        if (item.IndexOfAny(['$', '@', '%', '*', '?']) < 0)
+                        {
+                            // Relative to the project; MSBuild takes \ as / on Linux and macOS.
+                            references.Add(Path.GetFullPath(Path.Combine(Path.GetDirectoryName(project)!, item.Replace('\\', '/'))));
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex) when (ex is XmlException or IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            // its build says what is wrong with it
+        }
+
+        return references;
+    }
+
+    /// <summary>
+    /// The files that builds read (<see cref="BuildInputs"/>) in a folder and its subfolders whose names match, but in those
+    /// that builds write (bin, obj), node_modules and hidden ones (.git…).
+    /// </summary>
+    private static List<string> Files(string folder, string pattern)
+    {
+        if (!Directory.Exists(folder))
+        {
+            return [$"{folder}|missing"];
+        }
+
+        var options = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = 0 };
+        return
+        [
+            .. new FileSystemEnumerable<string>(folder, (ref FileSystemEntry entry) => $"{entry.ToFullPath()}|{entry.Length}|{entry.LastWriteTimeUtc.Ticks}", options)
+            {
+                ShouldIncludePredicate = (ref FileSystemEntry entry) => !entry.IsDirectory && FileSystemName.MatchesSimpleExpression(pattern, entry.FileName)
+                    && (BuildInputs.Contains(Path.GetExtension(entry.FileName)) || BuildInputs.Contains(entry.FileName)),
+                ShouldRecursePredicate = (ref FileSystemEntry entry) => entry.FileName is not ("bin" or "obj" or "node_modules") && entry.FileName[0] != '.',
+            },
+        ];
     }
 
     private static string? Ready(string copy)
@@ -334,6 +521,22 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
             Directory.Delete(temporary, recursive: true);
         }
 
+        if (Directory.Exists(copy))
+        {
+            try
+            {
+                // The program first: while a TermRest runs it, deleting it fails (on Windows) and the folder stays whole.
+                File.Delete(Path.Combine(copy, CSharpWorkerCode.AssemblyName + ".dll"));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                File.WriteAllText(Path.Combine(copy, ".ok"), ""); // it runs, so it is complete
+                return;
+            }
+
+            Directory.Delete(copy, recursive: true); // incomplete, or forgotten
+        }
+
         foreach (var file in Directory.EnumerateFiles(output, "*", SearchOption.AllDirectories))
         {
             var target = Path.Combine(temporary, Path.GetRelativePath(output, file));
@@ -341,25 +544,7 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
             File.Copy(file, target, overwrite: true);
         }
 
-        var moved = true;
-        if (Directory.Exists(copy))
-        {
-            try
-            {
-                Directory.Delete(copy, recursive: true); // incomplete, or forgotten
-            }
-            catch (IOException)
-            {
-                moved = false; // a TermRest runs it: it is complete
-                Directory.Delete(temporary, recursive: true);
-            }
-        }
-
-        if (moved)
-        {
-            Directory.Move(temporary, copy);
-        }
-
+        Directory.Move(temporary, copy);
         File.WriteAllText(Path.Combine(copy, ".ok"), "");
     }
 
@@ -432,7 +617,8 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
     /// <summary>Runs dotnet with hidden output; returns its exit code and what it printed.</summary>
     private async Task<(int ExitCode, List<string> Output)> RunAsync(string[] arguments, string workingDirectory, CancellationToken cancellationToken)
     {
-        var info = new ProcessStartInfo(dotnet)
+        var executable = ScriptRuntimeLocator.Executable(dotnet) ?? throw new ScriptException($"The .NET SDK could not be started ({dotnet}): it is not on PATH.");
+        var info = new ProcessStartInfo(executable)
         {
             WorkingDirectory = workingDirectory,
             RedirectStandardInput = true,
@@ -507,20 +693,27 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
         }
     }
 
-    /// <summary>The errors in the build output; those in a script's lines name the script.</summary>
-    private static List<CSharpError> Errors(List<string> output)
+    /// <summary>
+    /// The errors in the build output; those in a script's lines name the script, those in a file that a script brings in
+    /// (#:include, #:project) name that file (relative to the workspace when inside it) and their position.
+    /// </summary>
+    private static List<CSharpError> Errors(List<string> output, string workspaceRoot)
     {
         var errors = new List<CSharpError>();
         foreach (var line in output.Select(l => l.Trim()).Where(l => !Warning().IsMatch(l)))
         {
             if (PositionedError().Match(line) is { Success: true } positioned)
             {
-                var script = CSharpWorkerCode.ScriptIdOf(positioned.Groups["file"].Value);
+                var file = positioned.Groups["file"].Value;
+                var script = CSharpWorkerCode.ScriptIdOf(file);
                 var code = positioned.Groups["code"].Value;
                 var text = positioned.Groups["message"].Value;
-                errors.Add(new CSharpError(script, int.Parse(positioned.Groups["line"].Value, System.Globalization.CultureInfo.InvariantCulture),
-                    int.Parse(positioned.Groups["column"].Value, System.Globalization.CultureInfo.InvariantCulture), code, text,
-                    script is null ? $"{code}: {text} (at the end of the script)" : $"{code}: {text}"));
+                var row = int.Parse(positioned.Groups["line"].Value, System.Globalization.CultureInfo.InvariantCulture);
+                var column = int.Parse(positioned.Groups["column"].Value, System.Globalization.CultureInfo.InvariantCulture);
+                errors.Add(new CSharpError(script, row, column, code, text,
+                    script is not null ? $"{code}: {text}"
+                    : Path.GetFileName(file).Equals(CSharpWorkerCode.AssemblyName + ".cs", StringComparison.OrdinalIgnoreCase) ? $"{code}: {text} (at the end of the script)"
+                    : $"{code}: {text} ({Shown(file, workspaceRoot)}, line {row}, column {column})"));
             }
             else if (OtherError().Match(line) is { Success: true } other)
             {
@@ -531,6 +724,13 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
         }
 
         return errors;
+    }
+
+    /// <summary><paramref name="file"/> relative to the workspace when it is inside it, else as it is.</summary>
+    private static string Shown(string file, string workspaceRoot)
+    {
+        var relative = Path.GetRelativePath(workspaceRoot, file);
+        return relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative) ? file : relative;
     }
 
     /// <summary>A script's compiler errors, as Python shows a syntax error: the first in the message, all in the traceback.</summary>

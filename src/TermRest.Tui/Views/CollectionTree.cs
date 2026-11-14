@@ -4,6 +4,7 @@ using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using TermRest.Core.Postman;
 using TermRest.Core.Workspace;
+using TermRest.Tui.Dialogs;
 using TermRest.Tui.Theming;
 using Attribute = Terminal.Gui.Drawing.Attribute;
 
@@ -164,15 +165,15 @@ internal sealed class CollectionTree : View
 
     private static bool CanExpand(object item) => item is PostmanCollection or FolderNode;
 
-    private static string Describe(object item) => item switch
+    private string Describe(object item) => Ui.Drawable(item switch
     {
-        PostmanCollection collection => $"{(collection.IsDirty ? "● " : "")}{collection.Name}",
+        PostmanCollection collection => $"{(collection.IsDirty ? "● " : "")}{_workspace.DisplayName(collection)}",
         FolderNode folder => folder.Name,
         RequestNode request => $"{ShortMethod(request.Method),-4} {request.Name}",
         _ => item.ToString() ?? "",
-    };
+    });
 
-    private static string ShortMethod(string method) => method.ToUpperInvariant() switch
+    private static string ShortMethod(string method) => Ui.Drawable(method).ToUpperInvariant() switch
     {
         "DELETE" => "DEL",
         "OPTIONS" => "OPT",

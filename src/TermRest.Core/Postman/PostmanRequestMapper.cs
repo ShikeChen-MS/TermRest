@@ -115,12 +115,7 @@ public static class PostmanRequestMapper
         string? value = "";
         if (obj.TryGetPropertyValue("value", out var valueNode))
         {
-            value = valueNode switch
-            {
-                null => null,
-                JsonValue v => v.GetString() ?? v.ToJsonString(),
-                _ => valueNode.ToJsonString(),
-            };
+            value = ValueText(valueNode);
         }
 
         return new KeyValueEntry
@@ -142,6 +137,14 @@ public static class PostmanRequestMapper
         _ => node.GetString(),
     };
 
+    /// <summary>A value as the text that is edited: numbers, booleans and objects as their JSON.</summary>
+    private static string? ValueText(JsonNode? node) => node switch
+    {
+        null => null,
+        JsonValue v => v.GetString() ?? v.ToJsonString(),
+        _ => node.ToJsonString(),
+    };
+
     internal static string? ReadDescription(JsonNode? node) => node is JsonObject obj ? obj["content"].GetString() : node.GetString();
 
     private static void ReadUrl(JsonNode? node, HttpRequestSpec spec)
@@ -156,13 +159,7 @@ public static class PostmanRequestMapper
                 break;
             case JsonObject obj:
                 var query = obj["query"] is JsonArray ? ReadKeyValues(obj["query"]) : null;
-                spec.Url = obj["raw"].GetString() ?? PostmanUrl.BuildRaw(
-                    obj["protocol"].GetString(),
-                    ReadParts(obj["host"], '.'),
-                    obj["port"].GetString(),
-                    ReadParts(obj["path"], '/'),
-                    query ?? [],
-                    obj["hash"].GetString());
+                spec.Url = RawUrl(obj, query);
                 spec.QueryParams = query ?? QueryFromRaw(spec.Url);
                 var variables = ReadKeyValues(obj["variable"]);
                 foreach (var name in PostmanUrl.PathVariableNames(spec.Url))
@@ -177,6 +174,19 @@ public static class PostmanRequestMapper
                 break;
         }
     }
+
+    /// <summary>
+    /// The URL of a URL object: its <c>raw</c> text, else built from its parts (Postman allows either).
+    /// <paramref name="query"/>: its <c>query</c> entries when already read.
+    /// </summary>
+    internal static string RawUrl(JsonObject url, List<KeyValueEntry>? query = null) =>
+        url["raw"].GetString() ?? PostmanUrl.BuildRaw(
+            url["protocol"].GetString(),
+            ReadParts(url["host"], '.'),
+            url["port"].GetString(),
+            ReadParts(url["path"], '/'),
+            query ?? (url["query"] is JsonArray ? ReadKeyValues(url["query"]) : []),
+            url["hash"].GetString());
 
     private static IEnumerable<string> ReadParts(JsonNode? node, char separator) => node switch
     {
@@ -528,7 +538,9 @@ public static class PostmanRequestMapper
         var obj = entry.Source is { } source ? (JsonObject)source.DeepClone() : new JsonObject();
         obj.SetOrdered("key", entry.Key, KeyValueOrder);
 
-        var skipValue = style == KeyValueStyle.FormData && entry.IsFile && !obj.ContainsKey("value");
+        // An unchanged value keeps its JSON type (a number, boolean or object is edited as its text).
+        var skipValue = (style == KeyValueStyle.FormData && entry.IsFile && !obj.ContainsKey("value"))
+                        || (obj.TryGetPropertyValue("value", out var value) && ValueText(value) == entry.Value);
         if (!skipValue)
         {
             obj.SetOrdered("value", entry.Value is null ? null : JsonValue.Create(entry.Value), KeyValueOrder);
@@ -578,7 +590,11 @@ public static class PostmanRequestMapper
 
         if (style == KeyValueStyle.Environment)
         {
-            obj.SetOrdered("enabled", entry.Enabled, KeyValueOrder);
+            // A value without "enabled" counts as enabled: it only gets one once disabled, so an edit doesn't touch the others.
+            if (isNew || !entry.Enabled || obj.ContainsKey("enabled"))
+            {
+                obj.SetOrdered("enabled", entry.Enabled, KeyValueOrder);
+            }
         }
         else if (!entry.Enabled)
         {

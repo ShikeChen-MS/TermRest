@@ -22,12 +22,16 @@ public static class SecretNames
     private static readonly string[] Ending =
     [
         "token", "authorization", "cookie", "cookies", "apikey", "accesskey", "secretkey", "subscriptionkey", "functionskey",
-        "masterkey", "sessionkey", "signingkey", "accountkey", "sharedkey", "sessionid", "sessid", "signature", "assertion",
-        "codeverifier", "pwd",
+        "masterkey", "sessionkey", "signingkey", "accountkey", "sharedkey", "authkey", "sessionid", "sessid", "signature",
+        "assertion", "codeverifier", "pwd",
     ];
 
-    // Short names that are credentials only in URLs: Google API keys (?key=) and Azure SAS signatures (?sig=).
-    private static readonly string[] QueryOnly = ["key", "sig"];
+    // Short names that are credentials only in URLs: Google API keys (?key=), Azure SAS signatures (?sig=) and Firebase
+    // ID tokens or database secrets (?auth=).
+    private static readonly string[] QueryOnly = ["key", "sig", "auth"];
+
+    // Names that look like credentials but never hold one (CORS says whether credentials are allowed: "true").
+    private static readonly string[] NotSecret = ["accesscontrolallowcredentials"];
 
     /// <summary>Lowercase ASCII letters and digits of <paramref name="name"/>, without trailing digits (X-Hub-Signature-256 → xhubsignature).</summary>
     public static string Normalize(string? name)
@@ -66,7 +70,7 @@ public static class SecretNames
     public static bool IsSecret(string? name, NameKind kind, IReadOnlySet<string>? extraNames = null)
     {
         var normalized = Normalize(name);
-        if (normalized.Length == 0)
+        if (normalized.Length == 0 || NotSecret.Contains(normalized, StringComparer.Ordinal))
         {
             return false;
         }

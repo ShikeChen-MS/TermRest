@@ -50,6 +50,31 @@ public class PostmanFidelityTests
         Assert.Equal(before, File.ReadAllBytes(path));
     }
 
+    [Fact]
+    public void Saving_a_file_with_mixed_line_breaks_writes_the_kind_most_lines_have()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        var lf = File.ReadAllText(TestFiles.DemoCollection);
+        var lines = lf.Split('\n');
+        lines[1] += "\r"; // one line saved by a Windows editor, or a merge
+        var mostlyLf = Path.Combine(directory, "lf.postman_collection.json");
+        File.WriteAllText(mostlyLf, string.Join('\n', lines));
+        var crlf = lf.Replace("\n", "\r\n", StringComparison.Ordinal);
+        var mostlyCrLf = Path.Combine(directory, "crlf.postman_collection.json");
+        File.WriteAllText(mostlyCrLf, crlf.Replace("\"info\": {\r\n", "\"info\": {\n", StringComparison.Ordinal));
+
+        foreach (var path in (string[])[mostlyLf, mostlyCrLf])
+        {
+            var collection = PostmanCollection.Load(path);
+            collection.MarkDirty();
+            collection.Save();
+        }
+
+        // Only the stray line changes.
+        Assert.Equal(lf, File.ReadAllText(mostlyLf));
+        Assert.Equal(crlf, File.ReadAllText(mostlyCrLf));
+    }
+
     [Theory]
     [InlineData("plain", "\"plain\"")]
     [InlineData("quote \" and \\ backslash", "\"quote \\\" and \\\\ backslash\"")]

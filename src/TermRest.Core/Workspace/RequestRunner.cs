@@ -40,6 +40,23 @@ public sealed partial class RequestRunner : IDisposable
 
     public int? TimeoutOverrideMs { get; set; }
 
+    /// <summary>
+    /// The proxy URL of the workspace's settings that requests may use: the one the user allowed for this workspace folder
+    /// (read by <see cref="ConfigureProxy"/>; saved in Tools › Settings of the full-screen UI). The settings come with the
+    /// repository a workspace is cloned from, and a proxy sees every request: one not allowed is not used (see <see cref="BlockedProxy"/>).
+    /// </summary>
+    public string? AllowedProxy { get; set; }
+
+    /// <summary>
+    /// The proxy URL of the workspace's settings while it is not the <see cref="AllowedProxy"/>: requests use the system's
+    /// proxy settings then (the OS's, <c>HTTPS_PROXY</c>), as without a proxy setting. Null when the settings name no proxy
+    /// URL ("system", "none") or the one allowed.
+    /// </summary>
+    public string? BlockedProxy =>
+        Workspace.Settings.Proxy is var proxy && WorkspaceSettings.IsProxyUrl(proxy) && !string.Equals(proxy.Trim(), AllowedProxy?.Trim(), StringComparison.Ordinal)
+            ? proxy
+            : null;
+
     /// <summary>Where sent requests are recorded; null turns recording off (see <see cref="ConfigureHistory"/>).</summary>
     public HistoryStore? History { get; set; }
 
@@ -49,19 +66,43 @@ public sealed partial class RequestRunner : IDisposable
     /// <summary>Largest response body kept with a history entry.</summary>
     public int HistoryMaxBodyBytes { get; set; } = 256 * 1024;
 
+    /// <summary>
+    /// The environment requests use: <see cref="EnvironmentOverride"/>, else the workspace's active one. A request reads it
+    /// once, when it starts, and keeps it until it is recorded, so switching while it is on its way changes later requests only.
+    /// </summary>
     public PostmanEnvironment? Environment => EnvironmentOverride ?? Workspace.ActiveEnvironment;
 
-    /// <summary>Turns history recording on or off according to the workspace settings.</summary>
+    /// <summary>
+    /// Turns history recording on or off according to the workspace settings; off while they cannot be read
+    /// (<see cref="ApiWorkspace.SettingsError"/>), since they may turn it off.
+    /// </summary>
     /// <param name="stateDirectory">Overrides the per-user state folder (tests, portable setups).</param>
     public void ConfigureHistory(string? stateDirectory = null)
     {
         var settings = Workspace.Settings;
-        History = settings.HistoryEnabled ? HistoryStore.ForWorkspace(Workspace.RootPath, settings.HistoryLimit, stateDirectory) : null;
-        HistoryMaxBodyBytes = Math.Max(0, settings.HistoryResponseKb) * 1024;
+        History = settings.HistoryEnabled && Workspace.SettingsError is null ? HistoryStore.ForWorkspace(Workspace.RootPath, settings.HistoryLimit, stateDirectory) : null;
+        HistoryMaxBodyBytes = (int)Math.Min(int.MaxValue, Math.Max(0L, settings.HistoryResponseKb) * 1024);
     }
 
+    /// <summary>
+    /// Sets <see cref="AllowedProxy"/> to the proxy URL of the workspace's settings when the user's settings allow it for
+    /// this workspace folder (<see cref="UserSettings.IsProxyAllowed"/>), else to none.
+    /// </summary>
+    /// <param name="userSettingsDirectory">Overrides the user's configuration folder (tests, portable setups).</param>
+    public void ConfigureProxy(string? userSettingsDirectory = null)
+    {
+        var proxy = Workspace.Settings.Proxy;
+        AllowedProxy = WorkspaceSettings.IsProxyUrl(proxy) && UserSettings.Load(userSettingsDirectory).IsProxyAllowed(Workspace.RootPath, proxy) ? proxy : null;
+    }
+
+    /// <summary>The variables of <paramref name="collection"/> as a request sent now sees them (with the current <see cref="Environment"/>).</summary>
     /// <param name="requestVariables">Variables scripts set for this request only (<c>tr.variables</c>); null unsets.</param>
-    public VariableResolver CreateResolver(PostmanCollection? collection, IReadOnlyDictionary<string, string?>? requestVariables = null)
+    public VariableResolver CreateResolver(PostmanCollection? collection, IReadOnlyDictionary<string, string?>? requestVariables = null) =>
+        CreateResolver(Environment, collection, requestVariables);
+
+    /// <param name="environment">The request's environment (see <see cref="Environment"/>).</param>
+    private VariableResolver CreateResolver(PostmanEnvironment? environment, PostmanCollection? collection,
+        IReadOnlyDictionary<string, string?>? requestVariables)
     {
         var scopes = new List<IVariableScope>();
         if (LocalVariables.Count > 0 || requestVariables is { Count: > 0 })
@@ -69,7 +110,7 @@ public sealed partial class RequestRunner : IDisposable
             scopes.Add(new OverlayScope(new DictionaryScope("local", LocalVariables), requestVariables));
         }
 
-        if (Environment is { } environment)
+        if (environment is not null)
         {
             scopes.Add(new OverlayScope(new EntryListScope($"environment '{environment.Name}'", environment.Values), Session.Find(environment)));
         }
@@ -98,52 +139,65 @@ public sealed partial class RequestRunner : IDisposable
             Timeout = timeoutMs > 0 ? TimeSpan.FromMilliseconds(timeoutMs) : null,
             FollowRedirects = settings.FollowRedirects,
             MaxRedirects = settings.MaxRedirects,
-            Proxy = settings.Proxy,
+            // One not allowed: the system's proxy settings, as without one. Trimmed, as requests use it: recordings then find
+            // the password of a URL written with a space before it.
+            Proxy = BlockedProxy is null ? settings.Proxy?.Trim() : null,
             MaxResponseBytes = Math.Max(1, settings.MaxResponseSizeMb) * 1024L * 1024L,
             HttpVersion = settings.HttpVersion,
         };
     }
 
-    public PreparedRequest Prepare(PostmanCollection collection, RequestNode? node, HttpRequestSpec spec) => Prepare(collection, node, spec, spec, null);
+    public PreparedRequest Prepare(PostmanCollection collection, RequestNode? node, HttpRequestSpec spec) =>
+        Prepare(Environment, collection, node, spec, spec, null);
 
+    /// <param name="environment">The request's environment (see <see cref="Environment"/>).</param>
     /// <param name="spec">The request to send (as changed by pre-request scripts).</param>
     /// <param name="source">The request as written: kept in the history, so re-sending it runs its scripts again.</param>
     /// <param name="requestVariables">Variables set by scripts for this request only.</param>
-    private PreparedRequest Prepare(PostmanCollection collection, RequestNode? node, HttpRequestSpec spec, HttpRequestSpec source,
-        IReadOnlyDictionary<string, string?>? requestVariables)
+    private PreparedRequest Prepare(PostmanEnvironment? environment, PostmanCollection collection, RequestNode? node, HttpRequestSpec spec,
+        HttpRequestSpec source, IReadOnlyDictionary<string, string?>? requestVariables)
     {
-        var preparer = new RequestPreparer(CreateResolver(collection, requestVariables), Certificates, CreateDefaults());
+        var preparer = new RequestPreparer(CreateResolver(environment, collection, requestVariables), Certificates, CreateDefaults());
         var auth = node is not null ? collection.GetEffectiveAuth(node, spec) : spec.Auth ?? collection.RootNode.Auth;
         var prepared = preparer.Prepare(spec, auth, collection.BaseDirectory);
         var saved = node is not null && node.Collection == collection && collection.FilePath is not null && node.Parent is not null;
 
-        // History keeps a self-contained copy: inherited auth is stored with the request so it can be re-sent on its own.
+        // History keeps a self-contained copy: inherited auth is stored with the request so it can be re-sent on its own (of
+        // credential sets, the one its URL selected).
         var snapshot = source.Clone();
-        snapshot.Auth ??= auth?.Clone();
+        var used = prepared.AuthUsed;
+        var authInherited = snapshot.Auth is null && used is not null;
+        snapshot.Auth ??= used?.Clone();
         prepared.Source = new RequestSource(
             snapshot,
             collection.FilePath is null ? null : collection.Name,
             saved ? node!.PathInCollection : null,
-            saved ? node!.Name : null);
-        prepared.SecretValues.UnionWith(SecretVariableValues(collection));
-        prepared.SensitiveValues.UnionWith(VariablesNamedLikeSecrets(collection, preparer.Variables, requestVariables));
+            saved ? node!.Name : null,
+            authInherited,
+            Workspace.FileOf(collection));
+        prepared.AddSecretValues(SecretVariableValues(environment, collection, preparer.Variables));
+        prepared.AddSensitiveValues(VariablesNamedLikeSecrets(environment, collection, preparer.Variables, requestVariables));
         return prepared;
     }
 
     /// <summary>Sends a prepared request and records it in <see cref="History"/> and <see cref="Recorder"/> (when on).</summary>
-    public async Task<HttpExchange> SendAsync(PreparedRequest prepared, CancellationToken cancellationToken = default)
+    public Task<HttpExchange> SendAsync(PreparedRequest prepared, CancellationToken cancellationToken = default) =>
+        SendAsync(Environment, prepared, cancellationToken);
+
+    /// <param name="environment">The request's environment (see <see cref="Environment"/>): the history and recordings name it.</param>
+    private async Task<HttpExchange> SendAsync(PostmanEnvironment? environment, PreparedRequest prepared, CancellationToken cancellationToken)
     {
         // No ConfigureAwait(false): UI callers resume on their own thread, which also records the entry.
         var exchange = await Executor.SendAsync(prepared, cancellationToken).ConfigureAwait(true);
-        Record(exchange);
-        Recorder?.Record(exchange, Environment?.Name);
+        Record(exchange, environment?.Name);
+        Recorder?.Record(exchange, environment?.Name);
         return exchange;
     }
 
     public Task<HttpExchange> SendAsync(PostmanCollection collection, RequestNode? node, HttpRequestSpec spec, CancellationToken cancellationToken = default) =>
         SendAsync(collection, node, spec, null, cancellationToken);
 
-    private void Record(HttpExchange exchange)
+    private void Record(HttpExchange exchange, string? environment)
     {
         var request = exchange.Request;
         if (History is not { } history || request.Source is not { } source || exchange.Cancelled
@@ -154,7 +208,7 @@ public sealed partial class RequestRunner : IDisposable
 
         try
         {
-            var entry = HistoryEntry.Create(exchange, source, Environment?.Name, HistoryMaxBodyBytes, out var body);
+            var entry = HistoryEntry.Create(exchange, source, environment, HistoryMaxBodyBytes, out var body);
             history.Add(entry, body);
             exchange.HistoryEntry = entry;
         }
@@ -164,11 +218,15 @@ public sealed partial class RequestRunner : IDisposable
         }
     }
 
-    /// <summary>Values of variables typed "secret" in the environment, collection and globals, including values scripts set.</summary>
-    private List<string> SecretVariableValues(PostmanCollection collection)
+    /// <summary>
+    /// Values of variables typed "secret" in the environment, collection and globals: as written, as scripts set them, and
+    /// as <paramref name="resolver"/> resolves them, which is the value sent (a CLI <c>--var</c> or a value a script set
+    /// for the request may take precedence, and the value may reference other variables).
+    /// </summary>
+    private List<string> SecretVariableValues(PostmanEnvironment? environment, PostmanCollection collection, VariableResolver resolver)
     {
         var secrets = new List<string>();
-        Add(Environment?.Values, Environment is { } environment ? Session.Find(environment) : null);
+        Add(environment?.Values, environment is not null ? Session.Find(environment) : null);
         Add(collection.GetVariables(), Session.Find(collection));
         Add(Workspace.Globals?.Values, Session.Globals);
         return secrets;
@@ -188,6 +246,13 @@ public sealed partial class RequestRunner : IDisposable
                     {
                         secrets.Add(current);
                     }
+
+                    var reference = "{{" + entry.Key + "}}";
+                    var used = resolver.Resolve(reference);
+                    if (used != reference)
+                    {
+                        secrets.Add(used);
+                    }
                 }
             }
         }
@@ -195,21 +260,27 @@ public sealed partial class RequestRunner : IDisposable
 
     /// <summary>
     /// Resolved values of variables named like credentials (password, token, apiKey … and the workspace's extra
-    /// <see cref="WorkspaceSettings.RecordingRedact"/> names) that are not typed "secret": recordings redact them too.
+    /// <see cref="WorkspaceSettings.RecordingRedact"/> names, with those of the <see cref="Recorder"/>, which keeps the
+    /// names removed from the settings since it started) that are not typed "secret": recordings redact them too.
     /// Values set by scripts count as well.
     /// </summary>
-    private IEnumerable<string> VariablesNamedLikeSecrets(PostmanCollection collection, VariableResolver resolver,
+    private IEnumerable<string> VariablesNamedLikeSecrets(PostmanEnvironment? environment, PostmanCollection collection, VariableResolver resolver,
         IReadOnlyDictionary<string, string?>? requestVariables)
     {
         var extraNames = SecretNames.NormalizeAll(Workspace.Settings.RecordingRedact);
-        IEnumerable<KeyValuePair<string, string?>> variables = (Environment?.Values ?? [])
+        if (Recorder is { } recorder)
+        {
+            extraNames.UnionWith(recorder.ExtraNames);
+        }
+
+        IEnumerable<KeyValuePair<string, string?>> variables = (environment?.Values ?? [])
             .Concat(collection.GetVariables())
             .Concat(Workspace.Globals?.Values ?? [])
             .Where(e => e.Enabled)
             .Select(e => new KeyValuePair<string, string?>(e.Key, e.Value));
         variables = variables.Concat(LocalVariables.Select(v => new KeyValuePair<string, string?>(v.Key, v.Value)));
         IEnumerable<IReadOnlyDictionary<string, string?>?> setByScripts =
-            [Environment is { } environment ? Session.Find(environment) : null, Session.Find(collection), Session.Globals, requestVariables];
+            [environment is not null ? Session.Find(environment) : null, Session.Find(collection), Session.Globals, requestVariables];
         variables = variables.Concat(setByScripts.SelectMany(values => values ?? new Dictionary<string, string?>()));
         return variables
             .Where(v => !string.IsNullOrEmpty(v.Value) && SecretNames.IsSecret(v.Key, NameKind.Field, extraNames))

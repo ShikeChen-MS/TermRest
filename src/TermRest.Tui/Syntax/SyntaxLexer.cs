@@ -66,6 +66,16 @@ internal readonly record struct LexState(LexMode Mode, char Quote = '\0', byte Q
 /// </summary>
 internal abstract class SyntaxLexer
 {
+    /// <summary>
+    /// Interpolations nested deeper than this have their code left plain: each level is colored by a nested call, and a
+    /// line could nest thousands of them.
+    /// </summary>
+    private const int MaxNesting = 8;
+
+    /// <summary>How many interpolations deep the line being colored on this thread is.</summary>
+    [ThreadStatic]
+    private static int _nesting;
+
     /// <summary>The lexer of a script language (<see cref="ScriptLanguage"/>), or null for plain text.</summary>
     public static SyntaxLexer? For(string? language) => language switch
     {
@@ -117,6 +127,10 @@ internal abstract class SyntaxLexer
 
         return end - i;
     }
+
+    /// <summary>Whether <paramref name="count"/> <paramref name="c"/> follow each other from <paramref name="i"/> (looking no further).</summary>
+    protected static bool Repeats(ReadOnlySpan<char> line, int i, char c, int count) =>
+        line.Length - i >= count && !line.Slice(i, count).ContainsAnyExcept(c);
 
     /// <summary>Whether the word at <paramref name="i"/> follows a dot: a member (<c>pm.test</c>, <c>x.default</c>), never a keyword.</summary>
     protected static bool IsMember(ReadOnlySpan<char> line, int i) => i > 0 && line[i - 1] == '.';
@@ -173,7 +187,19 @@ internal abstract class SyntaxLexer
         var end = ClosingBracket(line, i, open, close, escape, ref depth);
         var codeEnd = end < 0 ? line.Length : end;
         kinds[i..codeEnd].Clear();
-        Lex(line[i..codeEnd], kinds[i..codeEnd], LexState.Code);
+        if (_nesting < MaxNesting)
+        {
+            _nesting++;
+            try
+            {
+                Lex(line[i..codeEnd], kinds[i..codeEnd], LexState.Code);
+            }
+            finally
+            {
+                _nesting--;
+            }
+        }
+
         if (end < 0)
         {
             state = state with { Depth = (byte)Math.Min(depth, byte.MaxValue) };

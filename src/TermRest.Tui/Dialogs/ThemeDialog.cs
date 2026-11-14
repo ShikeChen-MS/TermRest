@@ -73,7 +73,7 @@ internal static class ThemeDialog
             names.Clear();
             foreach (var theme in themes)
             {
-                names.Add(theme.IsBuiltIn ? theme.Name : $"{theme.Name} *");
+                names.Add(Ui.Drawable(theme.IsBuiltIn ? theme.Name : $"{theme.Name} *"));
             }
 
             list.Value = Math.Max(0, themes.FindIndex(t => string.Equals(t.Name, select, StringComparison.OrdinalIgnoreCase)));
@@ -103,11 +103,17 @@ internal static class ThemeDialog
         };
 
         var copy = new Button { Text = "Copy as custom theme…", X = 1, Y = Pos.AnchorEnd(1) };
-        copy.Accepted += (_, _) =>
+        Ui.OnPress(copy, () =>
         {
             var from = Selected();
-            if (Ui.PromptText(app, "Copy as custom theme", $"Name of the new theme (a copy of {from.Name} you can edit)", $"My {from.Name}") is not { Length: > 0 } name)
+            if (Ui.PromptText(app, "Copy as custom theme", $"Name of the new theme (a copy of {from.Name} you can edit)", ThemeCatalog.FreeName(themes, $"My {from.Name}")) is not { Length: > 0 } name)
             {
+                return;
+            }
+
+            if (ThemeCatalog.FindCustom(themes, name) is { } taken)
+            {
+                Ui.Error(app, "Copy failed", $"A custom theme called '{taken.Name}' exists already ({taken.FilePath}): choose another name.");
                 return;
             }
 
@@ -124,32 +130,38 @@ internal static class ThemeDialog
             {
                 Ui.Error(app, "Copy failed", ex.Message);
             }
-        };
+        });
         var reload = new Button { Text = "Reload theme files", X = Pos.Right(copy) + 1, Y = Pos.AnchorEnd(1) };
-        reload.Accepted += (_, _) =>
+        Ui.OnPress(reload, () =>
         {
             var name = Selected().Name;
             errors.Clear();
             themes = [.. ThemeCatalog.Load(workspace.RootPath, errors, userDirectory)];
             Fill(name);
-        };
+        });
 
         dialog.Add(new Label { Text = "Themes (* custom)", X = 1, Y = 0 }, list, details, preview, workspaceOnly, folderLabel, folder, copy, reload);
         dialog.AddButton(new Button { Text = "Cancel" });
         dialog.AddButton(new Button { Text = "Use theme" });
         Fill(original.Name);
         list.SetFocus();
-        app.Run(dialog);
-
-        if (dialog.Canceled)
+        ColorTheme? chosen = null;
+        try
         {
-            ThemeCatalog.Apply(original);
-            return null;
+            app.Run(dialog);
+            chosen = dialog.Canceled ? null : Selected();
+        }
+        finally
+        {
+            // Cancelled, or ended by an unexpected error: the theme shown before comes back, not the one previewed last.
+            ThemeCatalog.Apply(chosen ?? original);
         }
 
-        var chosen = Selected();
-        ThemeCatalog.Apply(chosen);
-        Save(workspace, chosen, workspaceOnly.Value == CheckState.Checked, userDirectory);
+        if (chosen is not null)
+        {
+            Ui.TrySave(app, () => Save(workspace, chosen, workspaceOnly.Value == CheckState.Checked, userDirectory));
+        }
+
         return chosen;
     }
 

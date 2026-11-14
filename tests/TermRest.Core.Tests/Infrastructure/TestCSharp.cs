@@ -29,6 +29,6 @@ internal static class TestCSharp
         }
 
         return candidates.FirstOrDefault(candidate =>
-            ScriptRuntimeLocator.CheckAsync(ScriptLanguage.CSharp, candidate, Path.GetTempPath()).GetAwaiter().GetResult().Ok);
+            ScriptRuntimeLocator.CheckAsync(ScriptLanguage.CSharp, candidate).GetAwaiter().GetResult().Ok);
     }
 }

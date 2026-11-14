@@ -1,4 +1,8 @@
+using System.Text.Json.Nodes;
 using TermRest.Core.Certificates;
+using TermRest.Core.Http;
+using TermRest.Core.IO;
+using TermRest.Core.Json;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Tests.Infrastructure;
@@ -36,6 +40,77 @@ public class WorkspaceAndCollectionTests
     }
 
     [Fact]
+    public void Environments_of_the_same_name_are_told_apart_by_their_file()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        File.WriteAllText(Path.Combine(directory, "Staging.postman_environment.json"), """{ "name": "Staging", "values": [ { "key": "baseUrl", "value": "https://old" } ] }""");
+        var export = Path.Combine(TestFiles.NewTempDirectory(), "Staging.postman_environment.json");
+        File.WriteAllText(export, """{ "name": "Staging", "values": [ { "key": "baseUrl", "value": "https://new" } ] }""");
+        var workspace = ApiWorkspace.Open(directory);
+
+        // A teammate's updated export, imported next to the old one: it keeps the name.
+        var updated = workspace.ImportEnvironment(export);
+        workspace.ActiveEnvironment = updated;
+        Assert.Same(updated, workspace.ActiveEnvironment);
+        workspace.SaveSettings();
+
+        // Opened again, it is loaded first ("Staging (2)" sorts before "Staging."), and the old one second.
+        var reopened = ApiWorkspace.Open(directory);
+        Assert.Equal(["Staging (2).postman_environment.json", "Staging.postman_environment.json"], reopened.Environments.Select(e => Path.GetFileName(e.FilePath!)));
+        Assert.Equal("https://new", reopened.ActiveEnvironment?.Values[0].Value);
+        reopened.ActiveEnvironment = reopened.Environments[1];
+        reopened.SaveSettings();
+        Assert.Equal("https://old", ApiWorkspace.Open(directory).ActiveEnvironment?.Values[0].Value);
+
+        // The name decides when that file is gone (renamed outside TermRest), and in settings of earlier versions.
+        File.Move(Path.Combine(directory, "Staging.postman_environment.json"), Path.Combine(directory, "Staging-old.postman_environment.json"));
+        Assert.Equal("https://new", ApiWorkspace.Open(directory).ActiveEnvironment?.Values[0].Value);
+        File.WriteAllText(workspace.SettingsPath, """{ "activeEnvironment": "staging" }""");
+        Assert.Equal("https://new", ApiWorkspace.Open(directory).ActiveEnvironment?.Values[0].Value);
+    }
+
+    [Fact]
+    public void Environments_of_the_same_name_are_shown_with_their_file()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        File.WriteAllText(Path.Combine(directory, "Staging.postman_environment.json"), """{ "name": "Staging", "values": [] }""");
+        File.WriteAllText(Path.Combine(directory, "Staging (2).postman_environment.json"), """{ "name": "staging", "values": [] }""");
+        File.WriteAllText(Path.Combine(directory, "Prod.postman_environment.json"), """{ "name": "Prod", "values": [] }""");
+
+        // Where their files have the same name too, with the file's path in the workspace.
+        var folder = Directory.CreateDirectory(Path.Combine(directory, "postman", "environments")).FullName;
+        File.WriteAllText(Path.Combine(folder, "Staging.postman_environment.json"), """{ "name": "Staging", "values": [] }""");
+
+        var workspace = ApiWorkspace.Open(directory);
+
+        Assert.Equal(["Prod", "staging (Staging (2).postman_environment.json)", "Staging (Staging.postman_environment.json)",
+                      "Staging (postman/environments/Staging.postman_environment.json)"],
+            workspace.Environments.Select(workspace.DisplayName));
+    }
+
+    [Fact]
+    public void The_active_environment_s_name_and_file_are_saved_together()
+    {
+        // As "termrest convert dev.postman_environment.json" leaves them: both named "dev".
+        var directory = TestFiles.NewTempDirectory();
+        File.WriteAllText(Path.Combine(directory, "dev.postman_environment.json"), """{ "name": "dev", "values": [] }""");
+        var yamlPath = Path.Combine(Directory.CreateDirectory(Path.Combine(directory, "postman", "environments")).FullName, "dev.environment.yaml");
+        File.WriteAllText(yamlPath, "name: dev\nvalues: []\n");
+        var workspace = ApiWorkspace.Open(directory);
+        workspace.ActiveEnvironment = workspace.Environments.Single(e => !e.IsYaml);
+        workspace.SaveSettings();
+
+        // A git pull changes the settings meanwhile; then the other "dev" is picked.
+        File.WriteAllText(workspace.SettingsPath, """{ "activeEnvironment": "prod", "activeEnvironmentFile": "prod.postman_environment.json" }""");
+        workspace.ActiveEnvironment = workspace.Environments.Single(e => e.IsYaml);
+        workspace.SaveSettings();
+
+        var saved = JsonNode.Parse(File.ReadAllText(workspace.SettingsPath))!;
+        Assert.Equal(("dev", "postman/environments/dev.environment.yaml"), ((string?)saved["activeEnvironment"], (string?)saved["activeEnvironmentFile"]));
+        Assert.Equal(yamlPath, ApiWorkspace.Open(directory).ActiveEnvironment?.FilePath);
+    }
+
+    [Fact]
     public void User_settings_are_kept_in_the_user_s_configuration_folder()
     {
         var directory = TestFiles.NewTempDirectory();
@@ -59,6 +134,57 @@ public class WorkspaceAndCollectionTests
         {
             Environment.SetEnvironmentVariable(UserSettings.DirectoryVariable, previous);
         }
+    }
+
+    [Fact]
+    public void A_proxy_in_the_workspace_settings_is_used_once_allowed_for_its_folder_and_again_after_each_change()
+    {
+        // A cloned repository's settings: a proxy that would see every request, and the CA it would read them with.
+        var root = TestFiles.NewTempDirectory();
+        var config = TestFiles.NewTempDirectory();
+        const string proxy = "http://ada:Pr0xy-s3cret@collect.example:8080";
+        var settings = Path.Combine(Directory.CreateDirectory(Path.Combine(root, ".termrest")).FullName, "settings.json");
+        File.WriteAllText(settings, $$"""{ "proxy": "{{proxy}}", "caBundle": "certs/ca.pem" }""");
+        ExecutionDefaults Defaults(string workspace, out string? blocked)
+        {
+            using var runner = new RequestRunner(ApiWorkspace.Open(workspace));
+            runner.ConfigureProxy(config);
+            blocked = runner.BlockedProxy;
+            return runner.CreateDefaults();
+        }
+
+        var defaults = Defaults(root, out var blocked);
+        Assert.Equal(proxy, blocked);
+        Assert.Null(defaults.Proxy); // the system's proxy settings
+        Assert.Equal(Path.Combine(root, "certs", "ca.pem"), defaults.CaBundlePath); // the other settings apply
+
+        var user = UserSettings.Load(config);
+        Assert.True(user.AllowProxy(root, proxy));
+        Assert.False(user.AllowProxy(root + Path.DirectorySeparatorChar, proxy)); // nothing to save
+        user.Save(config);
+        var saved = File.ReadAllText(Path.Combine(config, "settings.json"));
+        Assert.Contains("\"allowedProxies\": {", saved, StringComparison.Ordinal);
+        Assert.DoesNotContain("Pr0xy-s3cret", saved, StringComparison.Ordinal);
+        Assert.DoesNotContain("collect.example", saved, StringComparison.Ordinal);
+        Assert.Equal(proxy, Defaults(root, out blocked).Proxy);
+        Assert.Null(blocked);
+
+        // The same proxy in another folder, and a changed one (a git pull), must be allowed again.
+        var clone = TestFiles.NewTempDirectory();
+        Directory.CreateDirectory(Path.Combine(clone, ".termrest"));
+        File.Copy(settings, Path.Combine(clone, ".termrest", "settings.json"));
+        Assert.Null(Defaults(clone, out blocked).Proxy);
+        Assert.Equal(proxy, blocked);
+        File.WriteAllText(settings, """{ "proxy": "http://collect.example:3128" }""");
+        Assert.Null(Defaults(root, out blocked).Proxy);
+        Assert.Equal("http://collect.example:3128", blocked);
+
+        // The system's proxy settings, or none, need no approval.
+        File.WriteAllText(settings, """{ "proxy": "none" }""");
+        Assert.Equal("none", Defaults(root, out blocked).Proxy);
+        Assert.Null(blocked);
+        Assert.True(user.AllowProxy(root, null));
+        Assert.Null(user.AllowedProxies);
     }
 
     [Fact]
@@ -156,6 +282,26 @@ public class WorkspaceAndCollectionTests
     }
 
     [Fact]
+    public void New_collection_and_environment_files_get_names_valid_on_every_os()
+    {
+        // A workspace is shared through Git: Windows can't check out a name with | or ?, nor two names differing in case.
+        var root = TestFiles.NewTempDirectory();
+        var workspace = ApiWorkspace.Open(root);
+
+        var collection = workspace.CreateCollection("Orders | v2?");
+        var environment = workspace.CreateEnvironment("CON");
+        var sameButCase = workspace.CreateCollection("orders | V2?");
+        var longName = workspace.CreateEnvironment(new string('x', 300)); // too long for a file name: the name inside keeps it
+
+        Assert.Equal(Path.Combine(root, "Orders - v2-.postman_collection.json"), collection.FilePath);
+        Assert.Equal(Path.Combine(root, "CON-.postman_environment.json"), environment.FilePath);
+        Assert.Equal(Path.Combine(root, "orders - V2- (2).postman_collection.json"), sameButCase.FilePath);
+        Assert.Equal(Path.Combine(root, new string('x', 64) + ".postman_environment.json"), longName.FilePath);
+        Assert.Equal(["Orders | v2?", "orders | V2?"], ApiWorkspace.Open(root).Collections.Select(c => c.Name).Order(StringComparer.Ordinal));
+        Assert.Contains(ApiWorkspace.Open(root).Environments, e => e.Name == new string('x', 300));
+    }
+
+    [Fact]
     public void Certificate_registry_round_trips_newman_format()
     {
         var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
@@ -178,6 +324,31 @@ public class WorkspaceAndCollectionTests
         var reopened = ApiWorkspace.Open(workspace.RootPath);
         Assert.Equal(["dev", "store"], reopened.Certificates.Entries.Select(e => e.Name));
         Assert.Equal(CertificateSourceKind.Store, reopened.Certificates.Entries[1].Kind);
+    }
+
+    [Fact]
+    public void Certificates_changed_on_disk_since_they_were_read_are_saved_over_only_when_told_to()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        var workspace = ApiWorkspace.Open(directory); // no registry yet
+        workspace.Certificates.Entries.Add(new CertificateEntry { Name = "mine", Matches = ["https://mine.example/*"] });
+        var teammate = ApiWorkspace.Open(directory); // a git pull, or another TermRest
+        teammate.Certificates.Entries.Add(new CertificateEntry { Name = "theirs", Matches = ["https://theirs.example/*"] });
+        teammate.SaveCertificates();
+        var pulled = File.ReadAllText(workspace.CertificatesPath);
+
+        Assert.Equal([workspace.CertificatesPath], Assert.Throws<FileChangedException>(workspace.SaveCertificates).Paths);
+        Assert.Equal(pulled, File.ReadAllText(workspace.CertificatesPath));
+
+        workspace.ReloadCertificates();
+        workspace.Certificates.Entries[0].Disabled = true;
+        workspace.SaveCertificates();
+        Assert.True(Assert.Single(ApiWorkspace.Open(directory).Certificates.Entries).Disabled);
+
+        teammate.Certificates.Entries.Add(new CertificateEntry { Name = "more", Matches = ["https://more.example/*"] });
+        Assert.Throws<FileChangedException>(teammate.SaveCertificates);
+        teammate.SaveCertificates(overwriteChanged: true);
+        Assert.Equal([("theirs", false), ("more", false)], ApiWorkspace.Open(directory).Certificates.Entries.Select(e => (e.Name, e.Disabled)));
     }
 
     [Fact]
@@ -208,6 +379,34 @@ public class WorkspaceAndCollectionTests
     }
 
     [Fact]
+    public void Importing_a_collection_the_workspace_would_not_load_where_it_is_copies_it_in()
+    {
+        // A v2.1 export saved under another name (as "openapi2postmanv2 -o collection.json" writes it), in the workspace folder.
+        var directory = TestFiles.NewTempDirectory();
+        var workspace = ApiWorkspace.Open(directory);
+        var export = Path.Combine(directory, "collection.json");
+        File.Copy(TestFiles.DemoCollection, export);
+
+        Assert.Equal(Path.Combine(directory, "TermRest Demo.postman_collection.json"), workspace.ImportCollection(export).FilePath);
+
+        // Added by a git pull where the workspace keeps collections: loaded where it is.
+        var pulled = Path.Combine(directory, "Pulled.postman_collection.json");
+        File.WriteAllText(pulled, """{ "info": { "name": "Pulled", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" }, "item": [] }""");
+        Assert.Equal(pulled, workspace.ImportCollection(pulled).FilePath);
+        Assert.Equal(["Pulled", "TermRest Demo"], ApiWorkspace.Open(directory).Collections.Select(c => c.Name));
+
+        // In the v3 layout it is converted, as a JSON collection from elsewhere is.
+        var root = V3Fixture.Create();
+        var v3 = ApiWorkspace.Open(root);
+        var rootExport = Path.Combine(root, "collection.json");
+        File.Copy(TestFiles.DemoCollection, rootExport);
+        var converted = v3.ImportCollection(rootExport);
+        Assert.True(converted.IsV3);
+        Assert.Equal(Path.Combine(root, "postman", "collections", "TermRest Demo"), converted.FilePath);
+        Assert.NotNull(ApiWorkspace.Open(root).FindCollection(converted.FilePath!));
+    }
+
+    [Fact]
     public void Importing_an_open_environment_refuses_to_drop_unsaved_changes()
     {
         var workspace = OpenSampleCopy();
@@ -222,5 +421,329 @@ public class WorkspaceAndCollectionTests
         var reloaded = workspace.ImportEnvironment(environment.FilePath!);
         Assert.Same(reloaded, Assert.Single(workspace.Environments));
         Assert.Equal("changed", Assert.Single(reloaded.Values).Key);
+    }
+
+    [Fact]
+    public void A_collection_folder_is_found_with_a_trailing_separator()
+    {
+        var folder = V3Fixture.CollectionPath(V3Fixture.Create());
+        var workspace = ApiWorkspace.Open(folder + Path.DirectorySeparatorChar);
+
+        var collection = workspace.FindCollection(folder + Path.DirectorySeparatorChar);
+        Assert.NotNull(collection);
+        Assert.Same(collection, workspace.FindCollection(folder + Path.AltDirectorySeparatorChar));
+        Assert.Same(collection, workspace.FindCollection(folder));
+    }
+
+    [Fact]
+    public void Settings_and_certificates_that_cannot_be_read_are_never_saved_over()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        var config = Directory.CreateDirectory(Path.Combine(directory, ApiWorkspace.ConfigDirectoryName)).FullName;
+        const string settings = "{ \"caBundle\": \"C:\\certs\\ca.pem\", \"proxy\": \"http://proxy:8080\" }"; // a Windows path typed in: invalid JSON
+        const string certificates = "<<<<<<< HEAD\n[]\n=======\n[]\n>>>>>>> theirs\n";
+        File.WriteAllText(Path.Combine(config, "settings.json"), settings);
+        File.WriteAllText(Path.Combine(config, "certificates.json"), certificates);
+
+        var workspace = ApiWorkspace.Open(directory);
+
+        Assert.Equal<string?>([workspace.SettingsError, workspace.CertificatesError], workspace.LoadErrors);
+        Assert.StartsWith(workspace.SettingsPath, workspace.SettingsError, StringComparison.Ordinal);
+        Assert.StartsWith(workspace.CertificatesPath, workspace.CertificatesError, StringComparison.Ordinal);
+        workspace.Settings.Theme = "Nord";
+        Assert.Contains(workspace.SettingsPath, Assert.Throws<IOException>(workspace.SaveSettings).Message, StringComparison.Ordinal);
+        workspace.Certificates.Entries.Add(new CertificateEntry { Name = "new", Matches = ["https://h/*"] });
+        Assert.Contains(workspace.CertificatesPath, Assert.Throws<IOException>(workspace.SaveCertificates).Message, StringComparison.Ordinal);
+        Assert.Equal(settings, File.ReadAllText(workspace.SettingsPath));
+        Assert.Equal(certificates, File.ReadAllText(workspace.CertificatesPath));
+
+        // A file deleted meanwhile (to start over) holds nothing to lose.
+        File.Delete(workspace.SettingsPath);
+        workspace.SaveSettings();
+        Assert.Equal("Nord", ApiWorkspace.Open(directory).Settings.Theme);
+    }
+
+    [Fact]
+    public void Files_with_a_duplicate_key_are_reported_instead_of_crashing()
+    {
+        // A merge conflict resolved by keeping both lines.
+        var directory = TestFiles.NewTempDirectory();
+        File.WriteAllText(Path.Combine(directory, "Api.postman_collection.json"), """
+            { "info": { "name": "Api", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+              "item": [ { "name": "Ping", "description": "ours", "description": "theirs", "request": { "method": "GET", "url": "https://h/ping" } } ] }
+            """);
+        File.WriteAllText(Path.Combine(directory, "dev.postman_environment.json"), """
+            { "name": "dev", "values": [ { "key": "baseUrl", "value": "https://ours", "value": "https://theirs", "enabled": true } ] }
+            """);
+
+        var workspace = ApiWorkspace.Open(directory);
+
+        Assert.Empty(workspace.Collections);
+        Assert.Empty(workspace.Environments);
+        Assert.Equal(2, workspace.LoadErrors.Count(e => e.Contains("Duplicate property", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void Files_with_half_of_a_surrogate_pair_are_reported_instead_of_crashing()
+    {
+        // JavaScript's JSON.stringify writes half of an emoji that was cut in two as an escape.
+        var directory = TestFiles.NewTempDirectory();
+        File.WriteAllText(Path.Combine(directory, "Api.postman_collection.json"), """
+            { "info": { "name": "Api", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+              // a comment may hold "\ud83d", and so may a string whose backslash is escaped:
+              "item": [ { "name": "Ping \\ud83d", "request": { "method": "GET", "url": "https://h/ping" } },
+                        { "name": "Pong \ud83d\ude00", "request": { "method": "GET", "url": "https://h/pong" } } ] }
+            """);
+        File.WriteAllText(Path.Combine(directory, "dev.postman_environment.json"), """
+            { "name": "dev",
+              "values": [ { "key": "greeting", "value": "Hi \ud83d", "enabled": true } ] }
+            """);
+        File.WriteAllText(Path.Combine(directory, "workspace.postman_globals.json"), "{ \"name\": \"Globals\", \"values\": [ { \"key\": \"x\\uDE00\", \"value\": \"\" } ] }");
+
+        var workspace = ApiWorkspace.Open(directory);
+
+        Assert.Equal(["Ping \\ud83d", "Pong 😀"], Assert.Single(workspace.Collections).AllRequests().Select(r => r.Name));
+        Assert.Empty(workspace.Environments);
+        Assert.Null(workspace.Globals);
+        Assert.Equal(2, workspace.LoadErrors.Count);
+        Assert.StartsWith("dev.postman_environment.json: ", workspace.LoadErrors[0], StringComparison.Ordinal);
+        Assert.Contains("\"\\ud83d\" at line 2, column 49", workspace.LoadErrors[0], StringComparison.Ordinal);
+        Assert.Contains("\"\\uDE00\" at line 1, column 45", workspace.LoadErrors[1], StringComparison.Ordinal);
+        Assert.Null(PostmanJson.TryPrettyPrint("{ \"a\": \"\\ud83d\" }"));
+    }
+
+    [Fact]
+    public void Importing_an_environment_writes_it_in_the_workspace_s_format()
+    {
+        var root = V3Fixture.Create();
+        var workspace = ApiWorkspace.Open(root);
+        var outside = TestFiles.NewTempDirectory();
+
+        // Added by a git pull where the workspace keeps environments: loaded where it is.
+        var pulled = Path.Combine(root, "postman", "environments", "Staging.environment.yaml");
+        File.WriteAllText(pulled, "name: Staging\nvalues:\n  - key: token\n    value: s3cret\n    enabled: true\n");
+        Assert.Equal(pulled, workspace.ImportEnvironment(pulled).FilePath);
+
+        // From elsewhere: converted to YAML in the v3 layout.
+        var json = TestFiles.CopyToTemp(TestFiles.DemoEnvironment, outside);
+        var imported = workspace.ImportEnvironment(json);
+        Assert.Equal(Path.Combine(root, "postman", "environments", "Postman Echo.environment.yaml"), imported.FilePath);
+        Assert.Equal(PostmanEnvironment.Load(json).Values.Select(v => v.Key), PostmanEnvironment.Load(imported.FilePath!).Values.Select(v => v.Key));
+
+        // And to JSON in a JSON workspace.
+        var plain = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        var converted = plain.ImportEnvironment(pulled);
+        Assert.Equal(Path.Combine(plain.RootPath, "Staging.postman_environment.json"), converted.FilePath);
+        Assert.Equal("s3cret", PostmanEnvironment.Load(converted.FilePath!).Values[0].Value);
+
+        // A file that cannot be loaded leaves nothing behind, and the error does not show its values.
+        var broken = Path.Combine(outside, "Broken.postman_environment.json");
+        File.WriteAllText(broken, "name: Broken\nvalues:\n  - key: token\n    value: s3cret\n");
+        Assert.DoesNotContain("s3cret", Assert.Throws<InvalidDataException>(() => plain.ImportEnvironment(broken)).Message, StringComparison.Ordinal);
+        Assert.Equal([converted.FilePath], Directory.GetFiles(plain.RootPath));
+        Assert.Equal(["Local", "Staging", "Postman Echo"], workspace.Environments.Select(e => e.Name));
+        Assert.DoesNotContain(ApiWorkspace.Open(root).LoadErrors, e => !e.Contains("non-HTTP", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Importing_a_globals_export_makes_it_the_workspace_s_globals()
+    {
+        var export = Path.Combine(TestFiles.NewTempDirectory(), "My Workspace.postman_globals.json");
+        File.WriteAllText(export, """{ "name": "My Workspace Globals", "values": [ { "key": "tenant", "value": "acme", "enabled": true } ], "_postman_variable_scope": "globals" }""");
+
+        // A JSON workspace keeps its globals in workspace.postman_globals.json.
+        var plain = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        var globals = plain.ImportEnvironment(export);
+        Assert.Same(globals, plain.Globals);
+        Assert.Empty(plain.Environments);
+        Assert.Equal(Path.Combine(plain.RootPath, "workspace.postman_globals.json"), globals.FilePath);
+        Assert.Equal("acme", ApiWorkspace.Open(plain.RootPath).Globals?.Values.Single().Value);
+
+        // The v3 layout in postman/globals/workspace.globals.yaml, where Postman keeps them.
+        var root = V3Fixture.Create();
+        File.Delete(Path.Combine(root, "postman", "globals", "workspace.globals.yaml"));
+        ApiWorkspace.Open(root).ImportEnvironment(export);
+        var reopened = ApiWorkspace.Open(root);
+        Assert.Equal(Path.Combine(root, "postman", "globals", "workspace.globals.yaml"), reopened.Globals?.FilePath);
+        Assert.Equal("acme", reopened.Globals?.Values.Single().Value);
+        Assert.Equal(["Local"], reopened.Environments.Select(e => e.Name));
+    }
+
+    [Fact]
+    public void Importing_globals_is_refused_while_the_workspace_has_its_own()
+    {
+        var export = Path.Combine(TestFiles.NewTempDirectory(), "My Workspace.postman_globals.json");
+        File.WriteAllText(export, """{ "name": "My Workspace Globals", "values": [], "_postman_variable_scope": "globals" }""");
+        var root = V3Fixture.Create();
+        var workspace = ApiWorkspace.Open(root);
+        var own = workspace.Globals!;
+        var before = V3Fixture.Snapshot(root);
+
+        var error = Assert.Throws<InvalidOperationException>(() => workspace.ImportEnvironment(export));
+
+        Assert.Contains(Path.Combine("postman", "globals", "workspace.globals.yaml"), error.Message, StringComparison.Ordinal);
+        Assert.Same(own, workspace.Globals);
+        Assert.Equal(["Local"], workspace.Environments.Select(e => e.Name));
+        Assert.Equal(before, V3Fixture.Snapshot(root));
+
+        // Also one that could not be read: it is not saved over, nor joined by another that Open might load in its place.
+        var directory = TestFiles.NewTempDirectory();
+        File.WriteAllText(Path.Combine(directory, "team.postman_globals.json"), "<<<<<<< HEAD\n");
+        var conflicted = ApiWorkspace.Open(directory);
+        Assert.Null(conflicted.Globals);
+        Assert.Contains("team.postman_globals.json", Assert.Throws<InvalidOperationException>(() => conflicted.ImportEnvironment(export)).Message, StringComparison.Ordinal);
+        Assert.Equal(["team.postman_globals.json"], Directory.GetFiles(directory).Select(Path.GetFileName));
+
+        // Its own file is reloaded, as an open environment file is, but never over unsaved changes.
+        own.SetValue("tenant", "acme");
+        Assert.Contains("unsaved changes", Assert.Throws<InvalidOperationException>(() => workspace.ImportEnvironment(own.FilePath!)).Message, StringComparison.Ordinal);
+        Assert.Same(own, workspace.Globals);
+        own.Save();
+        var reloaded = workspace.ImportEnvironment(own.FilePath!);
+        Assert.Same(reloaded, workspace.Globals);
+        Assert.Equal(("tenant", "acme"), (reloaded.Values.Single().Key, reloaded.Values.Single().Value));
+        Assert.Equal(["Local"], workspace.Environments.Select(e => e.Name));
+    }
+
+    [Fact]
+    public void Saving_settings_writes_only_what_changed_and_keeps_the_rest_of_the_file()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        var path = Path.Combine(Directory.CreateDirectory(Path.Combine(directory, ApiWorkspace.ConfigDirectoryName)).FullName, "settings.json");
+        File.WriteAllText(path, "{\n  // shared with the team\n  \"strictSsl\": false,\n  \"proxy\": \"http://proxy:8080\",\n  \"futureSetting\": [1, 2],\n}\n");
+        var workspace = ApiWorkspace.Open(directory);
+
+        // Nothing changed: nothing written.
+        var written = File.GetLastWriteTimeUtc(path);
+        var text = File.ReadAllText(path);
+        workspace.SaveSettings();
+        Assert.Equal((text, written), (File.ReadAllText(path), File.GetLastWriteTimeUtc(path)));
+
+        // A git pull changes the file meanwhile; this session changes other settings.
+        File.WriteAllText(path, "{ \"strictSsl\": true, \"proxy\": \"http://proxy:8080\", \"futureSetting\": [1, 2], \"recordingRedact\": [\"X-Tenant-Key\"] }");
+        workspace.Settings.Theme = "Nord";
+        workspace.Settings.Proxy = null;
+        workspace.SaveSettings();
+
+        var saved = JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+        Assert.Equal(["strictSsl", "futureSetting", "recordingRedact", "theme"], saved.Select(p => p.Key));
+        Assert.Equal("""{"strictSsl":true,"futureSetting":[1,2],"recordingRedact":["X-Tenant-Key"],"theme":"Nord"}""", saved.ToJsonString());
+        Assert.False(workspace.Settings.StrictSsl, "the settings in use are not reloaded");
+
+        // A file that cannot be read now (a merge conflict) is not saved over.
+        const string conflicted = "<<<<<<< HEAD\n{ \"theme\": \"Nord\" }\n=======\n{ \"theme\": \"Dracula\" }\n>>>>>>> theirs\n";
+        File.WriteAllText(path, conflicted);
+        workspace.Settings.TimeoutMs = 5000;
+        Assert.Contains(path, Assert.Throws<IOException>(workspace.SaveSettings).Message, StringComparison.Ordinal);
+        Assert.Equal(conflicted, File.ReadAllText(path));
+    }
+
+    [Fact]
+    public void Json_files_changed_on_disk_since_they_were_read_are_not_saved_over()
+    {
+        var workspace = OpenSampleCopy();
+        var collection = workspace.Collections[0];
+        var environment = workspace.Environments[0];
+
+        // A git pull changes both files; TermRest's edits meanwhile must not undo that silently.
+        var pulledCollection = File.ReadAllText(collection.FilePath!).Replace("\"name\": \"TermRest Demo\"", "\"name\": \"TermRest Demo v2\"", StringComparison.Ordinal);
+        File.WriteAllText(collection.FilePath!, pulledCollection);
+        var pulledEnvironment = File.ReadAllText(environment.FilePath!).Replace("env-token-123", "env-token-456", StringComparison.Ordinal); // as long
+        File.WriteAllText(environment.FilePath!, pulledEnvironment);
+        File.SetLastWriteTimeUtc(environment.FilePath!, DateTime.UtcNow.AddMinutes(1));
+        var node = collection.FindRequest("Basics/GET with query")!;
+        var spec = node.ReadSpec();
+        spec.Method = "HEAD";
+        collection.UpdateRequest(node, spec);
+        environment.SetValue("baseUrl", "http://localhost:5000");
+
+        Assert.Equal([Path.GetFullPath(collection.FilePath!)], Assert.Throws<FileChangedException>(() => collection.Save()).Paths);
+        Assert.Equal([Path.GetFullPath(environment.FilePath!)], Assert.Throws<FileChangedException>(() => environment.Save()).Paths);
+        Assert.Equal(pulledCollection, File.ReadAllText(collection.FilePath!));
+        Assert.Equal(pulledEnvironment, File.ReadAllText(environment.FilePath!));
+        Assert.True(collection.IsDirty && environment.IsDirty);
+
+        collection.Save(overwriteChanged: true);
+        environment.Save(overwriteChanged: true);
+        Assert.False(collection.IsDirty || environment.IsDirty);
+        var reloaded = PostmanCollection.Load(collection.FilePath!);
+        Assert.Equal(("TermRest Demo", "HEAD"), (reloaded.Name, reloaded.FindRequest("Basics/GET with query")!.ReadSpec().Method));
+        Assert.Equal("http://localhost:5000", PostmanEnvironment.Load(environment.FilePath!).Values[0].Value);
+
+        // Only touched: not a change.
+        File.SetLastWriteTimeUtc(collection.FilePath!, DateTime.UtcNow.AddMinutes(2));
+        collection.MarkDirty();
+        collection.Save();
+    }
+
+    [Fact]
+    public void User_settings_that_cannot_be_read_are_reported_and_never_saved_over()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        var path = Path.Combine(directory, "settings.json");
+        const string text = "{ \"pythonInterpreters\": { \"C:\\work\": \"C:\\Python312\\python.exe\" } }";
+        File.WriteAllText(path, text);
+
+        var settings = UserSettings.Load(directory);
+        settings.Theme = "Nord";
+
+        Assert.StartsWith(path + ": ", settings.LoadError, StringComparison.Ordinal);
+        Assert.Contains(path, Assert.Throws<IOException>(() => settings.Save(directory)).Message, StringComparison.Ordinal);
+        Assert.Equal(text, File.ReadAllText(path));
+        Assert.Null(UserSettings.Load(TestFiles.NewTempDirectory()).LoadError);
+    }
+
+    [Fact]
+    public void Commands_can_open_a_workspace_without_its_other_collections()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        var collection = TestFiles.CopyToTemp(TestFiles.DemoCollection, directory);
+        TestFiles.CopyToTemp(TestFiles.DemoEnvironment, directory);
+        File.WriteAllText(Path.Combine(directory, "Broken.postman_collection.json"), "<<<<<<< HEAD");
+
+        var all = ApiWorkspace.Open(collection);
+        Assert.Single(all.Collections);
+        Assert.Single(all.LoadErrors);
+
+        var requested = ApiWorkspace.Open(collection, CollectionLoading.Requested);
+        Assert.Equal("TermRest Demo", Assert.Single(requested.Collections).Name);
+        Assert.Empty(requested.LoadErrors);
+        Assert.Equal("Postman Echo", Assert.Single(requested.Environments).Name);
+        Assert.Single(ApiWorkspace.Open(directory, CollectionLoading.Requested).LoadErrors); // a workspace folder: every collection
+
+        var none = ApiWorkspace.Open(collection, CollectionLoading.None);
+        Assert.Equal((directory, 0, 0, 1), (none.RootPath, none.Collections.Count, none.LoadErrors.Count, none.Environments.Count));
+    }
+
+    [Fact]
+    public void A_file_in_the_postman_folders_opens_the_workspace_that_holds_them()
+    {
+        // A JSON collection kept in postman/collections belongs to the workspace there, as a v3 collection does.
+        var root = TestFiles.NewTempDirectory();
+        var config = Directory.CreateDirectory(Path.Combine(root, ApiWorkspace.ConfigDirectoryName)).FullName;
+        File.WriteAllText(Path.Combine(config, "settings.json"), """{ "activeEnvironment": "staging", "proxy": "http://proxy:8080" }""");
+        var collection = TestFiles.CopyToTemp(TestFiles.DemoCollection, Directory.CreateDirectory(Path.Combine(root, "postman", "collections")).FullName);
+        var environment = Path.Combine(Directory.CreateDirectory(Path.Combine(root, "postman", "environments")).FullName, "staging.environment.yaml");
+        File.WriteAllText(environment, "name: staging\nvalues: []\n");
+        var globals = Path.Combine(Directory.CreateDirectory(Path.Combine(root, "postman", "globals")).FullName, "workspace.postman_globals.json");
+        File.WriteAllText(globals, """{ "name": "Globals", "values": [], "_postman_variable_scope": "globals" }""");
+
+        var workspace = ApiWorkspace.Open(collection, CollectionLoading.Requested);
+
+        Assert.Equal((root, "http://proxy:8080", environment), (workspace.RootPath, workspace.Settings.Proxy, workspace.ActiveEnvironment?.FilePath));
+        Assert.Same(Assert.Single(workspace.Collections), workspace.FindCollection(collection));
+        Assert.Empty(workspace.LoadErrors);
+
+        // So do environment and globals files there (a globals file is no collection).
+        foreach (var file in new[] { environment, globals })
+        {
+            var opened = ApiWorkspace.Open(file, CollectionLoading.Requested);
+            Assert.Equal((root, globals, 0), (opened.RootPath, opened.Globals?.FilePath, opened.LoadErrors.Count));
+        }
+
+        // A collection anywhere else opens the folder it is in, as before.
+        Assert.Equal(root, ApiWorkspace.Open(TestFiles.CopyToTemp(TestFiles.DemoCollection, root)).RootPath);
+        var exports = Directory.CreateDirectory(Path.Combine(root, "postman", "exports")).FullName;
+        Assert.Equal(exports, ApiWorkspace.Open(TestFiles.CopyToTemp(TestFiles.DemoCollection, exports)).RootPath);
     }
 }

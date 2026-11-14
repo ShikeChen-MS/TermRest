@@ -66,11 +66,19 @@ public static class ThemeCatalog
                                                || (Find(themes, baseName) is not null && !pending.Any(other => other != p && Same(other.Name, baseName))));
             if (ready < 0)
             {
-                // Missing or circular bases: start those from Default.
-                var (file, path, _) = pending[0];
-                errors.Add($"{Path.GetFileName(path)}: base theme '{file.Base}' was not found; using {DefaultName}");
-                file.Base = DefaultName;
-                continue;
+                var missing = pending.FindIndex(p => Find(themes, p.File.Base) is null);
+                if (missing >= 0)
+                {
+                    // Missing or circular bases: start those from Default.
+                    var (file, path, _) = pending[missing];
+                    errors.Add($"{Path.GetFileName(path)}: base theme '{file.Base}' was not found; using {DefaultName}");
+                    file.Base = DefaultName;
+                    continue;
+                }
+
+                // Every base exists, but each waits for another file that replaces it (as after copying Default as
+                // "Default" twice): build them in file order, each on the theme as it is so far.
+                ready = 0;
             }
 
             var (readyFile, readyPath, _) = pending[ready];
@@ -93,6 +101,25 @@ public static class ThemeCatalog
 
     public static ColorTheme? Find(IEnumerable<ColorTheme> themes, string? name) =>
         name is null ? null : themes.LastOrDefault(t => Same(t.Name, name));
+
+    /// <summary>
+    /// The custom theme called <paramref name="name"/>, if there is one. A copy must not take its name: only one theme of a
+    /// name is loaded, the one read last, so the other would never show.
+    /// </summary>
+    public static ColorTheme? FindCustom(IEnumerable<ColorTheme> themes, string name) =>
+        themes.LastOrDefault(t => !t.IsBuiltIn && Same(t.Name, name.Trim()));
+
+    /// <summary><paramref name="name"/>, or the first of "name 2", "name 3" … that no custom theme has.</summary>
+    public static string FreeName(IReadOnlyList<ColorTheme> themes, string name)
+    {
+        var candidate = name;
+        for (var i = 2; FindCustom(themes, candidate) is not null; i++)
+        {
+            candidate = $"{name} {i}";
+        }
+
+        return candidate;
+    }
 
     /// <summary>
     /// The theme to use: <paramref name="requested"/> (the <c>--theme</c> option), else <c>$TERMREST_THEME</c>, else the
@@ -147,22 +174,22 @@ public static class ThemeCatalog
         }
     }
 
-    /// <summary>Writes a copy of <paramref name="theme"/> named <paramref name="name"/> to <paramref name="directory"/>; returns the file.</summary>
+    /// <summary>
+    /// Writes a copy of <paramref name="theme"/> named <paramref name="name"/> to <paramref name="directory"/>; returns the
+    /// file. Its name is valid on every OS and unique ignoring case, as a workspace's themes are shared through Git.
+    /// </summary>
     public static string WriteCopy(ColorTheme theme, string name, string directory)
     {
         Directory.CreateDirectory(directory);
-        var safe = string.Concat(name.Trim().Select(c => Path.GetInvalidFileNameChars().Contains(c) || c is '/' or '\\' or ':' ? '-' : c));
-        if (safe.Length == 0)
+        var safe = name.Trim().Length == 0 ? "theme" : ApiWorkspace.SafeFileName(name);
+        var taken = new HashSet<string>(Directory.EnumerateFileSystemEntries(directory).Select(Path.GetFileName).OfType<string>(), StringComparer.OrdinalIgnoreCase);
+        var file = safe + ".json";
+        for (var i = 2; taken.Contains(file); i++)
         {
-            safe = "theme";
+            file = $"{safe}-{i}.json";
         }
 
-        var path = Path.Combine(directory, safe + ".json");
-        for (var i = 2; File.Exists(path); i++)
-        {
-            path = Path.Combine(directory, $"{safe}-{i}.json");
-        }
-
+        var path = Path.Combine(directory, file);
         File.WriteAllText(path, ThemeFile.CopyOf(theme, name.Trim()).ToJson());
         return path;
     }

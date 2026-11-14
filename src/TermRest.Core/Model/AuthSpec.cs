@@ -24,6 +24,12 @@ public sealed class AuthParam
     public AuthParam Clone() => new() { Key = Key, Value = Value?.DeepClone(), Type = Type, Source = Source };
 }
 
+/// <summary>
+/// One credential set of a v3 collection's or folder's auth: its name, the rules that select it (key and value; Postman
+/// writes <c>url</c> rules, whose value is a URL pattern) and its auth (null: none).
+/// </summary>
+public sealed record CredentialSet(string Name, IReadOnlyList<KeyValuePair<string, string>> Rules, AuthSpec? Auth);
+
 /// <summary>Postman auth block. A missing block (<c>null</c> spec) means "inherit from parent".</summary>
 public sealed class AuthSpec
 {
@@ -35,6 +41,13 @@ public sealed class AuthSpec
     public List<AuthParam> Params { get; set; } = [];
 
     public JsonObject? Source { get; set; }
+
+    /// <summary>
+    /// The credential sets of a v3 collection's or folder's auth, chosen by URL rules: a request uses the first whose rules
+    /// all match its URL (see <see cref="Http.RequestPreparer"/>). This auth is the first set, as shown. Null for one auth.
+    /// Kept in memory only: auth written to JSON (history entries, collections) never holds them.
+    /// </summary>
+    public IReadOnlyList<CredentialSet>? CredentialSets { get; set; }
 
     public string? Get(string key) => Params.FirstOrDefault(p => p.Key == key)?.ValueAsString;
 
@@ -51,7 +64,7 @@ public sealed class AuthSpec
         }
     }
 
-    public AuthSpec Clone() => new() { Type = Type, Params = Params.Select(p => p.Clone()).ToList(), Source = Source };
+    public AuthSpec Clone() => new() { Type = Type, Params = Params.Select(p => p.Clone()).ToList(), Source = Source, CredentialSets = CredentialSets };
 
     public bool ContentEquals(AuthSpec? other)
     {

@@ -190,6 +190,86 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
+    public void Saving_over_a_collection_changed_on_disk_asks_first_and_the_other_files_are_saved_anyway()
+    {
+        var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        using var ui = new Harness(_directory);
+        var environment = ui.Workspace.Environments[0];
+
+        // A git pull changes the collection while it is open.
+        var pulled = File.ReadAllText(path).Replace("\"name\": \"TermRest Demo\"", "\"name\": \"TermRest Demo v2\"", StringComparison.Ordinal);
+        File.WriteAllText(path, pulled);
+        string? notice = null;
+        var onDiskAfterCancel = "";
+        var environmentSaved = false;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Click("{{baseUrl}}/get?foo=bar&source=termrest");
+                ui.App.InjectKey(Key.End);
+                ui.Type("&page=2");
+                environment.SetValue("baseUrl", "http://localhost:5000");
+                ui.App.InjectKey(Key.S.WithCtrl); // asks: Enter is Cancel
+                notice = ui.Window.StatusMessage;
+                onDiskAfterCancel = File.ReadAllText(path);
+                environmentSaved = !environment.IsDirty;
+                ui.App.InjectKey(Key.S.WithCtrl); // asks, and overwrites
+                ui.App.RequestStop();
+            },
+            ("Changed on disk", () => ui.App.InjectKey(Key.Enter)),
+            ("Changed on disk", () => ui.Click("Overwrite")));
+
+        Assert.Equal(2, screens.Count);
+        OnScreen("TermRest Demo.postman_collection.json", screens[0]);
+        Assert.Equal(pulled, onDiskAfterCancel);
+        Assert.Contains("Not saved: TermRest Demo.postman_collection.json changed on disk", notice, StringComparison.Ordinal);
+        Assert.True(environmentSaved);
+        Assert.Equal("http://localhost:5000", PostmanEnvironment.Load(environment.FilePath!).Values.Single(v => v.Key == "baseUrl").Value);
+        var saved = PostmanCollection.Load(path);
+        Assert.Equal(("TermRest Demo", "{{baseUrl}}/get?foo=bar&source=termrest&page=2"), (saved.Name, saved.FindRequest("Basics/GET with query")!.ReadSpec().Url));
+        Assert.StartsWith("Saved TermRest Demo.postman_collection.json", ui.Window.StatusMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Saving_goes_on_after_a_file_fails_for_any_reason_and_logs_the_unexpected_failures()
+    {
+        var state = Path.Combine(_directory, "state");
+        var previousState = Environment.GetEnvironmentVariable(TermRest.Core.History.HistoryStore.StateDirectoryVariable);
+        Environment.SetEnvironmentVariable(TermRest.Core.History.HistoryStore.StateDirectoryVariable, state);
+        try
+        {
+            using var ui = new Harness(_directory);
+            var written = new List<string>();
+            List<string> saved = [];
+
+            var screens = Drive(ui, () =>
+                {
+                    (saved, _) = Dialogs.Ui.SaveEach(ui.App, _directory,
+                    [
+                        new("Broken.postman_collection.json", _ => throw new InvalidOperationException("A value could not be written.")),
+                        new("Locked.postman_environment.json", _ => throw new UnauthorizedAccessException("Access to Locked is denied.")),
+                        new("Dev.postman_environment.json", _ => written.Add("Dev")),
+                        new(null, _ => written.Add("settings")),
+                    ]);
+                    ui.App.RequestStop();
+                },
+                ("Save failed", () => ui.Click("► OK ◄")));
+
+            OnScreen("Broken.postman_collection.json: A value could not be written.", Assert.Single(screens));
+            OnScreen("Access to Locked is denied.", screens[0]);
+            Assert.Equal(["Dev", "settings"], written);
+            Assert.Equal(["Dev.postman_environment.json"], saved);
+            var log = File.ReadAllText(Path.Combine(state, "errors.log"));
+            Assert.Contains("System.InvalidOperationException: A value could not be written.", log, StringComparison.Ordinal);
+            Assert.DoesNotContain("Locked", log, StringComparison.Ordinal); // a disk or permission problem is no bug
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(TermRest.Core.History.HistoryStore.StateDirectoryVariable, previousState);
+        }
+    }
+
+    [Fact]
     public async Task F5_sends_the_request_and_shows_the_response()
     {
         await using var server = await LocalEchoServer.StartAsync();
@@ -222,6 +302,31 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
+    public async Task Enter_on_the_request_open_in_the_tree_goes_to_its_url_bar_and_keeps_its_response()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo");
+        TermRest.Core.Http.HttpExchange? sent = null, shown = null;
+        Terminal.Gui.ViewBase.View? focused = null;
+
+        var screens = Drive(ui, () => ui.App.InjectKey(Key.F5),
+            ("200 OK", () =>
+            {
+                sent = ui.Window.ResponsePane.Exchange;
+                ui.Click("GET  GET with query"); // the request sent, open already
+                ui.App.InjectKey(Key.Enter);
+                shown = ui.Window.ResponsePane.Exchange;
+                focused = ui.App.Navigation!.GetFocused();
+                ui.App.RequestStop();
+            }));
+
+        Assert.Single(screens);
+        Assert.NotNull(sent);
+        Assert.Same(sent, shown);
+        Assert.Equal("{{baseUrl}}/get?foo=bar&source=termrest", Assert.IsAssignableFrom<Terminal.Gui.Views.TextField>(focused).Text);
+    }
+
+    [Fact]
     public void Environment_menu_switches_the_active_environment()
     {
         using var ui = new Harness(_directory);
@@ -237,6 +342,97 @@ public sealed class MainWindowTests : IDisposable
         OnScreen("Env: Postman Echo", screen);
         Assert.Equal("Postman Echo", ui.Workspace.ActiveEnvironment?.Name);
         Assert.Equal("Postman Echo", ApiWorkspace.Open(_directory).ActiveEnvironment?.Name);
+    }
+
+    [Fact]
+    public void Names_are_shown_as_written_and_their_underscores_make_no_hotkeys()
+    {
+        // Terminal.Gui takes the first _ of a view's text as a hotkey marker: it hides it and the next letter becomes a key.
+        var setup = ApiWorkspace.Open(_directory);
+        setup.CreateEnvironment("prod");
+        setup.ActiveEnvironment = setup.CreateEnvironment("dev_local");
+        setup.SaveSettings();
+        var demo = setup.Collections[0];
+        var request = demo.AddRequest(demo.RootNode, "get_pets").PathInCollection;
+        demo.Save();
+        using var ui = new Harness(_directory);
+        var main = "";
+        var afterAltL = "";
+        var saved = "";
+        Terminal.Gui.ViewBase.View? focused = null, afterAltP = null;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.ShowRequest(ui.Workspace.Collections[0].FindRequest(request)!);
+                ui.Window.ShowHistory(false); // the tree has the focus
+                main = ui.Screen();
+                focused = ui.App.Navigation!.GetFocused();
+                ui.App.InjectKey(Key.P.WithAlt); // the letter after the _ of the request's name, in the pane's title
+                afterAltP = ui.App.Navigation.GetFocused();
+                ui.App.InjectKey(Key.L.WithAlt); // the letter after the _ of the environment's name, in the status bar
+                afterAltL = ui.Screen();
+                ui.App.InjectKey(Key.F7);
+            },
+            ("Manage environments…", () => ui.Click("Manage environments…")),
+            ("Active environment:", () =>
+            {
+                // The label naming the active environment is followed by Set active, which its hotkey would press.
+                ui.Click("  prod");
+                ui.App.InjectKey(Key.L.WithAlt);
+                Descendants(ui.App.TopRunnableView!).OfType<Terminal.Gui.Views.Button>().Single(b => b.Text == "Rename…").SetFocus();
+                ui.App.InjectKey(Key.L);
+                ui.Click("Close");
+            }),
+            ("Env:", () =>
+            {
+                ui.App.Driver!.SetScreenSize(180, 45); // room for the status bar's message
+                ui.Window.Editor.FocusUrl();
+                ui.Type("x");
+                ui.App.InjectKey(Key.S.WithCtrl);
+                saved = ui.Screen();
+                ui.App.RequestStop();
+            }));
+
+        Assert.Equal(3, screens.Count);
+        OnScreen("Request — TermRest Demo / get_pets", main);
+        OnScreen("Env: dev_local", main);
+        Assert.Same(focused, afterAltP);
+        Assert.DoesNotContain("Manage environments…", afterAltL, StringComparison.Ordinal);
+        OnScreen("● dev_local", screens[0]);
+        OnScreen("Active environment: dev_local", screens[1]);
+        OnScreen("Env: dev_local", screens[2]);
+        OnScreen("Saved TermRest Demo.postman_collection.json", saved);
+        Assert.Equal("dev_local", ApiWorkspace.Open(_directory).ActiveEnvironment?.Name);
+    }
+
+    [Fact]
+    public void A_certificate_s_name_is_shown_as_written_and_makes_no_hotkey_of_its_underscore()
+    {
+        // The label naming the request's certificate is followed by Manage certificates…, which its hotkey would press.
+        var setup = ApiWorkspace.Open(_directory);
+        setup.Certificates.Entries.Add(new TermRest.Core.Certificates.CertificateEntry
+        {
+            Name = "dev_cert",
+            Matches = ["https://localhost/*"],
+            Pfx = new TermRest.Core.Certificates.FileSource { Src = "missing.pfx" },
+        });
+        setup.SaveCertificates();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = "https://localhost/echo");
+        var settings = "";
+
+        var screens = Drive(ui, () =>
+            {
+                var tab = ui.Find("│Settings│");
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(tab.X + 2, tab.Y)));
+                settings = ui.Screen();
+                ui.App.InjectKey(Key.C.WithAlt); // the letter after the _ of the certificate's name
+                ui.App.InjectKey(Key.C);
+                ui.App.RequestStop();
+            },
+            ("Registry:", () => ui.Click("Close")));
+
+        OnScreen("dev_cert", settings);
+        Assert.Empty(screens); // the certificates dialog never opened
     }
 
     [Fact]
@@ -327,6 +523,9 @@ public sealed class MainWindowTests : IDisposable
         }
     }
 
+    /// <summary>A screen's text with its lines joined and its box-drawing characters left out, so a check doesn't depend on where a dialog wraps.</summary>
+    private static string Unwrapped(string screen) => System.Text.RegularExpressions.Regex.Replace(screen, @"[\s\u2500-\u259F]+", " ");
+
     [Fact]
     public async Task History_pane_lists_sent_requests_and_reopens_them()
     {
@@ -385,6 +584,52 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
+    public async Task The_history_pane_lists_no_more_entries_than_the_history_keeps()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+            runner.History!.MaxEntries = 2;
+        });
+        var sent = 0;
+        var screen = "";
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            if (ui.Window.IsSending && DateTime.UtcNow < deadline)
+            {
+                return true;
+            }
+
+            if (sent == 0)
+            {
+                ui.App.InjectKey(Key.F9); // listed while the requests are sent
+            }
+
+            if (sent < 3 && DateTime.UtcNow < deadline)
+            {
+                ui.App.InjectKey(Key.F5);
+                sent++;
+                return true;
+            }
+
+            screen = ui.Screen();
+            ui.App.RequestStop();
+            return false;
+        });
+
+        ui.App.Run(ui.Window);
+
+        Assert.Equal(3, sent);
+        Assert.StartsWith("GET 127.0.0.1 → 200", ui.Window.StatusMessage, StringComparison.Ordinal);
+        Assert.Equal((2, 2), (ui.Window.HistoryPane.Count, ui.Window.HistoryPane.Rows.Count));
+        OnScreen("History (2)", screen);
+    }
+
+    [Fact]
     public void Pasting_a_curl_command_into_the_url_bar_imports_it()
     {
         using var ui = new Harness(_directory);
@@ -440,6 +685,7 @@ public sealed class MainWindowTests : IDisposable
 
         ui.Window.ImportCurl("curl https://api.example.com/v1/users/42 -H 'Accept: application/json' -u ada:secret", intoCurrent: false);
         var screen = ui.Screen();
+        ui.Window.Editor.MarkClean(); // closing would ask about the imported request, which is in no collection
         ui.App.End(token!);
 
         OnScreen("Request (imported) ●", screen);
@@ -676,6 +922,255 @@ public sealed class MainWindowTests : IDisposable
             ui.Click("► Save ◄");
             return false;
         });
+    }
+
+    [Fact]
+    public async Task A_request_that_could_not_be_recorded_is_said_once_and_not_over_every_later_message()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo");
+        const string Failed = "A request could not be recorded: There is not enough space on the disk.";
+        string first = "", second = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F12);
+
+                // As when writing a request failed (the disk was full for a moment): the recording goes on.
+                typeof(RequestRecorder).GetProperty(nameof(RequestRecorder.LastError))!.SetValue(ui.Runner.Recorder, Failed);
+                ui.App.InjectKey(Key.F5);
+            },
+            ("· 1 request ·", () =>
+            {
+                first = ui.Window.StatusMessage;
+                ui.App.InjectKey(Key.F5);
+            }),
+            ("· 2 requests ·", () =>
+            {
+                second = ui.Window.StatusMessage;
+                var recorder = ui.Runner.Recorder!;
+                ui.Runner.Recorder = null; // not asked about when closing
+                recorder.Discard();
+                ui.App.RequestStop();
+            }));
+
+        Assert.Equal(2, screens.Count);
+        Assert.Equal("⚠ " + Failed, first);
+        Assert.StartsWith("GET 127.0.0.1 → 200", second, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Names_added_to_the_settings_while_recording_are_redacted_from_then_on()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var setup = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        var node = setup.FindRequest("Basics/GET with query")!;
+        var spec = node.ReadSpec();
+        spec.Headers.Add(new KeyValueEntry { Key = "X-Tenant-Key", Value = "t-123456" });
+        setup.UpdateRequest(node, spec);
+        setup.Save();
+
+        // Saving the settings turns the history on: it is kept in this test's folder.
+        var previousState = Environment.GetEnvironmentVariable(TermRest.Core.History.HistoryStore.StateDirectoryVariable);
+        Environment.SetEnvironmentVariable(TermRest.Core.History.HistoryStore.StateDirectoryVariable, Path.Combine(_directory, "state"));
+        try
+        {
+            using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo");
+            var har = Path.Combine(_directory, "recorded.har");
+            var notice = "";
+
+            var screens = Drive(ui, () =>
+                {
+                    ui.App.InjectKey(Key.F12);
+                    ui.Click("Tools");
+                    ui.Click("Settings…"); // returns once the dialog is closed
+                    notice = ui.Window.StatusMessage;
+                    ui.App.InjectKey(Key.F5);
+                },
+                ("Workspace settings", () =>
+                {
+                    var label = ui.Find("Recordings redact");
+                    ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 23, label.Y)));
+                    ui.Type("Tenant-Key");
+                    ui.Click("► Save ◄");
+                }),
+                ("· 1 request ·", () =>
+                {
+                    var recorder = ui.Runner.Recorder!;
+                    ui.Runner.Recorder = null; // not asked about when closing
+                    recorder.Save(har);
+                    ui.App.RequestStop();
+                }));
+
+            Assert.Equal(2, screens.Count);
+            Assert.Equal("Settings saved. The recording also redacts Tenant-Key from now on; requests already recorded are unchanged.", notice);
+            var text = File.ReadAllText(har);
+            Assert.DoesNotContain("t-123456", text, StringComparison.Ordinal);
+            var log = System.Text.Json.Nodes.JsonNode.Parse(text)!["log"]!;
+            Assert.Contains(log["entries"]![0]!["request"]!["headers"]!.AsArray(),
+                h => h!["name"]!.GetValue<string>() == "X-Tenant-Key" && h["value"]!.GetValue<string>() == "[REDACTED]");
+            Assert.Equal(["Tenant-Key"], log["_termrest"]!["redaction"]!["extraNames"]!.AsArray().Select(n => n!.GetValue<string>()));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(TermRest.Core.History.HistoryStore.StateDirectoryVariable, previousState);
+        }
+    }
+
+    [Fact]
+    public void Settings_that_could_not_be_saved_apply_for_the_session_and_are_not_said_to_be_saved()
+    {
+        using var ui = new Harness(_directory);
+        var notice = "";
+
+        var screens = Drive(ui, () =>
+            {
+                // A merge conflict in the file since TermRest read it: saving over it is refused.
+                Directory.CreateDirectory(ui.Workspace.ConfigDirectory);
+                File.WriteAllText(ui.Workspace.SettingsPath, "{ <<<<<<< HEAD");
+                ui.Click("Tools");
+                ui.Click("Settings…"); // returns once the dialog is closed
+                notice = ui.Window.StatusMessage;
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () =>
+            {
+                ui.Click("Verify server certificates");
+                ui.Click("► Save ◄");
+            }),
+            ("Save failed", () => ui.App.InjectKey(Key.Enter)));
+
+        Assert.Equal(2, screens.Count);
+        Assert.Equal("Settings applied for this session, not saved.", notice);
+        Assert.False(ui.Workspace.Settings.StrictSsl);
+    }
+
+    [Fact]
+    public void A_proxy_that_came_with_the_workspace_is_used_once_the_settings_are_saved()
+    {
+        // A cloned repository's settings: its proxy is not used (the system's is), and the UI says so.
+        const string proxy = "http://ada:Pr0xy-s3cret@127.0.0.1:1";
+        Directory.CreateDirectory(Path.Combine(_directory, ".termrest"));
+        File.WriteAllText(Path.Combine(_directory, ".termrest", "settings.json"), $$"""{ "proxy": "{{proxy}}" }""");
+        var userDirectory = TestFiles.NewTempDirectory();
+        using var ui = new Harness(_directory, runner => runner.ConfigureProxy(userDirectory));
+        var notice = ui.Window.StatusMessage;
+        var unused = ui.Runner.CreateDefaults().Proxy;
+        string info = "", dialog = "";
+        var saved = false;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Click("Help");
+                ui.Click("Workspace info"); // returns once the dialog is closed
+                SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out saved, userDirectory);
+                ui.App.RequestStop();
+            },
+            ("Proxy: system", () =>
+            {
+                info = ui.Screen();
+                ui.App.InjectKey(Key.Enter); // OK
+            }),
+            ("Workspace settings", () =>
+            {
+                dialog = ui.Screen();
+                ui.Click("► Save ◄"); // the user's own choice now: allowed for this folder
+            }));
+
+        Assert.Equal(2, screens.Count);
+        Assert.Contains("The proxy in this workspace's settings (.termrest/settings.json) is not used until you allow it: Tools > Settings > Save", notice, StringComparison.Ordinal);
+        Assert.Null(unused);
+        // Joined: the dialog wraps long lines where the screen's width has it (Terminal.Gui may set 120 columns again on Windows).
+        OnScreen("Proxy: system (OS / HTTPS_PROXY settings), not the workspace's http://ada:***@127.0.0.1:1 until you allow it: Tools > Settings > Save", Unwrapped(info));
+        Assert.DoesNotContain("Pr0xy-s3cret", info, StringComparison.Ordinal);
+        OnScreen("⚠ Set by the workspace: not used until you save", dialog);
+        OnScreen("http://ada:***@127.0.0.1:1", dialog); // its password masked, as everywhere; saved as it was
+        Assert.DoesNotContain("Pr0xy-s3cret", dialog, StringComparison.Ordinal);
+        Assert.True(saved);
+        Assert.Null(ui.Runner.BlockedProxy);
+        Assert.Equal(proxy, ui.Runner.CreateDefaults().Proxy);
+        Assert.True(UserSettings.Load(userDirectory).IsProxyAllowed(_directory, proxy));
+        Assert.DoesNotContain("Pr0xy-s3cret", File.ReadAllText(Path.Combine(userDirectory, "settings.json")), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Settings_written_by_hand_as_requests_read_them_can_be_saved()
+    {
+        // No redirects followed (0) and a proxy keyword in another case: valid settings that the dialog must not refuse.
+        Directory.CreateDirectory(Path.Combine(_directory, ".termrest"));
+        File.WriteAllText(Path.Combine(_directory, ".termrest", "settings.json"), """{ "maxRedirects": 0, "proxy": "None" }""");
+        using var ui = new Harness(_directory);
+        var (changed, saved) = (false, false);
+
+        var screens = Drive(ui, () =>
+            {
+                changed = SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out saved, TestFiles.NewTempDirectory());
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () => ui.Click("► Save ◄")));
+
+        Assert.Single(screens);
+        Assert.True(changed && saved);
+        Assert.Equal((0, "none"), (ui.Workspace.Settings.MaxRedirects, ui.Workspace.Settings.Proxy));
+    }
+
+    [Theory]
+    [InlineData("http://ada:***@proxy:3128", "http://ada:s3cret@proxy:3128")] // left as shown
+    [InlineData("http://ada:***@proxy:8080", "http://ada:s3cret@proxy:8080")] // only the port changed
+    [InlineData("http://bob:***@proxy:3128", "http://bob:***@proxy:3128")] // another user: as typed
+    [InlineData("http://ada:n3w@proxy:3128", "http://ada:n3w@proxy:3128")] // a new password
+    [InlineData("none", "none")]
+    public void A_proxy_password_left_masked_in_the_settings_stays_as_it_was(string typed, string saved)
+    {
+        const string Original = "http://ada:s3cret@proxy:3128";
+
+        Assert.Equal(saved, SettingsDialog.Unmasked(typed, PostmanUrl.MaskCredentials(Original), Original));
+        Assert.Equal("http://tok3n@proxy:3128", SettingsDialog.Unmasked("http://***@proxy:3128", "http://***@proxy:3128", "http://tok3n@proxy:3128")); // a user name alone: the credential
+    }
+
+    [Fact]
+    public void The_settings_and_certificates_dialogs_show_every_control_on_terminals_of_80_and_100_columns()
+    {
+        using var ui = new Harness(_directory);
+        var shown = new List<string>();
+        var cut = new List<string>();
+
+        // A dialog does not scroll: each control must be in its content area (its buttons within its border), and it on screen.
+        void Check()
+        {
+            foreach (var columns in (int[])[80, 100])
+            {
+                ui.App.Driver!.SetScreenSize(columns, 30); // set here: an answer to Terminal.Gui's size query sets 120×30 again now and then
+                shown.Add(ui.Screen());
+                var dialog = (Terminal.Gui.Views.Dialog)ui.App.TopRunnableView!;
+                var frame = dialog.FrameToScreen();
+                var content = dialog.ViewportToScreen();
+                var controls = Descendants(dialog).Skip(1).Where(v => v.CanFocus && v.Visible).Select(v => (View: v, Area: content))
+                    .Concat(dialog.Buttons.Select(b => (View: (Terminal.Gui.ViewBase.View)b, Area: Rectangle.Inflate(frame, -1, -1))));
+                cut.AddRange(controls.Where(c => !c.Area.Contains(c.View.ViewportToScreen()))
+                    .Select(c => $"{columns} columns, {dialog.Title}: {c.View.GetType().Name} '{c.View.Text}' at {c.View.ViewportToScreen()}, not in {c.Area}"));
+                if (!new Rectangle(0, 0, columns, 30).Contains(frame))
+                {
+                    cut.Add($"{columns} columns: {dialog.Title} at {frame}");
+                }
+            }
+
+            ui.App.InjectKey(Key.Esc);
+        }
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Click("Tools");
+                ui.Click("Settings…"); // returns once the dialog is closed
+                ui.App.InjectKey(Key.F8); // the client certificates, likewise
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", Check),
+            ("Client certificates", Check));
+
+        Assert.Equal(2, screens.Count);
+        Assert.True(cut.Count == 0, string.Join('\n', cut.Concat(shown)));
+        OnScreen("system (OS / HTTPS_PROXY settings)", shown[0]); // an underscore in a hint is not a hotkey marker
     }
 
     [Fact]
@@ -1119,9 +1614,17 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
-    public void The_scripts_dialog_chooses_a_runtime_for_each_language()
+    public async Task The_scripts_dialog_chooses_a_runtime_for_each_language()
     {
         TestCSharp.Require();
+
+        // Find takes dotnet on PATH, else the .NET installed for the user (~/.dotnet); TERMREST_TEST_DOTNET may name another.
+        var sdk = (await ScriptRuntimeLocator.FindAsync(ScriptLanguage.CSharp, _directory, r => r, TestContext.Current.CancellationToken))?.Runtime;
+        if (sdk is null)
+        {
+            Assert.Skip("Find looks for dotnet on PATH and in ~/.dotnet, and neither is a .NET SDK 10 or later.");
+        }
+
         var settings = TestFiles.NewTempDirectory();
         using var ui = new Harness(_directory);
         string dialog = "", found = "";
@@ -1170,8 +1673,8 @@ public sealed class MainWindowTests : IDisposable
         OnScreen("None chosen: C# scripts do not run.", dialog);
         OnScreen("None chosen: PowerShell scripts do not run.", dialog);
         Assert.True(found.Contains("✓ .NET SDK", StringComparison.Ordinal), $"{dialog}\n----\n{found}");
-        Assert.Equal("dotnet", UserSettings.Load(settings).GetScriptRuntime(ScriptLanguage.CSharp, ui.Workspace.RootPath));
-        Assert.Equal("dotnet", ui.Runner.CSharpRuntime);
+        Assert.Equal(sdk, UserSettings.Load(settings).GetScriptRuntime(ScriptLanguage.CSharp, ui.Workspace.RootPath));
+        Assert.Equal(sdk, ui.Runner.CSharpRuntime);
         Assert.Null(ui.Runner.PythonInterpreter);
     }
 
@@ -1278,10 +1781,10 @@ public sealed class MainWindowTests : IDisposable
 
         // Each column starts at the same place on every row (a message box would center every line on its own).
         int Column(params string[] texts) => Assert.Single(texts.Select(t => At(screen, t).X).Distinct());
-        var keys = Column("F5, Ctrl+Enter", "Esc ", "F2 ", "F8 ", "F9 ");
-        var actions = Column("Send (again to cancel)", "Cancel a running request", "Rename tree item", "Client certificates", "Collections ⇄ History");
-        var moreKeys = Column("F12  ", "Tab, Shift+Tab", "←, → (tab row)", "Shift+F10", "Ctrl+L");
-        var moreActions = Column("Start / stop recording", "Next / previous field", "Previous / next tab", "Focus the URL bar");
+        var keys = Column("F5, Ctrl+Enter", "Esc ", "F2 ", "Insert ", "F8 ");
+        var actions = Column("Send (again to cancel)", "Cancel a running request", "Rename tree item", "Add a table row", "Client certificates");
+        var moreKeys = Column("F9 ", "F12  ", "Tab, Shift+Tab", "←, → (tab row)", "Shift+F10", "Ctrl+L");
+        var moreActions = Column("Collections ⇄ History", "Start / stop recording", "Next / previous field", "Previous / next tab", "Focus the URL bar");
         Assert.True(keys < actions && actions < moreKeys && moreKeys < moreActions, screen);
         Assert.Equal(At(screen, "Esc ").Y + 1, At(screen, "Ctrl+S ").Y);
         OnScreen("Right-click the tree or the history for actions", screen);
@@ -1293,7 +1796,7 @@ public sealed class MainWindowTests : IDisposable
         var wide = MainWindow.KeysHelp(120).Split('\n');
         var narrow = MainWindow.KeysHelp(80).Split('\n');
 
-        Assert.Equal(wide.Length + 8, narrow.Length);
+        Assert.Equal(wide.Length + 9, narrow.Length);
         Assert.Contains("  F12             Start / stop recording", narrow);
         Assert.All(narrow.TakeWhile(l => l.Length > 0), l => Assert.True(l.Length <= 60, l));
         Assert.All(wide, l => Assert.True(l.Length <= 92, l));
@@ -1328,6 +1831,41 @@ public sealed class MainWindowTests : IDisposable
         Assert.Equal(At(screen, "Short: 1").X, At(screen, "A longer label: 2").X);
         Assert.Equal(At(screen, "Short: 1").X, At(screen, "Path: C:\\folder_name").X);
         Assert.Equal(20, System.Text.RegularExpressions.Regex.Count(screen, "folder_name")); // wrapped, not cut; underscores kept
+    }
+
+    [Fact]
+    public void A_help_text_taller_than_the_screen_scrolls_to_its_end()
+    {
+        using var ui = new Harness(_directory);
+        string top = "", end = "";
+        var closed = false;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.Driver!.SetScreenSize(120, 30);
+                ui.Click("Help");
+                ui.Click("Scripting");
+                ui.App.RequestStop();
+            },
+            ("Scripts run in a runtime you choose", () =>
+            {
+                top = ui.Screen();
+                for (var i = 0; i < 6; i++)
+                {
+                    ui.App.InjectKey(Key.PageDown);
+                }
+
+                end = ui.Screen();
+                ui.App.InjectKey(Key.Enter); // OK
+                closed = ui.App.TopRunnable is { StopRequested: true };
+            }));
+
+        Assert.Single(screens);
+        Assert.DoesNotContain("PowerShell: the $tr object", top, StringComparison.Ordinal);
+        OnScreen("PowerShell: the $tr object, as in C#", end);
+        OnScreen("permissions: choose runtimes only for workspaces whose collections you trust.", end);
+        OnScreen("► OK ◄", end);
+        Assert.True(closed);
     }
 
     [Fact]
@@ -1398,6 +1936,2352 @@ public sealed class MainWindowTests : IDisposable
         Assert.True(inPage);
         OnScreen("SSL certificate verification", screen);
     }
+
+    [Fact]
+    public void Certificate_dialog_buttons_do_their_job_and_leave_the_dialog_open()
+    {
+        var setup = ApiWorkspace.Open(_directory);
+        setup.Certificates.Entries.Add(new TermRest.Core.Certificates.CertificateEntry
+        {
+            Name = "Team cert",
+            Matches = ["https://localhost/*"],
+            Pfx = new TermRest.Core.Certificates.FileSource { Src = "missing.pfx" },
+        });
+        setup.SaveCertificates();
+        using var ui = new Harness(_directory);
+
+        var screens = Drive(ui, () =>
+            {
+                CertificatesDialog.Show(ui.App, ui.Workspace, ui.Runner, "https://localhost/api");
+                ui.App.RequestStop();
+            },
+            ("Team cert", () =>
+            {
+                ui.Click("Team cert");
+                ui.App.InjectKey(Key.Enter); // tests the certificate
+            }),
+            ("✗", () => ui.Click("On/Off")),
+            ("Team cert", () => ui.Click("Add PEM…")),
+            ("Leave the key empty", () => ui.Click("Browse…")),
+            ("Filename (▲)", () => ui.App.InjectKey(Key.Esc)),
+            ("Leave the key empty", () => ui.Click("Cancel")),
+            ("Registry:", () => ui.Click("Close")));
+
+        Assert.Equal(7, screens.Count);
+        OnScreen("missing.pfx", screens[1].Split('\n').Single(l => l.Contains('✗', StringComparison.Ordinal)));
+        Assert.Contains("off", screens[2].Split('\n').First(l => l.Contains("Team cert", StringComparison.Ordinal)), StringComparison.Ordinal);
+        Assert.True(Assert.Single(ApiWorkspace.Open(_directory).Certificates.Entries).Disabled);
+    }
+
+    [Fact]
+    public void The_certificate_dialog_asks_before_saving_over_a_registry_changed_on_disk_and_cancel_loads_it()
+    {
+        var setup = ApiWorkspace.Open(_directory);
+        setup.Certificates.Entries.Add(new TermRest.Core.Certificates.CertificateEntry
+        {
+            Name = "Team cert",
+            Matches = ["https://localhost/*"],
+            Pfx = new TermRest.Core.Certificates.FileSource { Src = "team.pfx" },
+        });
+        setup.SaveCertificates();
+        using var ui = new Harness(_directory);
+
+        // A git pull adds a teammate's certificate while TermRest is open.
+        setup.Certificates.Entries.Add(new TermRest.Core.Certificates.CertificateEntry
+        {
+            Name = "Partner cert",
+            Matches = ["https://partner.example.com/*"],
+            Pfx = new TermRest.Core.Certificates.FileSource { Src = "partner.pfx" },
+        });
+        setup.SaveCertificates();
+        var pulled = File.ReadAllText(setup.CertificatesPath);
+        var afterCancel = "";
+
+        var screens = Drive(ui, () =>
+            {
+                CertificatesDialog.Show(ui.App, ui.Workspace, ui.Runner, null);
+                ui.App.RequestStop();
+            },
+            ("Team cert", () =>
+            {
+                ui.Click("Team cert");
+                ui.Click("On/Off");
+            }),
+            ("Changed on disk", () => ui.App.InjectKey(Key.Enter)), // Cancel, the default
+            ("Partner cert", () =>
+            {
+                afterCancel = File.ReadAllText(setup.CertificatesPath);
+                ui.Click("Team cert");
+                ui.Click("On/Off"); // read since: saved without asking
+            }),
+            ("Registry:", () => ui.Click("Close")));
+
+        Assert.Equal(4, screens.Count);
+        OnScreen("certificates.json", screens[1]);
+        OnScreen("Overwrite", screens[1]);
+        Assert.Equal(pulled, afterCancel);
+        Assert.Equal([("Team cert", true), ("Partner cert", false)], ApiWorkspace.Open(_directory).Certificates.Entries.Select(e => (e.Name, e.Disabled)));
+    }
+
+    [Fact]
+    public void Environment_dialog_buttons_do_their_job_and_leave_the_dialog_open()
+    {
+        using var ui = new Harness(_directory);
+
+        var screens = Drive(ui, () =>
+            {
+                EnvironmentsDialog.Show(ui.App, ui.Workspace);
+                ui.App.RequestStop();
+            },
+            ("Active environment: (none)", () => ui.Click("New…")),
+            ("New environment", () =>
+            {
+                ui.Type("Staging");
+                ui.Click("► OK ◄");
+            }),
+            ("Staging", () => ui.Click("Set active")),
+            ("Active environment: Staging", () => ui.Click("Close")));
+
+        Assert.Equal(4, screens.Count);
+        var saved = ApiWorkspace.Open(_directory);
+        Assert.Equal(["Postman Echo", "Staging"], saved.Environments.Select(e => e.Name).Order());
+        Assert.Equal("Staging", saved.ActiveEnvironment?.Name);
+    }
+
+    [Fact]
+    public void Without_an_environment_the_dialog_takes_no_values_until_one_is_created()
+    {
+        // Values typed before an environment exists would have nowhere to go.
+        var empty = TestFiles.NewTempDirectory();
+        using var ui = new Harness(empty);
+
+        var screens = Drive(ui, () =>
+            {
+                EnvironmentsDialog.Show(ui.App, ui.Workspace);
+                ui.App.RequestStop();
+            },
+            ("No environments yet", () => ui.Click("New…")),
+            ("New environment", () =>
+            {
+                ui.App.RaisePasteEvent("Local");
+                ui.Click("► OK ◄");
+            }),
+            ("+ Add", () => ui.Click("Close")));
+
+        Assert.Equal(3, screens.Count);
+        Assert.DoesNotContain("+ Add", screens[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("No environments yet", screens[2], StringComparison.Ordinal);
+        Assert.Equal("Local", Assert.Single(ApiWorkspace.Open(empty).Environments).Name);
+    }
+
+    [Fact]
+    public void The_environment_dialog_goes_on_editing_its_environment_when_new_or_import_fails()
+    {
+        var file = Path.Combine(_directory, "Postman Echo.postman_environment.json");
+        using var ui = new Harness(_directory);
+
+        var screens = Drive(ui, () =>
+            {
+                EnvironmentsDialog.Show(ui.App, ui.Workspace);
+                ui.App.RequestStop();
+            },
+            ("Active environment: (none)", () =>
+            {
+                // New environments go to postman/environments, a folder that can't be made under a file of that name.
+                ui.Workspace.Settings.CollectionFormat = "v3";
+                File.WriteAllText(Path.Combine(_directory, "postman"), "");
+                ui.Click("New…");
+            }),
+            ("New environment", () =>
+            {
+                ui.App.RaisePasteEvent("Staging");
+                ui.Click("► OK ◄");
+            }),
+            ("Cannot create environment", () =>
+            {
+                ui.Workspace.Settings.CollectionFormat = null;
+                File.Delete(Path.Combine(_directory, "postman"));
+                ui.Click("► OK ◄");
+            }),
+            ("Active environment: (none)", () =>
+            {
+                ui.Click("unused");
+                ui.App.InjectKey(Key.Space); // on
+                ui.Click("Import…"); // its own file, changed here: refused
+            }),
+            ("Filename (▲)", () =>
+            {
+                ui.App.RaisePasteEvent(file); // over the folder the picker shows
+                ui.App.InjectKey(Key.Enter);
+            }),
+            ("Import failed", () => ui.Click("► OK ◄")),
+            ("Active environment: (none)", () =>
+            {
+                ui.Click("token");
+                ui.App.InjectKey(Key.Space); // off
+                ui.Click("Set active");
+            }),
+            ("Active environment: Postman Echo", () => ui.Click("Close")));
+
+        Assert.Equal(8, screens.Count);
+        OnScreen("already open", screens[5]);
+        Assert.Equal([true, false, true], PostmanEnvironment.Load(file).Values.Select(v => v.Enabled));
+        var saved = ApiWorkspace.Open(_directory);
+        Assert.Equal("Postman Echo", Assert.Single(saved.Environments).Name);
+        Assert.Equal("Postman Echo", saved.ActiveEnvironment?.Name);
+    }
+
+    [Fact]
+    public void Lists_scrolled_sideways_show_characters_outside_the_BMP_as_replacement_characters()
+    {
+        // Terminal.Gui's lists cut a row scrolled sideways at a UTF-16 index: inside an emoji, drawing it failed.
+        var setup = ApiWorkspace.Open(_directory);
+        setup.CreateEnvironment("Prod 🚀");
+        setup.CreateEnvironment("Prod 🚀"); // both show their file names then: wider than the list
+        var themes = ThemeCatalog.WorkspaceThemesDirectory(_directory);
+        Directory.CreateDirectory(themes);
+        File.WriteAllText(Path.Combine(themes, "rocket.json"), """{ "name": "Rocket 🚀 at night, a theme with a long name", "base": "Nord" }""");
+        using var ui = new Harness(_directory);
+        string environments = "", custom = "", themeList = "";
+        void ScrollRight()
+        {
+            var list = Descendants(ui.App.TopRunnableView!).OfType<Terminal.Gui.Views.ListView>().Single();
+            for (var i = 0; i < 8; i++)
+            {
+                ui.App.InjectMouse(new Mouse { ScreenPosition = list.FrameToScreen().Location, Flags = MouseFlags.WheeledRight });
+            }
+        }
+
+        try
+        {
+            var screens = Drive(ui, () =>
+                {
+                    EnvironmentsDialog.Show(ui.App, ui.Workspace);
+                    ThemeDialog.Show(ui.App, ui.Workspace, Path.Combine(_directory, "user-config"));
+                    ui.App.RequestStop();
+                },
+                ("Active environment:", () =>
+                {
+                    ScrollRight();
+                    environments = ui.Screen();
+                    ui.Click("Close");
+                }),
+                ("Themes (* custom)", () =>
+                {
+                    ui.App.InjectKey(Key.End); // custom themes come last
+                    custom = ui.Screen();
+                    ScrollRight();
+                    themeList = ui.Screen();
+                    ui.Click("Cancel");
+                }));
+
+            Assert.Equal(2, screens.Count);
+            OnScreen("  Prod \uFFFD (Prod \uFFFD", screens[0]);
+            OnScreen(" (Prod \uFFFD.postman_environment", environments); // scrolled past the name's own \uFFFD
+            OnScreen("Rocket \uFFFD at night", custom);
+            Assert.DoesNotContain("Rocket \uFFFD", themeList, StringComparison.Ordinal);
+        }
+        finally
+        {
+            ThemeCatalog.Apply(ThemeCatalog.BuiltIn[0]);
+        }
+    }
+
+    [Fact]
+    public void An_unexpected_error_in_a_dialog_loses_none_of_its_changes()
+    {
+        // The error goes on to the handler of unexpected errors, as any error in the main loop does; here it is caught
+        // where the dialog was opened.
+        var file = Path.Combine(_directory, "Postman Echo.postman_environment.json");
+        var userDirectory = Path.Combine(_directory, "user-config");
+        var original = ThemeCatalog.Current.Name;
+        Exception? environmentsError = null, themeError = null;
+        string statusBar = "", previewed = "", restored = "";
+        List<bool> saved = [];
+        string? active = null;
+        using (var ui = new Harness(_directory))
+        {
+            Drive(ui, () => ui.App.InjectKey(Key.F7),
+                ("Manage environments…", () =>
+                {
+                    environmentsError = Record.Exception(() => ui.Click("Manage environments…"));
+                    statusBar = ui.Screen();
+                    saved = [.. PostmanEnvironment.Load(file).Values.Select(v => v.Enabled)];
+                    active = ApiWorkspace.Open(_directory).ActiveEnvironment?.Name;
+                    ui.App.RequestStop();
+                }),
+                ("Active environment:", () =>
+                {
+                    ui.Click("token");
+                    ui.App.InjectKey(Key.Space); // off
+                    ui.Click("Set active");
+                    throw new InvalidOperationException("Unexpected");
+                }));
+        }
+
+        using (var ui = new Harness(_directory))
+        {
+            try
+            {
+                Drive(ui, () =>
+                    {
+                        themeError = Record.Exception(() => ThemeDialog.Show(ui.App, ui.Workspace, userDirectory));
+                        restored = ThemeCatalog.Current.Name;
+                        ui.App.RequestStop();
+                    },
+                    ("Themes (* custom)", () =>
+                    {
+                        ui.Click("Dracula");
+                        previewed = ThemeCatalog.Current.Name;
+                        throw new InvalidOperationException("Unexpected");
+                    }));
+            }
+            finally
+            {
+                ThemeCatalog.Apply(ThemeCatalog.BuiltIn[0]);
+            }
+        }
+
+        Assert.IsType<InvalidOperationException>(environmentsError);
+        OnScreen("Env: Postman Echo", statusBar);
+        Assert.Equal([true, false, false], saved);
+        Assert.Equal("Postman Echo", active);
+        Assert.IsType<InvalidOperationException>(themeError);
+        Assert.Equal(("Dracula", original), (previewed, restored));
+    }
+
+    [Fact]
+    public void Importing_an_environment_named_as_the_active_one_names_its_file_in_the_status_bar()
+    {
+        var setup = ApiWorkspace.Open(_directory);
+        var active = setup.CreateEnvironment("Production");
+        setup.ActiveEnvironment = active;
+        setup.SaveSettings();
+        var exported = Path.Combine(_directory, "exports", "Production.postman_environment.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(exported)!);
+        File.Copy(active.FilePath!, exported);
+        using var ui = new Harness(_directory);
+        var imported = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Click("File");
+                ui.Click("Import Postman environment…"); // returns once it is imported
+                ui.App.Driver!.SetScreenSize(200, 45); // room for the status bar's message
+                imported = ui.Screen();
+                ui.App.RequestStop();
+            },
+            ("Filename (▲)", () =>
+            {
+                ui.App.RaisePasteEvent(exported);
+                ui.App.InjectKey(Key.Enter);
+            }));
+
+        Assert.Single(screens);
+        Assert.Equal(2, ui.Workspace.Environments.Count(e => e.Name == "Production"));
+        OnScreen("Env: Production (Production.postman_environment.json)", imported);
+    }
+
+    [Fact]
+    public void Editing_a_certificate_from_an_os_store_keeps_its_store()
+    {
+        const string Thumbprint = "0123456789ABCDEF0123456789ABCDEF01234567";
+        var setup = ApiWorkspace.Open(_directory);
+        setup.Certificates.Entries.Add(new TermRest.Core.Certificates.CertificateEntry
+        {
+            Name = "Partner cert",
+            Matches = ["https://partner.example.com/*"],
+            Store = new TermRest.Core.Certificates.StoreSource { StoreName = "TrustedPeople", Thumbprint = Thumbprint },
+        });
+        setup.SaveCertificates();
+        using var ui = new Harness(_directory);
+
+        var screens = Drive(ui, () =>
+            {
+                CertificatesDialog.Show(ui.App, ui.Workspace, ui.Runner, null);
+                ui.App.RequestStop();
+            },
+            ("Partner cert", () =>
+            {
+                ui.Click("Partner cert");
+                ui.Click("Edit…");
+            }),
+            ("Store location", () => ui.Click("► Save ◄")),
+            ("Registry:", () => ui.Click("Close")));
+
+        Assert.Equal(3, screens.Count);
+        var store = Assert.Single(ApiWorkspace.Open(_directory).Certificates.Entries).Store;
+        Assert.Equal(("CurrentUser", "TrustedPeople", Thumbprint), (store?.Location, store?.StoreName, store?.Thumbprint));
+    }
+
+    [Fact]
+    public void Browse_buttons_open_the_file_picker_and_leave_their_dialog_open()
+    {
+        using var ui = new Harness(_directory);
+        bool? settingsSaved = null;
+        var field = new KeyValueEntry();
+
+        var screens = Drive(ui, () =>
+            {
+                settingsSaved = SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out _);
+                field = KeyValueEntryDialog.Show(ui.App, "Edit form field", new KeyValueEntry { Key = "avatar", Type = "text" }, Views.KeyValueKind.FormData);
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () =>
+            {
+                ui.Click("Verify server certificates"); // not saved: the dialog is cancelled
+                ui.Click("Browse…");
+            }),
+            ("Filename (▲)", () => ui.App.InjectKey(Key.Esc)),
+            ("Workspace settings", () => ui.Click("Cancel")),
+            ("Edit form field", () => ui.Click("Browse…")),
+            ("Filename (▲)", () => ui.App.InjectKey(Key.Esc)),
+            ("Edit form field", () => ui.Click("Cancel")));
+
+        Assert.Equal(6, screens.Count);
+        Assert.False(settingsSaved);
+        Assert.True(ui.Workspace.Settings.StrictSsl);
+        Assert.True(ApiWorkspace.ReadSettings(_directory).StrictSsl);
+        Assert.Null(field);
+    }
+
+    [Fact]
+    public void Browse_in_the_recording_dialog_does_not_end_the_recording()
+    {
+        using var ui = new Harness(_directory);
+        using var recorder = RequestRecorder.Start(new RecordingOptions { WorkspaceRoot = _directory });
+        var result = RecordingDialogResult.Saved;
+
+        var screens = Drive(ui, () =>
+            {
+                (result, _) = RecordingDialog.Show(ui.App, recorder, RecordingDialog.DefaultPath(_directory, recorder.StartedAt), RecordingDialogPurpose.Stop);
+                ui.App.RequestStop();
+            },
+            ("Stop recording", () => ui.Click("Browse…")),
+            ("Filename (▲)", () => ui.App.InjectKey(Key.Esc)),
+            ("Stop recording", () => ui.Click("Keep recording")));
+        var recording = recorder.IsRecording;
+        if (recording)
+        {
+            recorder.Discard();
+        }
+
+        Assert.Equal(3, screens.Count);
+        Assert.Equal(RecordingDialogResult.Kept, result);
+        Assert.True(recording);
+        Assert.Empty(Directory.GetFiles(_directory, "*.har"));
+    }
+
+    [Fact]
+    public void Theme_dialog_buttons_leave_the_dialog_open()
+    {
+        var userDirectory = Path.Combine(_directory, "user-config");
+        using var ui = new Harness(_directory);
+        ColorTheme? chosen = ThemeCatalog.Current;
+        try
+        {
+            var screens = Drive(ui, () =>
+                {
+                    chosen = ThemeDialog.Show(ui.App, ui.Workspace, userDirectory);
+                    ui.App.RequestStop();
+                },
+                ("Themes (* custom)", () => ui.Click("Reload theme files")),
+                ("Themes (* custom)", () => ui.Click("Copy as custom theme…")),
+                ("Name of the new theme", () => ui.Click("Cancel")),
+                ("Themes (* custom)", () => ui.Click("Cancel")));
+
+            Assert.Equal(4, screens.Count);
+            Assert.Null(chosen);
+        }
+        finally
+        {
+            ThemeCatalog.Apply(ThemeCatalog.BuiltIn[0]);
+        }
+    }
+
+    [Fact]
+    public void A_theme_copy_never_takes_the_name_of_a_custom_theme()
+    {
+        // Only one theme of a name is loaded, the one read last: a copy named like another custom theme would never show.
+        var userDirectory = Path.Combine(_directory, "user-config");
+        var themesFolder = UserSettings.ThemesDirectory(userDirectory);
+        ThemeCatalog.Apply(ThemeCatalog.BuiltIn[0]);
+        var taken = $"My {ThemeCatalog.BuiltIn[0].Name}";
+        ThemeCatalog.WriteCopy(ThemeCatalog.BuiltIn[0], taken, themesFolder);
+        using var ui = new Harness(_directory);
+        try
+        {
+            var screens = Drive(ui, () =>
+                {
+                    ThemeDialog.Show(ui.App, ui.Workspace, userDirectory);
+                    ui.App.RequestStop();
+                },
+                ("Themes (* custom)", () => ui.Click("Copy as custom theme…")),
+                ("Name of the new theme", () =>
+                {
+                    ui.App.InjectKey(Key.End);
+                    ui.App.InjectKey(Key.Backspace);
+                    ui.App.InjectKey(Key.Backspace); // the name proposed without its " 2": the taken one
+                    ui.Click("► OK ◄");
+                }),
+                ("exists already", () => ui.Click("► OK ◄")),
+                ("Themes (* custom)", () => ui.Click("Copy as custom theme…")),
+                ("Name of the new theme", () => ui.Click("► OK ◄")),
+                ("Custom theme created", () => ui.Click("► OK ◄")),
+                ("Themes (* custom)", () => ui.Click("Cancel")));
+
+            Assert.Equal(7, screens.Count);
+            OnScreen($"{taken} 2", screens[1]);
+            Assert.Equal([$"{taken} 2.json", $"{taken}.json"], Directory.GetFiles(themesFolder).Select(Path.GetFileName).Order(StringComparer.Ordinal));
+        }
+        finally
+        {
+            ThemeCatalog.Apply(ThemeCatalog.BuiltIn[0]);
+        }
+    }
+
+    [Fact]
+    public async Task A_response_that_arrives_after_another_request_was_opened_is_not_shown_there()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/hold"; // answered once released
+            runner.ConfigureHistory(state);
+        });
+        string opened = "", arrivedStatus = "";
+        TermRest.Core.Http.HttpExchange? shownOnArrival = null, sent = null;
+        var step = 0;
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            ui.App.InjectKey(Key.F5); // GET with query
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                server.Release();
+                ui.App.RequestStop();
+                return false;
+            }
+
+            switch (step)
+            {
+                case 0 when ui.Window.ResponsePane.StatusText.StartsWith("Sending GET", StringComparison.Ordinal):
+                    ui.Click("POST POST JSON");
+                    opened = ui.Screen();
+                    server.Release();
+                    step = 1;
+                    break;
+                case 1 when ui.Runner.History!.Load().Count == 1:
+                    shownOnArrival = ui.Window.ResponsePane.Exchange;
+                    arrivedStatus = ui.Window.StatusMessage;
+                    ui.App.InjectKey(Key.F5); // sends POST JSON
+                    step = 2;
+                    break;
+                case 2 when ui.Window.ResponsePane.Exchange is { } exchange:
+                    sent = exchange;
+                    ui.App.RequestStop();
+                    return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("POST     ▼ {{baseUrl}}/post", opened);
+        OnScreen("No response yet", opened);
+        Assert.DoesNotContain("Cancel", opened, StringComparison.Ordinal); // the Send button is POST JSON's
+        Assert.Null(shownOnArrival);
+        Assert.Equal("Response", ui.Window.ResponseTitle);
+        Assert.StartsWith("Earlier request: GET 127.0.0.1 → 200", arrivedStatus, StringComparison.Ordinal);
+        Assert.Equal("/hold/post", System.Text.Json.Nodes.JsonNode.Parse(sent!.Response!.Body)!["path"]!.GetValue<string>());
+        Assert.Equal(["/hold/post", "/hold/get?foo=bar&source=termrest"], ui.Runner.History!.Load().Select(e => new Uri(e.Url).PathAndQuery));
+    }
+
+    [Fact]
+    public async Task A_request_added_to_a_collection_with_Ctrl_N_keeps_its_response_and_its_send()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        using var ui = new Harness(_directory);
+        var arrived = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.ImportCurl($"curl {server.BaseUrl}/hold/imported", intoCurrent: false);
+                ui.App.InjectKey(Key.F5);
+            },
+            ("Sending GET", () => ui.App.InjectKey(Key.N.WithCtrl)), // while it is on its way
+            ("Name (in TermRest Demo / Basics)", () =>
+            {
+                ui.Click("► OK ◄");
+                server.Release();
+            }),
+            ("200 OK", () =>
+            {
+                arrived = ui.Window.StatusMessage;
+                ui.App.InjectKey(Key.S.WithCtrl);
+                ui.App.RequestStop();
+            }));
+
+        Assert.Equal(3, screens.Count);
+        Assert.StartsWith("GET 127.0.0.1 → 200", arrived, StringComparison.Ordinal); // not "Earlier request: …"
+        Assert.Equal("/hold/imported", ui.Window.ResponsePane.Exchange!.Request.Uri!.AbsolutePath);
+        var saved = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        Assert.Contains($"{server.BaseUrl}/hold/imported", saved.AllRequests().Select(r => r.ReadSpec().Url));
+    }
+
+    [Fact]
+    public void A_request_added_to_a_collection_with_Ctrl_N_says_what_it_inherits_there()
+    {
+        using var ui = new Harness(_directory);
+        IEnumerable<string> AuthNotes() => Descendants(ui.Window.Editor).OfType<Views.AuthEditor>().Single().SubViews
+            .SelectMany(Descendants).OfType<Terminal.Gui.Views.Label>().Select(l => l.Text);
+        List<string> imported = [], added = [];
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.ShowRequest(ui.Workspace.Collections[0].FindRequest("Auth/Auth inherited from folder")!); // its folder is the target
+                ui.Window.ImportCurl("curl https://api.example.com/v1/me", intoCurrent: false);
+                imported = [.. AuthNotes()];
+                ui.App.InjectKey(Key.N.WithCtrl);
+            },
+            ("Name (in TermRest Demo / Auth)", () => ui.Click("► OK ◄")),
+            ("Request — TermRest Demo / Auth/", () =>
+            {
+                added = [.. AuthNotes()];
+                ui.App.InjectKey(Key.S.WithCtrl);
+                ui.App.RequestStop();
+            }));
+
+        Assert.Equal(2, screens.Count);
+        Assert.Contains("No auth is set on the collection.", imported); // a scratch request's
+        Assert.Contains("Currently: Bearer Token from folder 'Auth'.", added);
+        Assert.DoesNotContain("No auth is set on the collection.", added);
+    }
+
+    [Fact]
+    public void Changes_to_a_request_outside_a_collection_are_not_lost_without_asking()
+    {
+        const string Imported = "https://api.example.com/v1/users/42";
+        using var ui = new Harness(_directory);
+        string afterCancel = "", afterDelete = "", afterDiscard = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.ImportCurl($"curl {Imported} -H 'Accept: application/json'", intoCurrent: false);
+                ui.Click("POST POST JSON"); // asks: Cancel keeps the imported request
+                afterCancel = ui.Window.Editor.Spec.Url;
+                ui.Click("Request");
+                ui.Click("Delete…"); // POST JSON, selected in the tree but not open
+                afterDelete = ui.Window.Editor.Spec.Url;
+                ui.Click("GET  GET with query"); // asks: Discard opens it
+                afterDiscard = ui.Window.Editor.Spec.Url;
+                ui.Window.ImportCurl($"curl {Imported} -H 'Accept: application/json'", intoCurrent: false);
+                ui.App.InjectKey(Key.Q.WithCtrl); // asks: Add to collection…, then saving quits
+            },
+            ("Unsaved request", () => ui.Click("Cancel")),
+            ("Delete request 'POST JSON'?", () => ui.Click("► Delete ◄")),
+            ("Unsaved request", () => ui.Click("Discard")),
+            ("Unsaved request", () => ui.Click("Add to collection…")),
+            ("Name (in TermRest Demo / Basics)", () => ui.Click("► OK ◄")),
+            ("Unsaved changes", () => ui.Click("► Save ◄")));
+
+        Assert.Equal(6, screens.Count);
+        Assert.Equal((Imported, Imported), (afterCancel, afterDelete));
+        Assert.Equal("{{baseUrl}}/get?foo=bar&source=termrest", afterDiscard);
+        Assert.False(ui.Window.IsRunning);
+        var saved = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        Assert.Null(saved.FindRequest("Basics/POST JSON"));
+        Assert.StartsWith("Basics/", saved.AllRequests().Single(r => r.ReadSpec().Url == Imported).PathInCollection, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Saving_an_edited_history_request_to_a_collection_keeps_the_changes()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+
+        var screens = Drive(ui, () => ui.App.InjectKey(Key.F5),
+            ("200 OK", () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("200 GET    /echo/get");
+                ui.Click("{{baseUrl}}/get?foo=bar&source=termrest");
+                ui.App.InjectKey(Key.End);
+                ui.Type("&edited=1");
+                ui.App.InjectSequence(InputInjectionExtensions.RightButtonClick(ui.Find("200 GET    /echo/get")));
+                ui.Click("Save to collection…");
+            }),
+            ("Name (in TermRest Demo / Basics)", () => ui.Click("► OK ◄")),
+            ("Request — TermRest Demo / Basics/", () =>
+            {
+                ui.App.InjectKey(Key.S.WithCtrl);
+                ui.App.RequestStop();
+            }));
+
+        Assert.Equal(3, screens.Count);
+        var saved = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        Assert.Contains("{{baseUrl}}/get?foo=bar&source=termrest&edited=1", saved.AllRequests().Select(r => r.ReadSpec().Url));
+    }
+
+    [Fact]
+    public async Task A_history_request_whose_credentials_were_masked_asks_before_it_is_sent_again()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner => runner.ConfigureHistory(state));
+        var auth = new AuthSpec { Type = "basic" };
+        auth.Set("username", "ada");
+        auth.Set("password", "typed-s3cret");
+        await ui.Runner.SendAsync(PostmanCollection.Create("Scratch"), null, new HttpRequestSpec { Url = server.BaseUrl + "/echo/masked", Auth = auth }, null,
+            TestContext.Current.CancellationToken);
+        string? notice = null;
+        var sentAfterCancel = -1;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/masked");
+                notice = ui.Window.StatusMessage;
+                ui.App.InjectKey(Key.F5); // asks, and is cancelled
+                ui.App.InjectKey(Key.F5); // asks: Enter is Cancel
+                sentAfterCancel = ui.Runner.History!.Load().Count;
+                ui.App.InjectKey(Key.F5); // asks, and is sent
+            },
+            ("Masked credentials", () => ui.App.InjectKey(Key.Esc)),
+            ("Masked credentials", () => ui.App.InjectKey(Key.Enter)),
+            ("Masked credentials", () => ui.Click("Send ***")),
+            ("200 OK", () => ui.App.RequestStop()));
+
+        Assert.Equal(4, screens.Count);
+        Assert.Contains("***", notice, StringComparison.Ordinal);
+        Assert.Equal(1, sentAfterCancel);
+        Assert.Equal(2, ui.Runner.History!.Load().Count);
+    }
+
+    [Fact]
+    public void Names_are_taken_without_the_spaces_around_them()
+    {
+        using var ui = new Harness(_directory);
+        List<string?> names = [];
+
+        var screens = Drive(ui, () =>
+            {
+                names.Add(Dialogs.Ui.PromptText(ui.App, "First name", "Name"));
+                names.Add(Dialogs.Ui.PromptText(ui.App, "Second name", "Name"));
+                ui.App.RequestStop();
+            },
+            ("First name", () =>
+            {
+                ui.Type("  Ada  ");
+                ui.Click("► OK ◄");
+            }),
+            ("Second name", () =>
+            {
+                ui.Type("   ");
+                ui.Click("► OK ◄");
+            }));
+
+        Assert.Equal(2, screens.Count);
+        Assert.Equal(["Ada", ""], names); // spaces alone are no name: New request, Rename … then do nothing
+    }
+
+    [Fact]
+    public void The_recording_clock_counts_hours_past_a_day()
+    {
+        using var ui = new Harness(_directory);
+        var indicator = new Views.RecordingIndicator();
+        ui.Window.Add(indicator);
+
+        indicator.ShowRecording(DateTimeOffset.Now - new TimeSpan(25, 3, 0), 2);
+
+        Assert.Contains(" REC 25:03:0", indicator.Caption, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Status_bar_shortcuts_do_not_act_behind_a_dialog()
+    {
+        using var ui = new Harness(_directory);
+        string? name = null;
+        var stillRunning = false;
+
+        var screens = Drive(ui, () =>
+            {
+                name = Dialogs.Ui.PromptText(ui.App, "Name it", "Name");
+                stillRunning = ui.Window.IsRunning;
+                ui.App.InjectKey(Key.Q.WithCtrl); // in the main window, it quits
+            },
+            ("Name it", () => ui.App.InjectKey(Key.Q.WithCtrl)),
+            ("Name it", () =>
+            {
+                ui.App.InjectKey(Key.F5);
+                ui.App.InjectKey(Key.F8);
+            }),
+            ("Name it", () =>
+            {
+                ui.Type("Ada");
+                ui.Click("► OK ◄");
+            }));
+
+        Assert.Equal(3, screens.Count);
+        Assert.Equal("Ada", name);
+        Assert.True(stillRunning);
+        Assert.StartsWith("No response yet", ui.Window.ResponsePane.StatusText, StringComparison.Ordinal);
+        Assert.False(ui.Window.IsRunning);
+    }
+
+    [Fact]
+    public void A_workspace_folder_that_cannot_be_opened_leaves_the_current_one_open()
+    {
+        var other = Path.Combine(_directory, "other");
+        Directory.CreateDirectory(other);
+        var missing = Path.Combine(_directory, "missing");
+        using var ui = new Harness(_directory);
+        var stayed = false;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.OpenWorkspaceFrom(missing);
+                stayed = ui.Window.IsRunning && ui.Window.NextWorkspace is null;
+                ui.Window.OpenWorkspaceFrom(other);
+            },
+            ("Cannot open workspace", () => ui.Click("► OK ◄")));
+
+        OnScreen("does not exist", Assert.Single(screens));
+        Assert.True(stayed);
+        Assert.False(ui.Window.IsRunning);
+        Assert.Equal(other, ui.Window.NextWorkspace?.RootPath);
+        Assert.Equal(2, TuiApp.Run(missing)); // nor does the first one end the program
+    }
+
+    [Fact]
+    public void Unexpected_errors_are_logged_in_the_users_own_state_folder()
+    {
+        var state = Path.Combine(_directory, "state");
+
+        var log = TuiApp.LogUnexpectedError(new InvalidOperationException("first"), state);
+        TuiApp.LogUnexpectedError(new InvalidOperationException("second"), state);
+
+        Assert.Equal(Path.Combine(state, "errors.log"), log);
+        var text = File.ReadAllText(log);
+        Assert.Contains("System.InvalidOperationException: first", text, StringComparison.Ordinal);
+        Assert.Contains("System.InvalidOperationException: second", text, StringComparison.Ordinal);
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(log));
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(state));
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)] // the state folder can't be written: the error is shown all the same
+    public async Task An_unexpected_error_after_sending_is_shown_and_logged_and_TermRest_goes_on(bool canLog)
+    {
+        var state = Path.Combine(_directory, "state");
+        if (!canLog)
+        {
+            File.WriteAllText(state, "a file where the folder would be");
+        }
+
+        var previousState = Environment.GetEnvironmentVariable(TermRest.Core.History.HistoryStore.StateDirectoryVariable);
+        Environment.SetEnvironmentVariable(TermRest.Core.History.HistoryStore.StateDirectoryVariable, state);
+        try
+        {
+            await using var server = await LocalEchoServer.StartAsync();
+            using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo");
+
+            // Once the response is in, a step fails (saying the result in the status bar): an exception that leaves the
+            // async void method sending the request would end the process.
+            var failed = false;
+            foreach (var shortcut in Descendants(ui.Window).OfType<Terminal.Gui.Views.Shortcut>())
+            {
+                shortcut.TitleChanged += (_, e) =>
+                {
+                    if (!failed && e.Value.Contains("→ 200", StringComparison.Ordinal))
+                    {
+                        failed = true;
+                        throw new InvalidOperationException("The result could not be shown.");
+                    }
+                };
+            }
+
+            var goesOn = false;
+            var screens = Drive(ui, () => ui.App.InjectKey(Key.F5),
+                ("Unexpected error", () => ui.Click("► OK ◄")),
+                ("200 OK", () =>
+                {
+                    goesOn = ui.Window.IsRunning && !ui.Window.IsSending;
+                    ui.App.RequestStop();
+                }));
+
+            Assert.Equal(2, screens.Count);
+            OnScreen("The result could not be shown.", screens[0]);
+            Assert.True(goesOn);
+            if (!canLog)
+            {
+                Assert.DoesNotContain("Details were", screens[0], StringComparison.Ordinal);
+                return;
+            }
+
+            OnScreen("Details were", screens[0]);
+            Assert.Contains("System.InvalidOperationException: The result could not be shown.", File.ReadAllText(Path.Combine(state, "errors.log")),
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(TermRest.Core.History.HistoryStore.StateDirectoryVariable, previousState);
+        }
+    }
+
+    [Fact]
+    public void The_ui_runs_at_full_pace_only_while_it_is_in_use()
+    {
+        using var ui = new Harness(_directory);
+        var idle = Application.MaximumIterationsPerSecond;
+        var busy = false;
+        var seen = new List<(bool Active, ushort Rate)>();
+        using var pace = new UiPace(ui.App, () => busy) { ActiveFor = TimeSpan.FromMilliseconds(300) };
+        void Note() => seen.Add((pace.IsActive, Application.MaximumIterationsPerSecond));
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            Note();
+            ui.Click("Collections");
+            Note();
+            busy = true; // a request is on its way
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(900), () =>
+        {
+            Note();
+            busy = false;
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(1700), () =>
+        {
+            Note();
+            ui.App.RequestStop();
+            return false;
+        });
+
+        ui.App.Run(ui.Window);
+
+        (bool, ushort)[] expected = [(false, idle), (true, TuiApp.IterationsPerSecond), (true, TuiApp.IterationsPerSecond), (false, idle)];
+        Assert.Equal(expected, seen);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="act"/> from the main loop while <paramref name="steps"/> answer the dialogs it opens: each
+    /// step waits until its text is on screen (and no dialog is closing), then acts; the screens they saw are returned
+    /// (fewer than the steps when one did not come). The next step is scheduled before a step acts, as an action that
+    /// opens a dialog returns only once that is closed. After 20 s whatever is open is closed, without unsaved changes,
+    /// so a test fails instead of hanging.
+    /// </summary>
+    private static List<string> Drive(Harness ui, Action act, params (string WaitFor, Action Act)[] steps)
+    {
+        var screens = new List<string>();
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        void Next(int index)
+        {
+            if (index == steps.Length)
+            {
+                return;
+            }
+
+            ui.App.AddTimeout(TimeSpan.FromMilliseconds(50), () =>
+            {
+                var screen = ui.Screen();
+                if (ui.App.TopRunnable is { StopRequested: true } || !screen.Contains(steps[index].WaitFor, StringComparison.Ordinal))
+                {
+                    return DateTime.UtcNow < deadline;
+                }
+
+                screens.Add(screen);
+                Next(index + 1);
+                steps[index].Act();
+                return false;
+            });
+        }
+
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            Next(0);
+            act();
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromSeconds(1), () =>
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                if (ui.App.TopRunnableView == ui.Window)
+                {
+                    ui.Window.Editor.MarkClean();
+                    ui.App.InjectKey(Key.S.WithCtrl);
+                }
+
+                ui.App.RequestStop();
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+        return screens;
+    }
+
+    [Fact]
+    public void Space_and_clicking_the_checkbox_column_turn_table_rows_on_and_off()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        var debug = ui.Find("debug"); // the disabled query parameter; foo is two rows above it
+
+        ui.Click("debug");
+        ui.App.InjectKey(Key.Space);
+        var afterSpace = ui.Window.Editor.Spec.Clone();
+        ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(debug.X - 2, debug.Y - 2)));
+        var afterClick = ui.Window.Editor.Spec.Clone();
+        var screen = ui.Screen();
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        Assert.True(afterSpace.QueryParams.Single(q => q.Key == "debug").Enabled);
+        Assert.Equal("{{baseUrl}}/get?foo=bar&source=termrest&debug=1", afterSpace.Url);
+        Assert.False(afterClick.QueryParams.Single(q => q.Key == "foo").Enabled);
+        Assert.Equal("{{baseUrl}}/get?source=termrest&debug=1", afterClick.Url);
+        OnScreen("☐│foo", screen);
+        OnScreen("☑│debug", screen);
+        var saved = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json")).FindRequest("Basics/GET with query")!.ReadSpec();
+        Assert.Equal([false, true, true], saved.QueryParams.Select(q => q.Enabled));
+    }
+
+    [Fact]
+    public void The_history_filter_stays_quick_with_thousands_of_entries()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        var entries = Enumerable.Range(0, 5_000).Select(i => new TermRest.Core.History.HistoryEntry
+        {
+            Id = i.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Time = DateTimeOffset.Now,
+            Method = "GET",
+            Url = $"https://api.example.com/items/{i}",
+            Item = new System.Text.Json.Nodes.JsonObject { ["name"] = $"Item {i}" },
+            Status = 200,
+        }).ToList();
+        ui.App.InjectKey(Key.F9);
+        var filter = ui.Find("Filter:");
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        ui.Window.HistoryPane.SetEntries(entries, "No requests sent yet.");
+        ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(filter.X + 9, filter.Y)));
+        ui.Type("/49");
+        watch.Stop();
+        var rows = ui.Window.HistoryPane.Rows.ToList();
+        var screen = ui.Screen();
+        ui.App.End(token!);
+
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5), $"Filtering took {watch.Elapsed}."); // 0.3 s here; 96 s when each row was added on its own
+        Assert.Equal(111, rows.Count); // items/49, items/490…499 and items/4900…4999
+        Assert.EndsWith("200 GET    /items/49", rows[0], StringComparison.Ordinal);
+        OnScreen("200 GET    /items/49 ", screen);
+    }
+
+    [Fact]
+    public void Deleting_words_and_cutting_lines_in_a_text_editor_change_the_request()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.Click("POST POST JSON");
+        ui.Click("Body");
+        ui.Click("Ada Lovelace");
+        var editor = Assert.IsType<Views.TextArea>(ui.App.Navigation!.GetFocused());
+        var bodies = new List<(string Editor, string Request)>();
+        foreach (var key in (Key[])[Key.Delete.WithCtrl, Key.K.WithCtrl, Key.Backspace.WithCtrl, Key.Backspace.WithCtrl.WithShift])
+        {
+            ui.App.InjectKey(key);
+            bodies.Add((editor.GetText(), ui.Window.Editor.Spec.Body.Raw));
+        }
+
+        var modified = ui.Window.Editor.IsModified;
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        Assert.Equal(4, bodies.Select(b => b.Editor).Distinct().Count()); // each key changed the text
+        Assert.All(bodies, body => Assert.Equal(body.Editor, body.Request));
+        Assert.True(modified);
+        var saved = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json")).FindRequest("Basics/POST JSON")!.ReadSpec();
+        Assert.Equal(bodies[^1].Editor, saved.Body.Raw);
+    }
+
+    [Fact]
+    public void Ctrl_L_and_Ctrl_N_are_left_to_the_window_in_text_editors()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        var dialogs = new List<string>();
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            // Runs only while a dialog is open: notes what it shows and closes it.
+            dialogs.Add(ui.Screen());
+            ui.App.InjectKey(Key.Esc);
+            return true;
+        });
+        ui.Click("POST POST JSON");
+        ui.Click("Body");
+        ui.Click("Ada Lovelace");
+        var editor = Assert.IsType<Views.TextArea>(ui.App.Navigation!.GetFocused());
+
+        var ctrlLHandled = editor.NewKeyDownEvent(Key.L.WithCtrl);
+        ui.App.InjectKey(Key.N.WithCtrl);
+        editor.SetFocus();
+        ui.App.InjectKey(Key.L.WithCtrl);
+        var focused = ui.App.Navigation!.GetFocused();
+        ui.App.End(token!);
+
+        Assert.False(ctrlLHandled); // left to the window (Focus URL bar), not TextView's color picker
+        OnScreen("Name (in TermRest Demo / Basics)", Assert.Single(dialogs)); // New request, not the cursor moving down
+        Assert.Equal("UrlField", focused?.GetType().Name);
+    }
+
+    [Fact]
+    public void Auth_tokens_and_key_values_are_masked_like_passwords()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.Click("POST POST JSON");
+        ui.Click("Auth");
+        var shown = new List<string>();
+        (string Type, string Field, string Secret)[] fields = [("Bearer Token", "Token", "bearer-s3cret"), ("API Key", "Value", "apikey-s3cret"), ("OAuth 2.0 (access token)", "Access token", "oauth-s3cret")];
+        foreach (var (type, field, secret) in fields)
+        {
+            ui.Click(type);
+            var label = ui.Find(field);
+            ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 17, label.Y)));
+            ui.Type(secret);
+            shown.Add(ui.Screen());
+        }
+
+        var auth = ui.Window.Editor.Spec.Auth;
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        Assert.All(shown, screen => Assert.DoesNotContain("s3cret", screen, StringComparison.Ordinal));
+        Assert.Equal(("oauth2", "oauth-s3cret"), (auth?.Type, auth?.Get("accessToken")));
+    }
+
+    [Fact]
+    public void Enter_on_an_environment_value_edits_it_and_the_dialog_stays_open()
+    {
+        using var ui = new Harness(_directory);
+
+        var screens = Drive(ui, () =>
+            {
+                EnvironmentsDialog.Show(ui.App, ui.Workspace);
+                ui.App.RequestStop();
+            },
+            ("Active environment:", () =>
+            {
+                ui.Click("disabled values are ignored"); // a value only this dialog shows
+                ui.App.InjectKey(Key.Enter); // returns once the row's editor is closed
+            }),
+            ("Edit variable", () => ui.App.InjectKey(Key.Esc)),
+            ("Active environment:", () => ui.Click("Close")));
+
+        Assert.Equal(3, screens.Count); // the Environments dialog was still open to close
+    }
+
+    [Fact]
+    public void Editing_a_row_keeps_what_was_left_alone_whole()
+    {
+        const string Pem = "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----";
+        var setup = ApiWorkspace.Open(_directory);
+        var echo = Assert.Single(setup.Environments);
+        echo.SetValues([.. echo.Values, new KeyValueEntry { Key = "client_key", Value = Pem, Description = "PEM\nPKCS#8", Type = "default" }]);
+        echo.Save();
+        using var ui = new Harness(_directory);
+        KeyValueEntry? flag = null;
+
+        var screens = Drive(ui, () =>
+            {
+                EnvironmentsDialog.Show(ui.App, ui.Workspace);
+                flag = KeyValueEntryDialog.Show(ui.App, "Edit query parameter", new KeyValueEntry { Key = "flag", Value = null }, Views.KeyValueKind.QueryParams);
+                ui.App.RequestStop();
+            },
+            ("client_key", () => ui.App.InjectSequence(InputInjectionExtensions.LeftButtonDoubleClick(ui.Find("client_key")))),
+            ("Edit variable", () =>
+            {
+                ui.Click("mask value");
+                ui.Click("► OK ◄");
+            }),
+            ("Active environment:", () => ui.Click("Close")),
+            ("Edit query parameter", () => ui.App.InjectKey(Key.Enter)));
+
+        Assert.Equal(4, screens.Count);
+        OnScreen("MIIB", screens[1]); // all of it, to edit
+        var saved = Assert.Single(ApiWorkspace.Open(_directory).Environments).Values.Single(v => v.Key == "client_key");
+        Assert.Equal((Pem, "PEM\nPKCS#8", true), (saved.Value, saved.Description, saved.IsSecret));
+        Assert.Equal(("flag", null), (flag?.Key, flag?.Value)); // not ?flag=
+    }
+
+    [Fact]
+    public void Bulk_edit_applied_without_a_change_changes_no_row()
+    {
+        // Terminal.Gui keeps each character composed (NFC): the bulk text read back is not the text it was given.
+        const string Decomposed = "Cafe\u0301 \u2126";
+        var setup = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        var request = setup.FindRequest("Basics/POST JSON")!;
+        var spec = request.ReadSpec();
+        spec.Headers.Add(new KeyValueEntry { Key = "X-Note", Value = Decomposed });
+        setup.UpdateRequest(request, spec);
+        setup.Save();
+        using var ui = new Harness(_directory);
+        bool blankLine = true, edited = false;
+        (bool Modified, string? Value) unchanged = default;
+        var headers = new List<string>();
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Click("GET  GET with query");
+                ui.Click("Bulk edit");
+                blankLine = ui.Window.Editor.IsModified;
+                ui.Click("POST POST JSON");
+                ui.Click("Headers");
+                ui.Click("Bulk edit");
+                unchanged = (ui.Window.Editor.IsModified, ui.Window.Editor.Spec.Headers.Single(h => h.Key == "X-Note").Value);
+                ui.Click("Bulk edit");
+                (edited, headers) = (ui.Window.Editor.IsModified, ui.Window.Editor.Spec.Headers.Select(h => $"{h.Key}:{h.Value}").ToList());
+                ui.App.InjectKey(Key.S.WithCtrl);
+                ui.App.RequestStop();
+            },
+            ("Bulk edit query parameters", () =>
+            {
+                ui.App.InjectKey(Key.End.WithCtrl);
+                ui.App.InjectKey(Key.Enter); // a blank line: the same rows
+                ui.Click("► Apply ◄");
+            }),
+            ("Bulk edit headers", () => ui.Click("► Apply ◄")),
+            ("Bulk edit headers", () =>
+            {
+                ui.App.InjectKey(Key.End.WithCtrl);
+                ui.App.InjectKey(Key.Enter);
+                ui.Type("X-New:1");
+                ui.Click("► Apply ◄");
+            }));
+
+        Assert.Equal(3, screens.Count);
+        Assert.False(blankLine);
+        Assert.Equal((false, Decomposed), unchanged);
+        Assert.True(edited);
+        Assert.Contains("X-New:1", headers);
+    }
+
+    [Fact]
+    public async Task The_tree_s_context_menu_sends_the_request_right_clicked()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        await ui.Runner.SendAsync(PostmanCollection.Create("Scratch"), null, new HttpRequestSpec { Method = "DELETE", Url = server.BaseUrl + "/echo/users/42" }, null,
+            TestContext.Current.CancellationToken);
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/users/42"); // GET with query stays selected in the tree
+                ui.App.InjectKey(Key.F9);
+                ui.App.InjectSequence(InputInjectionExtensions.RightButtonClick(ui.Find("GET  GET with query")));
+                var copy = ui.Find("Copy as cURL");
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(copy.X, copy.Y - 1))); // Send
+            },
+            ("200 OK", () => ui.App.RequestStop()));
+
+        Assert.Single(screens);
+        Assert.Equal("{{baseUrl}}/get?foo=bar&source=termrest", ui.Window.Editor.Spec.Url);
+        Assert.Equal(["/echo/get?foo=bar&source=termrest", "/echo/users/42"], ui.Runner.History!.Load().Select(e => new Uri(e.Url).PathAndQuery));
+    }
+
+    [Fact]
+    public void Copy_as_curl_says_why_when_curl_cannot_send_the_request_the_same_way()
+    {
+        var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        var setup = PostmanCollection.Load(path);
+        var node = setup.FindRequest("Basics/GET with query")!;
+        var spec = node.ReadSpec();
+        spec.Method = "POST";
+        spec.Body = new RequestBody { Mode = BodyMode.FormData, FormData = [new() { Key = "doc=</etc/passwd;", Value = "1" }] };
+        setup.UpdateRequest(node, spec);
+        setup.Save();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = "https://api.example.com");
+        ui.App.Driver!.Clipboard = new FakeClipboard();
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectSequence(InputInjectionExtensions.RightButtonClick(ui.Find("POST GET with query")));
+                ui.Click("Copy as cURL");
+                ui.App.RequestStop();
+            },
+            ("cannot be sent with curl", () => ui.Click("► OK ◄")));
+
+        Assert.Single(screens);
+        OnScreen("'doc=</etc/passwd;'", screens[0]);
+        Assert.DoesNotContain("Unexpected error", screens[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("copied", ui.Window.StatusMessage ?? "", StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Copy_as_curl_copies_no_command_for_a_request_TermRest_would_not_send()
+    {
+        // Its body file is not on this machine: TermRest sends nothing, and a command would replace the resource with nothing.
+        var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        var setup = PostmanCollection.Load(path);
+        var node = setup.FindRequest("Basics/GET with query")!;
+        var spec = node.ReadSpec();
+        spec.Method = "PUT";
+        spec.Body = new RequestBody { Mode = BodyMode.File, FileSrc = "fixtures/missing-user.json" };
+        setup.UpdateRequest(node, spec);
+        setup.Save();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = "https://api.example.com");
+        ui.App.Driver!.Clipboard = new FakeClipboard();
+        var message = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectSequence(InputInjectionExtensions.RightButtonClick(ui.Find("PUT  GET with query")));
+                ui.Click("Copy as cURL");
+                ui.App.RequestStop();
+            },
+            ("► OK ◄", () =>
+            {
+                message = ui.App.TopRunnableView!.Text;
+                ui.Click("► OK ◄");
+            }));
+
+        Assert.Single(screens);
+        Assert.Matches(@"^Body file '.*missing-user\.json' does not exist\.$", message);
+        Assert.DoesNotContain("copied", ui.Window.StatusMessage ?? "", StringComparison.Ordinal);
+        Assert.True(string.IsNullOrEmpty(ui.App.Clipboard!.GetClipboardData()));
+    }
+
+    [Fact]
+    public void A_request_typed_where_a_deleted_one_was_is_a_scratch_request_that_reloads_leave_alone()
+    {
+        const string Typed = "https://typed.example.com/items";
+        var zoo = Path.Combine(_directory, "Zoo.postman_collection.json"); // after TermRest Demo, whose first request is open
+        File.WriteAllText(zoo, """
+            {
+              "info": { "name": "Zoo", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+              "item": [{ "name": "Health", "request": { "method": "GET", "url": "https://zoo.example.com/health" } }]
+            }
+            """);
+        using var ui = new Harness(_directory);
+        ui.App.Driver!.Clipboard = new FakeClipboard();
+        string copied = "", url = "", status = "";
+        var modified = false;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Click("Request");
+                ui.Click("Delete…"); // GET with query, open in the editor, which it empties
+                status = ui.Window.Editor.ScriptsTab.Status;
+                ui.App.InjectKey(Key.L.WithCtrl);
+                ui.Type(Typed);
+                ui.Click("Request");
+                ui.Click("Copy as cURL");
+                copied = ui.App.Clipboard!.GetClipboardData() ?? "";
+                ui.Window.ImportCollectionFrom(zoo); // reloads Zoo
+                (url, modified) = (ui.Window.Editor.Spec.Url, ui.Window.Editor.IsModified);
+                ui.Window.Editor.MarkClean();
+                ui.App.RequestStop();
+            },
+            ("Delete request 'GET with query'?", () => ui.Click("► Delete ◄")),
+            ("Unsaved changes", () => ui.Click("Don't save")));
+
+        Assert.Equal(2, screens.Count);
+        Assert.Equal("→ runs no scripts", status);
+        Assert.Contains(Typed, copied, StringComparison.Ordinal);
+        Assert.Equal((Typed, true), (url, modified));
+    }
+
+    [Fact]
+    public async Task A_curl_command_pasted_into_a_request_from_history_is_sent_on_its_own()
+    {
+        // Not as the request the entry was sent from: its folder's token is not meant for the host the command names.
+        var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        File.WriteAllText(path, File.ReadAllText(path).Replace("\"value\": \"{{token}}\"", "\"value\": \"folder-s3cret\"", StringComparison.Ordinal)); // the Auth folder's
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var collection = Assert.Single(ui.Workspace.Collections);
+        var request = collection.FindRequest("Auth/Auth inherited from folder")!;
+        await ui.Runner.SendAsync(collection, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/headers"); // its history entry, which takes its auth from the folder
+                ui.Click("{{baseUrl}}/headers");
+                ui.App.RaisePasteEvent($"curl '{server.BaseUrl}/echo/pasted'");
+                ui.App.InjectKey(Key.F5);
+            },
+            ("200 OK", () => ui.App.RequestStop()),
+            ("Unsaved request", () => ui.Click("Discard")));
+
+        Assert.Equal(2, screens.Count);
+        OnScreen("Request (imported)", screens[0]);
+        var sent = ui.Window.ResponsePane.Exchange!.Request;
+        Assert.EndsWith("/echo/pasted", sent.Url, StringComparison.Ordinal);
+        Assert.DoesNotContain(sent.Headers, h => h.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void A_collection_that_no_longer_loads_is_not_reloaded_and_the_editor_goes_on_editing_its_request()
+    {
+        var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        using var ui = new Harness(_directory);
+        var edited = "";
+
+        var screens = Drive(ui, () =>
+            {
+                File.WriteAllText(path, "<<<<<<< HEAD\n" + File.ReadAllText(path) + "\n=======\n>>>>>>> theirs\n");
+                ui.Window.ImportCollectionFrom(path); // reloads it, and fails
+                ui.Click("{{baseUrl}}/get?foo=bar&source=termrest");
+                ui.App.InjectKey(Key.End);
+                ui.Type("&kept=1");
+                edited = ui.Screen();
+                ui.Click("POST POST JSON");
+                ui.App.RequestStop();
+            },
+            ("Import failed", () => ui.Click("► OK ◄")),
+            ("Unsaved changes", () => ui.Click("Don't save")));
+
+        Assert.Equal(2, screens.Count);
+        OnScreen("TermRest Demo / Basics/GET with query ●", edited);
+        Assert.EndsWith("&kept=1", Assert.Single(ui.Workspace.Collections).FindRequest("Basics/GET with query")!.ReadSpec().Url, StringComparison.Ordinal);
+        Assert.Equal("{{baseUrl}}/post", ui.Window.Editor.Spec.Url);
+    }
+
+    [Fact]
+    public async Task Clicking_the_history_entry_being_sent_again_leaves_its_response_to_come_there()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var collection = Assert.Single(ui.Workspace.Collections);
+        var request = collection.FindRequest("Basics/GET with query")!;
+        await ui.Runner.SendAsync(collection, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+        ui.Runner.LocalVariables["baseUrl"] = server.BaseUrl + "/hold"; // sent again, it waits
+        var sending = false;
+        var status = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/get");
+                ui.App.InjectKey(Key.F5);
+            },
+            ("Sending GET", () =>
+            {
+                ui.Click("/echo/get"); // its row, still the selected one
+                sending = ui.Window.IsSending;
+                server.Release();
+            }),
+            ("History (2)", () =>
+            {
+                status = ui.Window.StatusMessage;
+                ui.App.RequestStop();
+            }));
+
+        Assert.Equal(2, screens.Count);
+        Assert.True(sending);
+        Assert.StartsWith("GET 127.0.0.1 → 200", status, StringComparison.Ordinal);
+        Assert.Equal("/hold/get", System.Text.Json.Nodes.JsonNode.Parse(ui.Window.ResponsePane.Exchange!.Response!.Body)!["path"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task A_history_request_with_masked_credentials_goes_into_a_collection_only_when_confirmed()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner => runner.ConfigureHistory(state));
+        var auth = new AuthSpec { Type = "basic" };
+        auth.Set("username", "alice");
+        auth.Set("password", "typed-s3cret");
+        await ui.Runner.SendAsync(PostmanCollection.Create("Scratch"), null, new HttpRequestSpec { Url = server.BaseUrl + "/echo/masked", Auth = auth }, null,
+            TestContext.Current.CancellationToken);
+        var collection = Assert.Single(ui.Workspace.Collections);
+        var requests = collection.AllRequests().Count();
+        var afterCancel = -1;
+
+        void SaveToCollection()
+        {
+            ui.App.InjectSequence(InputInjectionExtensions.RightButtonClick(ui.Find("200 GET    /echo/masked")));
+            ui.Click("Save to collection…");
+        }
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/masked");
+                SaveToCollection(); // asks: Enter is Cancel
+                afterCancel = collection.AllRequests().Count();
+                SaveToCollection(); // asks, and is added
+            },
+            ("Masked credentials", () => ui.App.InjectKey(Key.Enter)),
+            ("Masked credentials", () => ui.Click("Add with ***")),
+            ("Name (in TermRest Demo / Basics)", () => ui.Click("► OK ◄")),
+            ("Request — TermRest Demo / Basics/", () =>
+            {
+                ui.App.InjectKey(Key.S.WithCtrl);
+                ui.App.RequestStop();
+            }));
+
+        Assert.Equal(4, screens.Count);
+        Assert.Equal(requests, afterCancel);
+        Assert.Equal("***", collection.AllRequests().Single(r => r.ReadSpec().Url.EndsWith("/echo/masked", StringComparison.Ordinal)).ReadSpec().Auth?.Get("password"));
+    }
+
+    [Fact]
+    public async Task Sending_again_a_request_that_inherited_its_auth_takes_that_auth_from_its_folder_again()
+    {
+        var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        File.WriteAllText(path, File.ReadAllText(path).Replace("\"value\": \"{{token}}\"", "\"value\": \"folder-s3cret\"", StringComparison.Ordinal)); // the Auth folder's
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var collection = Assert.Single(ui.Workspace.Collections);
+        var request = collection.FindRequest("Auth/Auth inherited from folder")!;
+        await ui.Runner.SendAsync(collection, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+        var entry = Assert.Single(ui.Runner.History!.Load());
+        var notice = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/headers");
+                notice = ui.Window.StatusMessage;
+                ui.App.InjectKey(Key.F5); // sent without asking
+            },
+            ("200 OK", () => ui.App.RequestStop()));
+
+        Assert.Single(screens);
+        Assert.True(entry is { AuthInherited: true, CredentialsMasked: true });
+        Assert.DoesNotContain("***", notice, StringComparison.Ordinal);
+        Assert.Equal(2, ui.Runner.History!.Load().Count);
+        Assert.Contains(new KeyValuePair<string, string>("Authorization", "Bearer folder-s3cret"), ui.Window.ResponsePane.Exchange!.Request.Headers);
+
+        // Sent as its request in the collection: the new entry inherits too, so sending it again works the same way.
+        var resent = ui.Runner.History!.Load()[0];
+        Assert.True(resent is { AuthInherited: true, RequestPath: "Auth/Auth inherited from folder" }, $"{resent.AuthInherited} {resent.RequestPath}");
+    }
+
+    [Fact]
+    public async Task A_history_request_says_what_it_inherits_from_its_collection_once_that_is_reloaded()
+    {
+        var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var collection = Assert.Single(ui.Workspace.Collections);
+        var request = collection.FindRequest("Auth/Auth inherited from folder")!;
+        await ui.Runner.SendAsync(collection, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+        IEnumerable<string> AuthNotes() => Descendants(ui.Window.Editor).OfType<Views.AuthEditor>().Single().SubViews
+            .SelectMany(Descendants).OfType<Terminal.Gui.Views.Label>().Select(l => l.Text);
+        List<string> before = [], after = [];
+
+        var screens = Drive(ui, () =>
+        {
+            ui.App.InjectKey(Key.F9);
+            ui.Click("/echo/headers");
+            before = [.. AuthNotes()];
+
+            // A pull gives the folder an API key instead of its bearer token, and the collection is reloaded.
+            File.WriteAllText(path, File.ReadAllText(path).Replace("\"type\": \"bearer\"", "\"type\": \"apikey\"", StringComparison.Ordinal)
+                .Replace("\"bearer\": [", "\"apikey\": [", StringComparison.Ordinal));
+            ui.Window.ImportCollectionFrom(path);
+            after = [.. AuthNotes()];
+            ui.App.RequestStop();
+        });
+
+        Assert.Empty(screens);
+        Assert.Contains("Currently: Bearer Token from folder 'Auth'.", before);
+        Assert.Contains("Currently: API Key from folder 'Auth'.", after);
+    }
+
+    [Fact]
+    public async Task A_history_request_no_longer_runs_the_scripts_of_the_folder_its_deleted_request_was_in()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var collection = Assert.Single(ui.Workspace.Collections);
+        var request = collection.FindRequest("Auth/Basic auth")!; // its own auth: deleting it leaves the editor's request as it is
+        await ui.Runner.SendAsync(collection, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+        collection.SetScripts(collection.FindFolder("Auth")!, new ScriptSet("console.log('folder')", "", ScriptLanguage.JavaScript));
+        string before = "", after = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.ShowRequest(request);
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/b"); // its history entry (/echo/basic-auth), which the folder's script runs for
+                before = ui.Window.Editor.ScriptsTab.Status;
+                ui.App.InjectKey(Key.F9); // the request is still selected in the tree
+                ui.App.InjectKey(Key.Delete);
+                after = ui.Window.Editor.ScriptsTab.Status;
+                ui.App.RequestStop();
+            },
+            ("Delete request 'Basic auth'?", () => ui.Click("► Delete ◄")),
+            ("Unsaved changes", () => ui.Click("Don't save")));
+
+        Assert.Equal(2, screens.Count);
+        Assert.Equal("→ runs JavaScript", before);
+        Assert.Equal("→ runs no scripts", after);
+    }
+
+    [Fact]
+    public async Task A_history_request_that_inherited_its_auth_is_sent_with_that_auth_once_its_request_is_deleted()
+    {
+        AuthFolderOverridingTheCollectionsAuth();
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var collection = Assert.Single(ui.Workspace.Collections);
+        var request = collection.FindRequest("Auth/Auth inherited from folder")!;
+        await ui.Runner.SendAsync(collection, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+        AuthSpec? auth = null;
+        var notice = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.ShowRequest(request);
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/headers"); // its history entry, which takes its auth from the folder
+                ui.App.InjectKey(Key.F9); // the request is still selected in the tree
+                ui.App.InjectKey(Key.Delete);
+                auth = ui.Window.Editor.Spec.Auth;
+                notice = ui.Window.StatusMessage;
+                ui.App.InjectKey(Key.F9);
+                ui.App.InjectKey(Key.F5); // asks: its token is ***
+            },
+            ("Delete request 'Auth inherited from folder'?", () => ui.Click("► Delete ◄")),
+            ("Masked credentials", () => ui.Click("Send ***")),
+            ("History (2)", () => ui.App.RequestStop()),
+            ("Unsaved changes", () => ui.Click("Don't save")));
+
+        Assert.Equal(4, screens.Count);
+        Assert.Equal(("bearer", "***"), (auth?.Type, auth?.Get("token")));
+        Assert.StartsWith("⚠ 'Auth/Auth inherited from folder' is no longer in its collection", notice, StringComparison.Ordinal);
+        var sent = ui.Window.ResponsePane.Exchange!.Request.Headers;
+        Assert.Contains(new KeyValuePair<string, string>("Authorization", "Bearer ***"), sent);
+        Assert.DoesNotContain(sent, h => h.Key == "X-Service-A");
+    }
+
+    [Fact]
+    public async Task A_history_request_that_inherited_its_auth_keeps_that_auth_and_its_changes_when_a_reload_loses_its_request()
+    {
+        var file = AuthFolderOverridingTheCollectionsAuth();
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var collection = Assert.Single(ui.Workspace.Collections);
+        var request = collection.FindRequest("Auth/Auth inherited from folder")!;
+        await ui.Runner.SendAsync(collection, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+        var token = ui.App.Begin(ui.Window);
+
+        ui.App.InjectKey(Key.F9);
+        ui.Click("/echo/headers");
+        var inherited = ui.Window.Editor.Spec.Auth;
+        ui.Click("{{baseUrl}}/headers");
+        ui.App.InjectKey(Key.End);
+        ui.Type("?edited=1");
+        File.WriteAllText(file, File.ReadAllText(file).Replace("Auth inherited from folder", "Renamed by a pull", StringComparison.Ordinal));
+        ui.Window.ImportCollectionFrom(file); // reloads it
+        var (auth, url, modified, status) = (ui.Window.Editor.Spec.Auth, ui.Window.Editor.Spec.Url, ui.Window.Editor.IsModified, ui.Window.StatusMessage);
+        ui.Window.Editor.MarkClean();
+        ui.App.End(token!);
+
+        Assert.Null(inherited);
+        Assert.Equal(("bearer", "***"), (auth?.Type, auth?.Get("token")));
+        Assert.Equal(("{{baseUrl}}/headers?edited=1", true), (url, modified));
+        Assert.StartsWith("Reloaded 'TermRest Demo' from disk. ⚠ 'Auth/Auth inherited from folder' is no longer in its collection", status, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_history_request_is_not_sent_as_another_request_that_has_its_name()
+    {
+        File.WriteAllText(Path.Combine(_directory, "Ops.postman_collection.json"), """
+            {
+              "info": { "name": "Ops", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+              "item": [
+                { "name": "Health", "request": { "method": "GET", "url": "{{baseUrl}}/health" } },
+                {
+                  "name": "Admin",
+                  "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "admin-s3cret", "type": "string" }] },
+                  "item": [{ "name": "Health", "request": { "method": "GET", "url": "{{baseUrl}}/admin/health" } }]
+                }
+              ]
+            }
+            """);
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var ops = ui.Workspace.Collections.Single(c => c.Name == "Ops");
+        var health = ops.FindRequest("Health")!;
+        await ui.Runner.SendAsync(ops, health, health.ReadSpec(), TestContext.Current.CancellationToken);
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Click("GET  Health"); // the one sent; Admin/Health is in its folder, closed
+                ui.App.InjectKey(Key.Delete);
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/health");
+                ui.App.InjectKey(Key.F5);
+            },
+            ("Delete request 'Health'?", () => ui.Click("► Delete ◄")),
+            ("History (2)", () => ui.App.RequestStop()),
+            ("Unsaved changes", () => ui.Click("Don't save")));
+
+        Assert.Equal(3, screens.Count);
+        Assert.Equal("/echo/health", ui.Window.ResponsePane.Exchange!.Request.Uri?.AbsolutePath);
+        Assert.DoesNotContain(ui.Window.ResponsePane.Exchange.Request.Headers, h => h.Key == "Authorization");
+    }
+
+    [Fact]
+    public async Task A_history_request_whose_path_another_request_shares_is_sent_on_its_own()
+    {
+        // Names may hold slashes: Admin › v2 › Health and Admin › "v2/Health" are both Admin/v2/Health.
+        File.WriteAllText(Path.Combine(_directory, "Ops.postman_collection.json"), """
+            {
+              "info": { "name": "Ops", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+              "item": [{
+                "name": "Admin",
+                "item": [
+                  {
+                    "name": "v2",
+                    "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "admin-s3cret", "type": "string" }] },
+                    "item": [{ "name": "Health", "request": { "method": "GET", "url": "{{baseUrl}}/admin/health" } }]
+                  },
+                  { "name": "v2/Health", "request": { "method": "GET", "url": "{{baseUrl}}/health" } }
+                ]
+              }]
+            }
+            """);
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var ops = ui.Workspace.Collections.Single(c => c.Name == "Ops");
+        var health = ops.AllRequests().Single(r => r.Name == "v2/Health");
+        await ui.Runner.SendAsync(ops, health, health.ReadSpec(), TestContext.Current.CancellationToken);
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/health");
+                ui.App.InjectKey(Key.F5);
+            },
+            ("History (2)", () => ui.App.RequestStop()));
+
+        Assert.Single(screens);
+        Assert.Equal("/echo/health", ui.Window.ResponsePane.Exchange!.Request.Uri?.AbsolutePath);
+        Assert.DoesNotContain(ui.Window.ResponsePane.Exchange.Request.Headers, h => h.Key == "Authorization");
+    }
+
+    [Fact]
+    public async Task A_history_request_is_sent_again_in_its_own_collection_when_another_has_its_name()
+    {
+        // An updated export, imported next to the collection it updates: both are 'Orders API', with other hosts and tokens.
+        await using var server = await LocalEchoServer.StartAsync();
+        File.WriteAllText(Path.Combine(_directory, "Orders API.postman_collection.json"), OrdersApi(server.BaseUrl + "/echo/v1", "v1-s3cret"));
+        var export = Path.Combine(_directory, "exports", "Orders API.postman_collection.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(export)!);
+        File.WriteAllText(export, OrdersApi(server.BaseUrl + "/echo/v2", "v2-s3cret"));
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner => runner.ConfigureHistory(state));
+        var token = ui.App.Begin(ui.Window);
+        ui.Window.ImportCollectionFrom(export);
+        ui.App.End(token!);
+        var update = ui.Workspace.Collections[^1];
+        var request = update.FindRequest("Get order")!;
+        await ui.Runner.SendAsync(update, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+        TermRest.Core.Http.HttpExchange? resent = null;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/v2/order"); // the sidebar cuts the row off
+                ui.App.InjectKey(Key.F5);
+            },
+            ("History (2)", () =>
+            {
+                resent = ui.Window.ResponsePane.Exchange;
+                ui.App.InjectSequence(InputInjectionExtensions.RightButtonClick(ui.Find("/echo/v2/order")));
+                ui.Click("Go to request in collection");
+                ui.App.InjectKey(Key.F5);
+            }),
+            ("200 OK", () => ui.App.RequestStop()));
+
+        Assert.Equal(2, screens.Count);
+        Assert.Equal("Orders API (2).postman_collection.json", Path.GetFileName(update.FilePath));
+        Assert.Equal("/echo/v2/orders/1", resent?.Request.Uri?.AbsolutePath);
+        Assert.Contains(new KeyValuePair<string, string>("Authorization", "Bearer v2-s3cret"), resent!.Request.Headers);
+        Assert.Equal("Orders API (2).postman_collection.json", ui.Runner.History!.Load()[0].CollectionFile);
+
+        // Go to request opened the request in the update: sent from there, it goes to the update's host.
+        Assert.Equal("/echo/v2/orders/1", ui.Window.ResponsePane.Exchange!.Request.Uri?.AbsolutePath);
+    }
+
+    [Fact]
+    public async Task A_history_request_from_an_earlier_version_is_sent_on_its_own_when_collections_share_its_name()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        File.WriteAllText(Path.Combine(_directory, "Orders API.postman_collection.json"), OrdersApi(server.BaseUrl + "/echo/v1", "v1-s3cret"));
+        File.WriteAllText(Path.Combine(_directory, "Orders API (2).postman_collection.json"), OrdersApi(server.BaseUrl + "/echo/v2", "v2-s3cret"));
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner => runner.ConfigureHistory(state));
+        var original = ui.Workspace.Collections.Single(c => Path.GetFileName(c.FilePath) == "Orders API.postman_collection.json");
+        var request = original.FindRequest("Get order")!;
+        await ui.Runner.SendAsync(original, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+
+        // As earlier versions wrote it: the entry names its collection, not the collection's file.
+        var history = ui.Runner.History!.FilePath;
+        File.WriteAllText(history, System.Text.RegularExpressions.Regex.Replace(File.ReadAllText(history), "\"collectionFile\":\"[^\"]*\",", ""));
+        var status = "";
+        AuthSpec? auth = null;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/v1/order");
+                (status, auth) = (ui.Window.StatusMessage, ui.Window.Editor.Spec.Auth);
+                ui.App.InjectKey(Key.F5); // asks: its token is ***
+            },
+            ("Masked credentials", () => ui.App.InjectKey(Key.Enter)),
+            ("Request (from history", () => ui.App.RequestStop()));
+
+        Assert.Equal(2, screens.Count);
+        Assert.Null(Assert.Single(ui.Runner.History.Load()).CollectionFile);
+        Assert.StartsWith("⚠ 2 collections are named 'Orders API' and which one this request was sent from is not known: it is sent on its own. Credentials are ***",
+            status, StringComparison.Ordinal);
+        Assert.Equal(("bearer", "***"), (auth?.Type, auth?.Get("token")));
+    }
+
+    [Fact]
+    public void Save_as_asks_before_replacing_a_file_and_says_when_it_saved_only_the_start_of_the_body()
+    {
+        // The save dialog may open on the workspace folder, where a click picks a collection.
+        var file = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        var collection = File.ReadAllText(file);
+        var copy = Path.Combine(_directory, "history-copy.txt");
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner => runner.ConfigureHistory(state));
+        var cut = new TermRest.Core.Http.HttpExchange(new TermRest.Core.Http.PreparedRequest { Method = "GET", Url = "https://api.example.com/log" })
+        {
+            Response = new TermRest.Core.Http.ResponseSnapshot { StatusCode = 200, ReasonPhrase = "OK", ContentType = "text/plain", Body = "the start"u8.ToArray(), BodyTruncated = true },
+        };
+        var entry = new TermRest.Core.History.HistoryEntry
+        {
+            Id = "cut",
+            Time = DateTimeOffset.Now,
+            Method = "GET",
+            Url = "https://api.example.com/log",
+            Item = new System.Text.Json.Nodes.JsonObject { ["name"] = "Log", ["request"] = new System.Text.Json.Nodes.JsonObject { ["method"] = "GET", ["url"] = "https://api.example.com/log" } },
+            Status = 200,
+            BodySaved = true,
+            BodyTruncated = true,
+        };
+        ui.Runner.History!.Add(entry, "token=***"u8.ToArray());
+        var (afterCancel, replaced, fromHistory) = ("", "", "");
+
+        void Choose(string path)
+        {
+            ui.App.RaisePasteEvent(path);
+            ui.App.InjectKey(Key.Enter);
+        }
+
+        void ClickReplace()
+        {
+            // The button, not the question's "Replace it?" above it.
+            var lines = ui.Screen().Split('\n');
+            var y = Array.FindLastIndex(lines, line => line.Contains("Replace", StringComparison.Ordinal));
+            ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(lines[y].IndexOf("Replace", StringComparison.Ordinal), y)));
+        }
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.ResponsePane.ShowExchange(cut);
+                ui.Click("Save as…"); // returns once it is answered
+                afterCancel = File.ReadAllText(file);
+                ui.Click("Save as…");
+                replaced = ui.Window.StatusMessage;
+                ui.Window.OpenHistoryEntry(entry);
+                ui.Click("Save as…");
+                fromHistory = ui.Window.StatusMessage;
+                ui.App.RequestStop();
+            },
+            ("Filename (▲)", () => Choose(file)),
+            ("exists.", () => ui.App.InjectKey(Key.Enter)), // Cancel
+            ("Filename (▲)", () => Choose(file)),
+            ("exists.", ClickReplace),
+            ("Filename (▲)", () => Choose(copy)));
+
+        Assert.Equal(5, screens.Count);
+        Assert.Equal(collection, afterCancel);
+        Assert.Equal("the start", File.ReadAllText(file));
+        Assert.Equal($"⚠ Saved 9 B to {file}: only the start of the body, cut at the maximum response size (Tools > Settings)", replaced);
+        Assert.Equal("token=***", File.ReadAllText(copy));
+        Assert.Equal($"⚠ Saved 9 B to {copy}: only the start of the body, as the history keeps it (secrets masked as ***)", fromHistory);
+    }
+
+    /// <summary>
+    /// The sample collection with auth for another service on the collection, which the Auth folder overrides with a
+    /// bearer token typed in (so the history masks it). Returns the collection's file.
+    /// </summary>
+    private string AuthFolderOverridingTheCollectionsAuth()
+    {
+        var file = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        var root = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(file))!;
+        root["auth"] = System.Text.Json.Nodes.JsonNode.Parse("""
+            { "type": "apikey", "apikey": [{ "key": "key", "value": "X-Service-A" }, { "key": "value", "value": "service-a-s3cret" }, { "key": "in", "value": "header" }] }
+            """);
+        root["item"]![1]!["auth"]!["bearer"]![0]!["value"] = "folder-s3cret";
+        File.WriteAllText(file, root.ToJsonString());
+        return file;
+    }
+
+    /// <summary>A collection named 'Orders API' whose request goes to <paramref name="baseUrl"/> with the bearer token it inherits.</summary>
+    private static string OrdersApi(string baseUrl, string token) => """
+        {
+          "info": { "name": "Orders API", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+          "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "TOKEN", "type": "string" }] },
+          "item": [{ "name": "Get order", "request": { "method": "GET", "url": "{{baseUrl}}/orders/1" } }],
+          "variable": [{ "key": "baseUrl", "value": "BASE_URL" }]
+        }
+        """.Replace("TOKEN", token, StringComparison.Ordinal).Replace("BASE_URL", baseUrl, StringComparison.Ordinal);
+
+    [Fact]
+    public void Recording_does_not_start_while_the_workspace_settings_cannot_be_read()
+    {
+        Directory.CreateDirectory(Path.Combine(_directory, ".termrest"));
+        File.WriteAllText(Path.Combine(_directory, ".termrest", "settings.json"), "{ \"recordingRedact\": [\"X-Tenant\" ");
+        using var ui = new Harness(_directory);
+        RequestRecorder? recorder = null;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F12);
+                recorder = ui.Runner.Recorder;
+                ui.Runner.Recorder = null; // one that started anyway is not asked about when closing
+                ui.App.RequestStop();
+            },
+            ("recordingRedact", () => ui.Click("► OK ◄")));
+        recorder?.Discard();
+
+        Assert.Single(screens);
+        Assert.Null(recorder);
+    }
+
+    [Fact]
+    public void Tabs_take_their_width_and_the_tab_key_still_moves_to_the_next_field()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.Window.ResponsePane.ShowExchange(TextResponse("id\tname\n1\tAda"));
+        var left = new List<bool>();
+        ui.Click("name");
+        var screen = ui.Screen();
+        var response = Assert.IsType<Views.TextArea>(ui.Window.MostFocused);
+        foreach (var key in (Key[])[Key.Tab, Key.Tab.WithShift])
+        {
+            response.SetFocus();
+            ui.App.InjectKey(key);
+            left.Add(ui.Window.MostFocused != response);
+        }
+
+        ui.Click("POST POST JSON");
+        ui.Click("Body");
+        ui.Click("Ada Lovelace");
+        var body = Assert.IsType<Views.TextArea>(ui.Window.MostFocused);
+        ui.App.InjectKey(Key.Tab);
+        left.Add(ui.Window.MostFocused != body);
+        var (raw, modified) = (body.GetText(), ui.Window.Editor.IsModified);
+        ui.App.InjectKey(Key.S.WithCtrl); // closing must not ask, even if this fails
+        ui.App.End(token!);
+
+        OnScreen("id  name", screen); // a tab moves on to the next multiple of 4 columns
+        OnScreen("1   Ada", screen);
+        Assert.Equal([true, true, true], left);
+        Assert.DoesNotContain('\t', raw); // no tab typed
+        Assert.False(modified);
+    }
+
+    [Fact]
+    public void A_lone_carriage_return_is_a_line_break_and_nothing_next_to_it_is_lost()
+    {
+        var file = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        File.WriteAllText(file, File.ReadAllText(file).Replace("Ada Lovelace", "Ada\\rLovelace", StringComparison.Ordinal));
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.App.Driver!.Clipboard = new FakeClipboard();
+        ui.Window.ResponsePane.ShowExchange(TextResponse("10%\r20%\ndone"));
+        ui.Click("Copy");
+        var (copied, response) = (ui.App.Clipboard!.GetClipboardData(), ui.Screen());
+
+        ui.Click("POST POST JSON");
+        ui.Click("Body");
+        var body = ui.Screen();
+        ui.Click("Lovelace");
+        ui.Type("!");
+        var edited = ui.Window.Editor.Spec.Body.Raw;
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        Assert.Equal(At(response, "10%") with { Y = At(response, "10%").Y + 1 }, At(response, "20%"));
+        Assert.Equal("10%\r20%\ndone", copied); // as it came, not as shown
+        Assert.Equal(At(body, "\"name\": \"Ada").Y + 1, At(body, "Lovelace\",").Y);
+        const string Expected = "{\n    \"id\": \"{{$guid}}\",\n    \"name\": \"Ada\n!Lovelace\",\n    \"sentAt\": \"{{$isoTimestamp}}\"\n}";
+        Assert.Equal(Expected, edited);
+        Assert.Equal(Expected, PostmanCollection.Load(file).FindRequest("Basics/POST JSON")!.ReadSpec().Body.Raw);
+    }
+
+    [Fact]
+    public void A_response_header_too_long_for_the_pane_is_marked_cut_and_opens_whole_to_read_and_copy()
+    {
+        const string Value = "Bearer error=\"invalid_token\", error_description=\"The token expired at '11/13/2026 21:32:45'\", scope=\"orders.read orders.write\", realm=\"orders\"";
+        using var ui = new Harness(_directory);
+        ui.App.Driver!.Clipboard = new FakeClipboard();
+        string table = "", shown = "", titled = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.ResponsePane.ShowExchange(TextResponse("ok", new("WWW-Authenticate", Value), new("X_Request_Id", "7f3a")));
+                var tabs = ui.Find("Timeline"); // the response's tabs: the request has a Headers tab too
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(ui.Screen().Split('\n')[tabs.Y].IndexOf("Headers", StringComparison.Ordinal), tabs.Y)));
+                table = ui.Screen();
+                ui.Click("WWW-Authenticate");
+                ui.App.InjectKey(Key.Enter); // returns once the dialog is closed
+                ui.Click("X_Request_Id");
+                ui.App.InjectKey(Key.Enter);
+                ui.App.RequestStop();
+            },
+            ("realm=\"orders\"", () =>
+            {
+                shown = ui.Screen();
+                ui.Click("► Copy ◄");
+            }),
+            ("► Copy ◄", () =>
+            {
+                titled = ui.Screen();
+                ui.App.InjectKey(Key.Esc);
+            }));
+
+        Assert.Equal(2, screens.Count);
+        var row = table.Split('\n').Single(l => l.Contains("WWW-Authenticate", StringComparison.Ordinal));
+        Assert.Contains("…", row, StringComparison.Ordinal);
+        Assert.DoesNotContain("realm", table, StringComparison.Ordinal);
+        OnScreen(Value, Unwrapped(shown));
+        Assert.Equal(Value, ui.App.Clipboard!.GetClipboardData());
+        Assert.Equal("The value of WWW-Authenticate copied to the clipboard.", ui.Window.StatusMessage);
+        OnScreen("┥X_Request_Id┝", titled); // the name as written, its _ no hotkey
+    }
+
+    [Fact]
+    public void Keys_that_delete_nothing_leave_the_request_unmodified()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.App.Driver!.Clipboard = new FakeClipboard();
+        ui.Click("Scripts");
+        var label = ui.Find("Pre-request (before sending)");
+        ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X, label.Y + 1)));
+        var script = Assert.IsType<Views.TextArea>(ui.Window.MostFocused);
+        foreach (var key in (Key[])[Key.Backspace, Key.Delete, Key.Backspace.WithCtrl, Key.Delete.WithCtrl, Key.K.WithCtrl, Key.Backspace.WithCtrl.WithShift])
+        {
+            ui.App.InjectKey(key);
+        }
+
+        var emptyScript = (script.GetText(), ui.Window.Editor.IsModified);
+        ui.Click("POST POST JSON");
+        ui.Click("Body");
+        ui.Click("Ada Lovelace");
+        foreach (var key in (Key[])[Key.Home.WithCtrl, Key.Backspace, Key.Backspace.WithCtrl, Key.End.WithCtrl, Key.Delete, Key.Delete.WithCtrl])
+        {
+            ui.App.InjectKey(key);
+        }
+
+        var (body, unsaved, screen) = (ui.Window.Editor.IsModified, ui.Workspace.HasUnsavedChanges, ui.Screen());
+        ui.App.InjectKey(Key.S.WithCtrl); // closing must not ask, even if this fails
+        ui.App.End(token!);
+
+        Assert.Equal(("", false), emptyScript);
+        Assert.False(body);
+        Assert.False(unsaved);
+        OnScreen("Request — TermRest Demo / Basics/POST JSON", screen);
+        Assert.DoesNotContain("POST JSON ●", screen, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Characters_the_editor_keeps_composed_are_no_edit_and_a_script_left_alone_keeps_its_bytes()
+    {
+        // Terminal.Gui keeps each character composed (NFC): a decomposed é (as macOS file names have it) and the ohm sign
+        // come back from an editor changed. U+FFFE (a byte order mark read the wrong way) is one normalizing refuses.
+        const string Decomposed = "Cafe\u0301 \u2126";
+        const string Body = $"{{\"name\": \"{Decomposed}\", \"bom\": \"\uFFFE\"}}";
+        var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        var setup = PostmanCollection.Load(path);
+        var request = setup.FindRequest("Basics/POST JSON")!;
+        var spec = request.ReadSpec();
+        spec.Body.Raw = Body;
+        spec.Scripts = new ScriptSet($"# {Decomposed}", $"# {Decomposed}", ScriptLanguage.Python);
+        setup.UpdateRequest(request, spec);
+        setup.Save();
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.Click("POST POST JSON");
+        ui.Click("Body");
+        ui.Click("\"name\"");
+        foreach (var key in (Key[])[Key.Home.WithCtrl, Key.Backspace, Key.End.WithCtrl, Key.Delete])
+        {
+            ui.App.InjectKey(key);
+        }
+
+        var body = (ui.Window.Editor.IsModified, ui.Workspace.HasUnsavedChanges, ui.Window.Editor.Spec.Body.Raw);
+        ui.Click("Scripts");
+        var label = ui.Find("Pre-request (before sending)");
+        ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X, label.Y + 1)));
+        ui.App.InjectKey(Key.Home.WithCtrl);
+        ui.Type("x");
+        var scripts = ui.Window.Editor.Spec.Scripts.For(ScriptLanguage.Python);
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        Assert.Equal((false, false, Body), body);
+        Assert.Equal($"x# {Decomposed.Normalize()}", scripts.PreRequest); // edited: as the editor holds it
+        Assert.Equal($"# {Decomposed}", scripts.Test);
+        Assert.Equal($"# {Decomposed}", PostmanCollection.Load(path).FindRequest("Basics/POST JSON")!.ReadSpec().Scripts.For(ScriptLanguage.Python).Test);
+    }
+
+    [Fact]
+    public void Ctrl_N_makes_a_new_request_from_lists_and_tables_and_Insert_adds_rows()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        var dialogs = new List<string>();
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            // Runs only while a dialog is open: notes what it shows and closes it.
+            dialogs.Add(ui.Screen());
+            ui.App.InjectKey(Key.Esc);
+            return true;
+        });
+        var pressed = new List<string>();
+        void CtrlN()
+        {
+            pressed.Add(ui.Window.MostFocused?.GetType().Name ?? "");
+            ui.App.InjectKey(Key.N.WithCtrl);
+        }
+
+        ui.Click("GET  GET with query");
+        CtrlN();
+        ui.Click("debug");
+        CtrlN();
+        ui.Click("Headers");
+        ui.Click("Accept");
+        CtrlN();
+        ui.App.InjectKey(Key.InsertChar);
+        ui.Click("Auth");
+        ui.Click("Inherit auth from parent");
+        CtrlN();
+        ui.Click("GET  Status by path");
+        ui.Click("Params");
+        Descendants(ui.Window).OfType<Views.KeyValueTable>().Single(t => t.Entries.Any(e => e.Key == "code")).SubViews.OfType<Terminal.Gui.Views.TableView>().Single().SetFocus();
+        CtrlN();
+        ui.App.InjectKey(Key.InsertChar); // path variables follow the URL: nothing to add or remove
+        ui.App.InjectKey(Key.Delete);
+        var pathVariables = ui.Window.Editor.Spec.PathVariables.Select(v => v.Key).ToList();
+        ui.Window.ResponsePane.ShowExchange(TextResponse("ok", new KeyValuePair<string, string>("X-Trace", "7")));
+        var tabs = ui.Find("Timeline"); // the response's tabs: the request has a Headers tab too
+        ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(ui.Screen().Split('\n')[tabs.Y].IndexOf("Headers", StringComparison.Ordinal), tabs.Y)));
+        ui.Click("X-Trace");
+        CtrlN();
+        ui.App.InjectKey(Key.F9);
+        ui.Window.HistoryPane.SetEntries(HistoryEntries(3), "No requests sent yet.");
+        ui.Click("/items/1");
+        var opened = ui.Window.HistoryPane.Selected;
+        CtrlN();
+        var (selected, url) = (ui.Window.HistoryPane.Selected, ui.Window.Editor.Spec.Url);
+        var unsaved = ui.Workspace.HasUnsavedChanges || ui.Window.Editor.IsModified;
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        Assert.Equal(["TreeView`1", "TableView", "TableView", "ListView", "TableView", "TableView", "ListView"], pressed);
+        Assert.Equal(8, dialogs.Count);
+        Assert.Equal(7, dialogs.Count(d => d.Contains("Name (in TermRest Demo / Basics)", StringComparison.Ordinal)));
+        OnScreen("Add header", dialogs[3]); // Insert, after the third Ctrl+N
+        Assert.Equal(["code"], pathVariables);
+        Assert.Equal(opened, selected); // not the next entry
+        Assert.Equal("https://api.example.com/items/1", url);
+        Assert.False(unsaved);
+    }
+
+    [Fact]
+    public void The_history_filter_says_when_nothing_matches_even_after_scrolling_down()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.App.InjectKey(Key.F9);
+        ui.Window.HistoryPane.SetEntries(HistoryEntries(100), "No requests sent yet.");
+        var list = ui.Find("/items/0");
+        for (var i = 0; i < 80; i++)
+        {
+            ui.App.InjectMouse(new Mouse { ScreenPosition = list, Flags = MouseFlags.WheeledDown });
+        }
+
+        var scrolled = ui.Screen();
+        var filter = ui.Find("Filter:");
+        ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(filter.X + 9, filter.Y)));
+        ui.Type("no-such-request");
+        var (rows, selected, screen) = (ui.Window.HistoryPane.Rows.ToList(), ui.Window.HistoryPane.Selected, ui.Screen());
+        ui.App.End(token!);
+
+        Assert.DoesNotContain("/items/0 ", scrolled, StringComparison.Ordinal);
+        Assert.Equal(["No match."], rows);
+        Assert.Null(selected);
+        OnScreen("No match.", screen);
+    }
+
+    [Fact]
+    public void A_typed_body_file_is_looked_up_in_the_background_once_typing_pauses()
+    {
+        using var ui = new Harness(_directory);
+        var path = Path.Combine(_directory, "order.json");
+        File.WriteAllText(path, "{\"item\": 1}");
+        string typing = "", found = "", missing = "";
+        var step = 0;
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                ui.Window.Editor.MarkClean();
+                ui.App.RequestStop();
+                return false;
+            }
+
+            switch (step)
+            {
+                case 0:
+                    ui.Click("POST POST JSON");
+                    ui.Click("Body");
+                    ui.Click("○ file");
+                    var label = ui.Find("File:");
+                    ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 8, label.Y)));
+                    ui.Type(path);
+                    typing = ui.Window.BodyFileStatus; // the disk is not read while typing
+                    step = 1;
+                    break;
+                case 1 when ui.Window.BodyFileStatus.StartsWith("order.json", StringComparison.Ordinal):
+                    found = ui.Window.BodyFileStatus;
+                    ui.Type("x");
+                    step = 2;
+                    break;
+                case 2 when ui.Window.BodyFileStatus.StartsWith('✗'):
+                    missing = ui.Window.BodyFileStatus;
+                    ui.App.InjectKey(Key.S.WithCtrl);
+                    ui.App.RequestStop();
+                    return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        Assert.Equal($"Looking for {path}…", typing);
+        Assert.Equal("order.json · 11 B · sent as it is", found);
+        Assert.Equal($"✗ {path}x does not exist.", missing);
+    }
+
+    /// <summary>A plain-text response, as if it had just arrived.</summary>
+    private static TermRest.Core.Http.HttpExchange TextResponse(string body, params KeyValuePair<string, string>[] headers) =>
+        new(new TermRest.Core.Http.PreparedRequest { Method = "GET", Url = "https://api.example.com/log" })
+        {
+            Response = new TermRest.Core.Http.ResponseSnapshot
+            {
+                StatusCode = 200,
+                ReasonPhrase = "OK",
+                ContentType = "text/plain",
+                Body = System.Text.Encoding.UTF8.GetBytes(body),
+                Headers = [new("Content-Type", "text/plain"), .. headers],
+            },
+        };
+
+    private static List<TermRest.Core.History.HistoryEntry> HistoryEntries(int count) =>
+    [
+        .. Enumerable.Range(0, count).Select(i => new TermRest.Core.History.HistoryEntry
+        {
+            Id = i.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Time = DateTimeOffset.Now,
+            Method = "GET",
+            Url = $"https://api.example.com/items/{i}",
+            Item = new System.Text.Json.Nodes.JsonObject
+            {
+                ["name"] = $"Item {i}",
+                ["request"] = new System.Text.Json.Nodes.JsonObject { ["method"] = "GET", ["url"] = $"https://api.example.com/items/{i}" },
+            },
+            Status = 200,
+        }),
+    ];
 
     /// <summary>What the main loop would show: draws only what changed (<see cref="Harness.Screen"/> redraws everything).</summary>
     private static string Drawn(Harness ui)

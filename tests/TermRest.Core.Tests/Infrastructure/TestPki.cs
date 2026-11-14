@@ -11,6 +11,8 @@ public sealed class TestPki : IDisposable
 {
     public const string Passphrase = "test-passphrase";
 
+    private X509Certificate2? _intermediate;
+
     private TestPki(string directory)
     {
         Directory = directory;
@@ -37,6 +39,10 @@ public sealed class TestPki : IDisposable
     public string ClientChainPemPath => Path.Combine(Directory, "client-chain.pem");
 
     public string ClientPfxPath => Path.Combine(Directory, "client.pfx");
+
+    public string ClientViaIntermediateChainPemPath => Path.Combine(Directory, "client-intermediate-chain.pem");
+
+    public string ClientViaIntermediateKeyPemPath => Path.Combine(Directory, "client-intermediate.key");
 
     public static TestPki Create()
     {
@@ -76,14 +82,47 @@ public sealed class TestPki : IDisposable
         }
     }
 
-    private static X509Certificate2 Issue(string subject, bool isServer, DateTimeOffset now, X509Certificate2 issuer, out RSA key)
+    /// <summary>Issues another localhost certificate from the test CA, for one extended key usage (e.g. client authentication only).</summary>
+    public X509Certificate2 IssueLocalhost(string extendedKeyUsage)
+    {
+        var certificate = Issue("CN=localhost", isServer: true, DateTimeOffset.UtcNow.AddMinutes(-5), Ca, out var key, extendedKeyUsage);
+        key.Dispose();
+        return certificate;
+    }
+
+    /// <summary>
+    /// Issues a client certificate from an intermediate CA under the test CA, written with that chain (leaf, intermediate,
+    /// root) to <see cref="ClientViaIntermediateChainPemPath"/> and with its key to <see cref="ClientViaIntermediateKeyPemPath"/>.
+    /// </summary>
+    public (string ClientThumbprint, string IntermediateThumbprint) IssueClientViaIntermediate()
+    {
+        var now = DateTimeOffset.UtcNow.AddMinutes(-5);
+        using var intermediateKey = RSA.Create(2048);
+        var request = new CertificateRequest("CN=TermRest Test Intermediate CA, O=TermRest Tests", intermediateKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+        request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
+        request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, false));
+        using var intermediate = request.Create(Ca, now, now.AddDays(20), RandomNumberGenerator.GetBytes(12));
+        using var intermediateWithKey = intermediate.CopyWithPrivateKey(intermediateKey);
+        _intermediate = X509CertificateLoader.LoadCertificate(intermediate.RawData);
+        using var client = Issue("CN=TermRest Test Client via Intermediate, O=TermRest Tests", isServer: false, now, intermediateWithKey, out var clientKey);
+        using (clientKey)
+        {
+            File.WriteAllText(ClientViaIntermediateChainPemPath, client.ExportCertificatePem() + "\n" + intermediate.ExportCertificatePem() + "\n" + Ca.ExportCertificatePem());
+            File.WriteAllText(ClientViaIntermediateKeyPemPath, clientKey.ExportPkcs8PrivateKeyPem());
+        }
+
+        return (client.Thumbprint, _intermediate.Thumbprint);
+    }
+
+    private static X509Certificate2 Issue(string subject, bool isServer, DateTimeOffset now, X509Certificate2 issuer, out RSA key, string? extendedKeyUsage = null)
     {
         key = RSA.Create(2048);
         var request = new CertificateRequest(subject, key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
         request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
         request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
-            [new Oid(isServer ? "1.3.6.1.5.5.7.3.1" : "1.3.6.1.5.5.7.3.2")], false));
+            [new Oid(extendedKeyUsage ?? (isServer ? "1.3.6.1.5.5.7.3.1" : "1.3.6.1.5.5.7.3.2"))], false));
         if (isServer)
         {
             var san = new SubjectAlternativeNameBuilder();
@@ -105,7 +144,31 @@ public sealed class TestPki : IDisposable
 
     public void Dispose()
     {
+        // On Windows, sending a client certificate with its chain makes .NET add the chain (this CA, an intermediate) to
+        // an intermediate CA store when the OS cannot build it; dozens of same-named test CAs there make chain building fail.
+        if (OperatingSystem.IsWindows())
+        {
+            foreach (var location in new[] { StoreLocation.LocalMachine, StoreLocation.CurrentUser })
+            {
+                try
+                {
+                    using var store = new X509Store(StoreName.CertificateAuthority, location);
+                    store.Open(OpenFlags.ReadWrite | OpenFlags.OpenExistingOnly);
+                    store.Remove(Ca);
+                    if (_intermediate is not null)
+                    {
+                        store.Remove(_intermediate);
+                    }
+                }
+                catch (CryptographicException)
+                {
+                    // Not writable (LocalMachine without elevation): .NET used the other store.
+                }
+            }
+        }
+
         Ca.Dispose();
+        _intermediate?.Dispose();
         Server.Dispose();
         Client.Dispose();
         try

@@ -25,6 +25,7 @@ internal sealed class JavaScriptLexer : SyntaxLexer
             _ => 0,
         };
         var regex = true; // whether a slash here starts a regular expression
+        var regexBudget = (4 * line.Length) + 256; // characters regular expressions may scan: failing ones scan to the line end
         var name = SyntaxKind.Plain; // the next name: a function after function, a type after class or new
         while (i < line.Length)
         {
@@ -53,7 +54,7 @@ internal sealed class JavaScriptLexer : SyntaxLexer
                 continue;
             }
 
-            if (c == '/' && regex && RegexEnd(line, i) is var regexEnd and > 0)
+            if (c == '/' && regex && RegexEnd(line, i, ref regexBudget) is var regexEnd and > 0)
             {
                 kinds[i..regexEnd].Fill(SyntaxKind.String);
                 i = regexEnd;
@@ -159,11 +160,14 @@ internal sealed class JavaScriptLexer : SyntaxLexer
         return i;
     }
 
-    /// <summary>The end of the regular expression at <paramref name="i"/> (with its flags), or -1 if it does not close on the line.</summary>
-    private static int RegexEnd(ReadOnlySpan<char> line, int i)
+    /// <summary>
+    /// The end of the regular expression at <paramref name="i"/> (with its flags), or -1 if it does not close on the line
+    /// or <paramref name="budget"/> (characters left to scan on this line) runs out.
+    /// </summary>
+    private static int RegexEnd(ReadOnlySpan<char> line, int i, ref int budget)
     {
         var inClass = false;
-        for (var j = i + 1; j < line.Length; j++)
+        for (var j = i + 1; j < line.Length && budget-- > 0; j++)
         {
             switch (line[j])
             {

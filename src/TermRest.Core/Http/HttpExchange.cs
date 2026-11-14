@@ -26,10 +26,13 @@ public sealed class HttpExchange(PreparedRequest request)
 
     public List<TlsConnectionInfo> Tls { get; } = [];
 
-    /// <summary>Request headers as sent (including generated ones such as User-Agent and Cookie).</summary>
+    /// <summary>Request headers as sent (including generated ones such as User-Agent, Accept-Encoding and Cookie).</summary>
     public List<KeyValuePair<string, string>> SentHeaders { get; } = [];
 
-    /// <summary>The history entry recorded for this exchange, if history is on.</summary>
+    /// <summary>
+    /// The history entry recorded for this exchange, if history is on; for an exchange rebuilt from the history (see
+    /// <see cref="History.HistoryEntry.ToExchange"/>), that entry.
+    /// </summary>
     public History.HistoryEntry? HistoryEntry { get; set; }
 
     /// <summary>What the scripts around this request did (tests, output, variables set); null when it has none.</summary>
@@ -74,9 +77,14 @@ public sealed class ResponseSnapshot
 
     public Version Version { get; init; } = HttpVersion.Version11;
 
+    /// <summary>The headers as the server sent them (Content-Encoding and Content-Length describe the body as received).</summary>
     public List<KeyValuePair<string, string>> Headers { get; init; } = [];
 
+    /// <summary>The body, decoded as its Content-Encoding says (gzip, deflate, br); as received when it could not be.</summary>
     public byte[] Body { get; init; } = [];
+
+    /// <summary>Size of the body as received, before it was decoded; null when not known (a response from the history).</summary>
+    public long? ReceivedBodySize { get; init; }
 
     public bool BodyTruncated { get; init; }
 

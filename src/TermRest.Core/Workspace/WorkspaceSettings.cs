@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json.Serialization;
 using TermRest.Core.Certificates;
 
@@ -15,6 +16,12 @@ public sealed class WorkspaceSettings
     /// <summary>Name of the selected environment.</summary>
     public string? ActiveEnvironment { get; set; }
 
+    /// <summary>
+    /// File of the selected environment, relative to the workspace folder with "/" separators: it tells environments of
+    /// the same name apart. Without it (settings of earlier versions), or when that file is not loaded, the name decides.
+    /// </summary>
+    public string? ActiveEnvironmentFile { get; set; }
+
     /// <summary>Verify server certificates (Postman "SSL certificate verification"). Requests can override with strictSSL.</summary>
     public bool StrictSsl { get; set; } = true;
 
@@ -28,8 +35,14 @@ public sealed class WorkspaceSettings
 
     public int MaxRedirects { get; set; } = 10;
 
-    /// <summary>Null/"system" uses the OS proxy settings, "none" disables proxies, otherwise a proxy URL.</summary>
+    /// <summary>
+    /// Null/"system" uses the OS proxy settings, "none" disables proxies, otherwise a proxy URL: used only once the user
+    /// allowed it for the workspace folder (<see cref="UserSettings.AllowedProxies"/>), as this file comes with the workspace.
+    /// </summary>
     public string? Proxy { get; set; }
+
+    /// <summary>Whether <paramref name="proxy"/> names a proxy (a URL), rather than "system" or "none" (see <see cref="Proxy"/>).</summary>
+    public static bool IsProxyUrl([NotNullWhen(true)] string? proxy) => proxy?.Trim().ToLowerInvariant() is not (null or "" or "system" or "none");
 
     /// <summary>Responses larger than this are truncated in memory.</summary>
     public int MaxResponseSizeMb { get; set; } = 50;

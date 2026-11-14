@@ -43,11 +43,7 @@ internal static class ThemesCommand
     private static Option<string?> WorkspaceOption() =>
         new("--workspace", "-w") { Description = "Workspace folder (default: current directory): its own themes and theme choice count too" };
 
-    private static string Root(string? workspace)
-    {
-        var path = Path.GetFullPath(workspace ?? Environment.CurrentDirectory);
-        return File.Exists(path) ? Path.GetDirectoryName(path)! : path;
-    }
+    private static string Root(string? workspace) => ApiWorkspace.RootFor(workspace ?? Environment.CurrentDirectory);
 
     private static IReadOnlyList<ColorTheme> Load(string root)
     {
@@ -65,7 +61,13 @@ internal static class ThemesCommand
     {
         var themes = Load(root);
         var settings = Directory.Exists(root) ? ApiWorkspace.ReadSettings(root) : new WorkspaceSettings();
-        var selected = ThemeCatalog.SelectedName(null, settings, UserSettings.Load()) ?? ThemeCatalog.DefaultName;
+        var user = UserSettings.Load();
+        if (user.LoadError is { } problem)
+        {
+            Output.Warning(problem);
+        }
+
+        var selected = ThemeCatalog.SelectedName(null, settings, user) ?? ThemeCatalog.DefaultName;
         var nameWidth = themes.Max(t => t.Name.Length) + 2;
         var sourceWidth = themes.Max(t => t.SourceDescription.Length) + 2;
         foreach (var theme in themes)
@@ -75,17 +77,17 @@ internal static class ThemesCommand
         }
 
         Output.Info("");
-        Output.Info($"In use: {selected}{Origin(settings)}");
+        Output.Info($"In use: {selected}{Origin(settings, user)}");
         Output.Info($"Custom themes: {UserSettings.ThemesDirectory()}");
         Output.Info($"  and for this workspace: {ThemeCatalog.WorkspaceThemesDirectory(root)}");
         Output.Info("Choose with 'termrest themes use <name>', in the UI (Tools > Color theme), or for one session with --theme <name>.");
         return 0;
     }
 
-    private static string Origin(WorkspaceSettings settings) =>
+    private static string Origin(WorkspaceSettings settings, UserSettings user) =>
         Environment.GetEnvironmentVariable(ThemeCatalog.EnvironmentVariable) is { Length: > 0 } ? $" (from ${ThemeCatalog.EnvironmentVariable})"
         : settings.Theme is not null ? " (chosen for this workspace)"
-        : UserSettings.Load().Theme is not null ? " (your choice for all workspaces)"
+        : user.Theme is not null ? " (your choice for all workspaces)"
         : "";
 
     private static int Use(string root, string name, bool onlyHere)
@@ -98,16 +100,34 @@ internal static class ThemesCommand
 
         if (onlyHere)
         {
-            var workspace = ApiWorkspace.Open(root);
-            workspace.Settings.Theme = theme.Name;
-            workspace.SaveSettings();
+            try
+            {
+                var workspace = ApiWorkspace.Open(root, CollectionLoading.None);
+                workspace.Settings.Theme = theme.Name;
+                workspace.SaveSettings();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Output.Error(ex.Message); // also when the settings file could not be read: it is not saved over
+                return 1;
+            }
+
             Output.Status($"✓ {theme.Name} is used in {root}", true);
             return 0;
         }
 
         var user = UserSettings.Load();
         user.Theme = string.Equals(theme.Name, ThemeCatalog.DefaultName, StringComparison.OrdinalIgnoreCase) ? null : theme.Name;
-        user.Save();
+        try
+        {
+            user.Save();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Output.Error(ex.Message);
+            return 1;
+        }
+
         Output.Status($"✓ {theme.Name} is used in all workspaces", true);
         if (Directory.Exists(root) && ApiWorkspace.ReadSettings(root).Theme is { } own)
         {
@@ -119,9 +139,16 @@ internal static class ThemesCommand
 
     private static int Copy(string root, string from, string name, bool inWorkspace)
     {
-        if (ThemeCatalog.Find(Load(root), from) is not { } theme)
+        var themes = Load(root);
+        if (ThemeCatalog.Find(themes, from) is not { } theme)
         {
             Output.Error($"Color theme '{from}' was not found; see 'termrest themes'.");
+            return 2;
+        }
+
+        if (ThemeCatalog.FindCustom(themes, name) is { } taken)
+        {
+            Output.Error($"A custom theme called '{taken.Name}' exists already ({taken.FilePath}): choose another name.");
             return 2;
         }
 

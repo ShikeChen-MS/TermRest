@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 
 namespace TermRest.Core.Import;
@@ -20,25 +21,34 @@ public enum ShellDialect
 /// </summary>
 public static class ShellWords
 {
-    /// <summary>Guesses the shell from continuation characters and Windows-only escapes; defaults to POSIX.</summary>
+    /// <summary>
+    /// Guesses the shell from continuation characters and Windows-only escapes outside quoted values (see
+    /// <see cref="FindMarks"/>); defaults to POSIX.
+    /// </summary>
     public static ShellDialect Detect(string text)
     {
-        if (HasContinuation(text, '`'))
+        var marks = FindMarks(text);
+        if (marks.Backtick)
         {
             return ShellDialect.PowerShell;
         }
 
-        if (text.Contains("^\"", StringComparison.Ordinal) || HasContinuation(text, '^'))
+        if (marks.CaretQuote || marks.Caret)
         {
             return ShellDialect.Cmd;
         }
 
-        if (HasContinuation(text, '\\'))
+        if (marks.Backslash)
         {
             return ShellDialect.Posix;
         }
 
         var start = text.TrimStart();
+        if (start.StartsWith('&'))
+        {
+            return ShellDialect.PowerShell; // the call operator: & curl.exe …
+        }
+
         if (start.StartsWith("curl.exe", StringComparison.OrdinalIgnoreCase))
         {
             return start.Contains('\'', StringComparison.Ordinal) ? ShellDialect.PowerShell : ShellDialect.Cmd;
@@ -60,17 +70,65 @@ public static class ShellWords
         _ => SplitPosix(text, notes),
     };
 
-    private static bool HasContinuation(string text, char escape)
+    /// <summary>
+    /// Which of <c>`</c>, <c>^</c> and <c>\</c> end a line, and whether a word starts with <c>^"</c> (Chrome's cmd quoting,
+    /// <c>curl ^"https://…^"</c>), outside quoted values, which say nothing about the shell: '…' (PowerShell's '' inside one
+    /// ends it and starts another), $'…' (where \ escapes the next character) and "…" (where \ and ` do). Outside them, \, ^
+    /// and ` escape the next character, so \' and ^" start no quoted value, and a # that starts a word starts a comment.
+    /// </summary>
+    private static (bool Backtick, bool Caret, bool Backslash, bool CaretQuote) FindMarks(string text)
     {
-        for (var i = text.IndexOf(escape, StringComparison.Ordinal); i >= 0; i = text.IndexOf(escape, i + 1))
+        bool backtick = false, caret = false, backslash = false, caretQuote = false;
+        for (var i = 0; i < text.Length; i++)
         {
-            if (NewlineLength(text, i + 1) > 0)
+            var wordStart = i == 0 || IsBlank(text[i - 1]);
+            switch (text[i])
             {
-                return true;
+                case '`' or '^' or '\\':
+                    if (NewlineLength(text, i + 1) > 0)
+                    {
+                        backtick |= text[i] == '`';
+                        caret |= text[i] == '^';
+                        backslash |= text[i] == '\\';
+                    }
+
+                    caretQuote |= text[i] == '^' && wordStart && i + 1 < text.Length && text[i + 1] == '"';
+                    i++;
+                    break;
+                case '\'':
+                    i = QuotedEnd(text, i + 1, '\'', "");
+                    break;
+                case '$' when i + 1 < text.Length && text[i + 1] == '\'':
+                    i = QuotedEnd(text, i + 2, '\'', "\\");
+                    break;
+                case '"':
+                    i = QuotedEnd(text, i + 1, '"', "\\`");
+                    break;
+                case '#' when wordStart:
+                    while (i + 1 < text.Length && text[i + 1] != '\n')
+                    {
+                        i++;
+                    }
+
+                    break;
             }
         }
 
-        return false;
+        return (backtick, caret, backslash, caretQuote);
+    }
+
+    /// <summary>Where the quoted value whose text starts at <paramref name="i"/> ends: its closing quote, or the end of the text.</summary>
+    private static int QuotedEnd(string text, int i, char quote, string escapes)
+    {
+        for (; i < text.Length && text[i] != quote; i++)
+        {
+            if (escapes.Contains(text[i], StringComparison.Ordinal))
+            {
+                i++;
+            }
+        }
+
+        return i;
     }
 
     /// <summary>Length of the line break starting at <paramref name="index"/> (LF or CRLF), or 0.</summary>
@@ -288,6 +346,13 @@ public static class ShellWords
         if (i == start)
         {
             word.Append(literalIfEmpty);
+        }
+        else if (value is >= 0xD800 and <= 0xDBFF && maxDigits == 4 && i + 6 <= s.Length && s[i] == '\\' && s[i + 1] == 'u'
+                 && int.TryParse(s.AsSpan(i + 2, 4), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out var low) && low is >= 0xDC00 and <= 0xDFFF)
+        {
+            // Browsers escape text one UTF-16 unit at a time, so an emoji arrives as a surrogate pair: \ud83d\ude00.
+            word.Append((char)value).Append((char)low);
+            i += 6;
         }
         else if (value is >= 0 and <= 0x10FFFF and not (>= 0xD800 and <= 0xDFFF))
         {

@@ -54,6 +54,40 @@ public class VariableResolverTests
     }
 
     [Fact]
+    public void Values_that_reference_themselves_several_times_stop_growing()
+    {
+        // Each pass would multiply the text by 8 (8^10 references after ten passes): the expansion stops at the limit,
+        // and the references left are reported as unresolved.
+        var resolver = new VariableResolver([new DictionaryScope("x", new Dictionary<string, string>
+        {
+            ["baseUrl"] = string.Concat(Enumerable.Repeat("{{baseUrl}}", 8)),
+            ["host"] = "example.com",
+        })]);
+        var unresolved = new HashSet<string>();
+
+        var result = resolver.Resolve("https://{{host}}/{{baseUrl}}/ping", unresolved);
+
+        Assert.InRange(result.Length, VariableResolver.MaxGrowth / 2, VariableResolver.MaxGrowth + 100);
+        Assert.StartsWith("https://example.com/", result, StringComparison.Ordinal);
+        Assert.EndsWith("/ping", result, StringComparison.Ordinal);
+        Assert.Equal(["baseUrl"], unresolved);
+    }
+
+    [Fact]
+    public void A_value_too_long_to_insert_is_left_unresolved_and_others_are_not()
+    {
+        var resolver = new VariableResolver([new DictionaryScope("x", new Dictionary<string, string>
+        {
+            ["upload"] = new('A', VariableResolver.MaxGrowth + 100),
+            ["id"] = "42",
+        })]);
+        var unresolved = new HashSet<string>();
+
+        Assert.Equal("{\"file\":\"{{upload}}\",\"id\":42}", resolver.Resolve("{\"file\":\"{{upload}}\",\"id\":{{id}}}", unresolved));
+        Assert.Equal(["upload"], unresolved);
+    }
+
+    [Fact]
     public void Dynamic_variables_produce_values()
     {
         var time = new FixedTimeProvider(new DateTimeOffset(2026, 1, 2, 3, 4, 5, 678, TimeSpan.Zero));
@@ -64,6 +98,20 @@ public class VariableResolverTests
         Assert.Equal("2026-01-02T03:04:05.678Z", resolver.Resolve("{{$isoTimestamp}}"));
         Assert.InRange(int.Parse(resolver.Resolve("{{$randomInt}}"), System.Globalization.CultureInfo.InvariantCulture), 0, 1000);
         Assert.NotEqual(resolver.Resolve("{{$guid}}"), resolver.Resolve("{{$guid}}"));
+    }
+
+    [Fact]
+    public void A_variable_takes_the_place_of_a_dynamic_one_of_its_name()
+    {
+        // As in Postman (its dynamic variables are looked up last) and in scripts' replaceIn: a script that signs
+        // {{$timestamp}} after setting it signs what the request sends.
+        var resolver = new VariableResolver([new DictionaryScope("local", new Dictionary<string, string> { ["$timestamp"] = "1700000000" })]);
+
+        Assert.Equal("1700000000", resolver.Resolve("{{$timestamp}}"));
+        Assert.True(resolver.TryResolve("$timestamp", out _, out var scope));
+        Assert.Equal("local", scope);
+        Assert.True(resolver.TryResolve("$guid", out _, out scope));
+        Assert.Equal("dynamic", scope);
     }
 
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider

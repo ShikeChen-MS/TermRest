@@ -1,9 +1,11 @@
+using System.IO.Compression;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using TermRest.Core.Auth;
 using TermRest.Core.Certificates;
+using TermRest.Core.History;
 using TermRest.Core.Http;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
@@ -153,6 +155,7 @@ public sealed class RecordingTests : IDisposable
         Assert.Equal("hello", multipart.Single(p => p!["name"]!.GetValue<string>() == "note")!["value"]!.GetValue<string>());
         var file = multipart.Single(p => p!["name"]!.GetValue<string>() == "doc")!;
         Assert.Equal("upload.txt", file["fileName"]!.GetValue<string>());
+        Assert.Equal("text/plain", file["contentType"]!.GetValue<string>()); // as sent: the type of its extension
         Assert.Null(file["value"]); // files are recorded by reference, not content
         Assert.Equal((upload, 12, false), (file["_file"]!["path"]!.GetValue<string>(), file["_file"]!["size"]!.GetValue<int>(), file["_file"]!["contentRecorded"]!.GetValue<bool>()));
         Assert.DoesNotContain("file-content", entries[6]!["request"]!.ToJsonString(), StringComparison.Ordinal);
@@ -219,6 +222,37 @@ public sealed class RecordingTests : IDisposable
         Assert.Equal(_pki.Client.Thumbprint, tls["clientCertificate"]!["thumbprint"]!.GetValue<string>());
         Assert.True(tls["clientCertificateRequested"]!.GetValue<bool>());
         Assert.True(Entries(har)[0]!["timings"]!["ssl"]!.GetValue<double>() >= 0);
+    }
+
+    [Fact]
+    public async Task A_decoded_response_is_recorded_with_the_size_received_and_the_bytes_saved()
+    {
+        await using var server = await EchoServer.StartAsync();
+        var data = Encoding.UTF8.GetBytes("[" + string.Join(',', Enumerable.Repeat("{\"id\":1}", 100)) + "]");
+        using var gzip = new MemoryStream();
+        using (var encoder = new GZipStream(gzip, CompressionLevel.Fastest, leaveOpen: true))
+        {
+            encoder.Write(data);
+        }
+
+        var preparer = new RequestPreparer(VariableResolver.Empty, null, new ExecutionDefaults());
+        using var recorder = Start();
+        foreach (var path in (string[])[$"bytes/{Convert.ToHexString(gzip.ToArray())}?type=application/json&encoding=gzip", $"bytes/{Convert.ToHexString(data)}?type=application/json"])
+        {
+            recorder.Record(await new HttpExecutor().SendAsync(preparer.Prepare(new HttpRequestSpec { Url = server.Url(path) }, null, _root), _ct));
+        }
+
+        var entries = Entries(ReadHar(recorder.Save(Path.Combine(_root, "sizes.har")).Path));
+
+        var decoded = entries[0]!["response"]!;
+        var content = decoded["content"]!;
+        Assert.Equal("gzip", Header(decoded["headers"], "Content-Encoding"));
+        Assert.Equal(gzip.Length, decoded["bodySize"]!.GetValue<long>());
+        Assert.Equal((data.Length, data.Length - gzip.Length), (content["size"]!.GetValue<long>(), content["compression"]!.GetValue<long>()));
+        Assert.Equal(Encoding.UTF8.GetString(data), content["text"]!.GetValue<string>());
+        var plain = entries[1]!["response"]!;
+        Assert.Equal((data.Length, data.Length), (plain["bodySize"]!.GetValue<long>(), plain["content"]!["size"]!.GetValue<long>()));
+        Assert.Null(plain["content"]!["compression"]);
     }
 
     [Fact]
@@ -366,6 +400,277 @@ public sealed class RecordingTests : IDisposable
     }
 
     [Fact]
+    public async Task The_password_of_a_proxy_written_with_a_space_before_it_is_redacted()
+    {
+        // A hand-edited .termrest/settings.json whose proxy the user allowed; nothing listens there, so the request fails.
+        const string Proxy = " http://ada:Pr0xy-s3cret@127.0.0.1:1";
+        var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        workspace.Settings.Proxy = Proxy;
+        using var runner = new RequestRunner(workspace) { AllowedProxy = Proxy };
+        using var recorder = Start();
+        runner.Recorder = recorder;
+
+        var exchange = await runner.SendAsync(PostmanCollection.Create("API"), null, new HttpRequestSpec { Url = "http://api.example.com/x" }, _ct);
+
+        Assert.Null(exchange.Response);
+        var path = recorder.Save(Path.Combine(_root, "proxy.har")).Path;
+        Assert.DoesNotContain("Pr0xy-s3cret", await File.ReadAllTextAsync(path, _ct), StringComparison.Ordinal);
+        Assert.Contains("127.0.0.1:1", Entries(ReadHar(path))[0]!["_termrest"]!["settings"]!["proxy"]!.GetValue<string>(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_token_a_test_script_keeps_is_redacted_in_the_response_it_came_from()
+    {
+        var python = TestPython.Require();
+        await using var server = await EchoServer.StartAsync();
+        const string Key = "9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b";
+        const string Jwt = "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6NDJ9.c2lnbmF0dXJlLXZhbHVl";
+        var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        var environment = workspace.CreateEnvironment("dev");
+        environment.SetValues([new KeyValueEntry { Key = "session", Value = "", Type = "secret" }]);
+        workspace.ActiveEnvironment = environment;
+        using var runner = new RequestRunner(workspace) { History = new HistoryStore(Path.Combine(TestFiles.NewTempDirectory(), "history"), 10) };
+        runner.SetPythonInterpreter(python);
+        using var recorder = Start();
+        runner.Recorder = recorder;
+
+        // A login answered as Django REST Framework ({"key": …}) and Strapi ({"jwt": …}) do: neither name says it is a credential.
+        var login = Encoding.UTF8.GetBytes($"{{\"key\":\"{Key}\",\"jwt\":\"{Jwt}\"}}");
+        var exchange = await runner.SendAsync(PostmanCollection.Create("API"), null, new HttpRequestSpec
+        {
+            Url = server.Url($"bytes/{Convert.ToHexString(login)}?type=application/json"),
+            Scripts = new ScriptSet("", "body = tr.response.json()\ntr.environment.set('session', body['key'])\ntr.environment.set('jwtToken', body['jwt'])", ScriptLanguage.Python),
+        }, _ct);
+        Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
+
+        var path = recorder.Save(Path.Combine(_root, "login.har")).Path;
+
+        var text = await File.ReadAllTextAsync(path, _ct);
+        Assert.DoesNotContain(Key, text, StringComparison.Ordinal);
+        Assert.DoesNotContain(Jwt, text, StringComparison.Ordinal);
+        Assert.Equal("{\"key\":\"[REDACTED]\",\"jwt\":\"[REDACTED]\"}", Entries(ReadHar(path))[0]!["response"]!["content"]!["text"]!.GetValue<string>());
+
+        // The history masks the value of the variable typed secret, as it masks secrets known before sending.
+        var entry = Assert.Single(runner.History.Load());
+        Assert.StartsWith("{\"key\":\"***\"", Encoding.UTF8.GetString(runner.History.ReadBody(entry)!), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task The_value_sent_for_a_secret_variable_is_redacted_whichever_scope_it_comes_from()
+    {
+        await using var server = await EchoServer.StartAsync();
+        const string CliKey = "cli-function-key-4f9a2b";
+        const string VaultValue = "vault-value-8c1d3e";
+        var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        var environment = workspace.CreateEnvironment("prod");
+        environment.SetValues(
+        [
+            new KeyValueEntry { Key = "functionKey", Value = "", Type = "secret" },
+            new KeyValueEntry { Key = "signing", Value = "{{fromVault}}", Type = "secret" },
+        ]);
+        workspace.ActiveEnvironment = environment;
+        var collection = workspace.CreateCollection("API");
+        collection.SetVariables([new KeyValueEntry { Key = "fromVault", Value = VaultValue }]);
+        using var runner = new RequestRunner(workspace) { History = new HistoryStore(Path.Combine(TestFiles.NewTempDirectory(), "history"), 10) };
+        runner.LocalVariables["functionKey"] = CliKey; // termrest send … -e prod --var functionKey=…
+        using var recorder = Start();
+        runner.Recorder = recorder;
+
+        // Neither name says it is a credential: only their type does.
+        var exchange = await runner.SendAsync(collection, null, new HttpRequestSpec { Url = server.Url("echo/orders") + "?code={{functionKey}}&ref={{signing}}" }, _ct);
+
+        Assert.Equal($"?code={CliKey}&ref={VaultValue}", JsonNode.Parse(exchange.Response!.Body)!["rawQuery"]!.GetValue<string>());
+        var entry = Assert.Single(runner.History.Load());
+        Assert.EndsWith("/echo/orders?code=***&ref=***", entry.Url, StringComparison.Ordinal);
+        var har = await File.ReadAllTextAsync(recorder.Save(Path.Combine(_root, "secret-variables.har")).Path, _ct);
+        foreach (var secret in (string[])[CliKey, VaultValue])
+        {
+            Assert.DoesNotContain(secret, Encoding.UTF8.GetString(runner.History.ReadBody(entry)!), StringComparison.Ordinal);
+            Assert.DoesNotContain(secret, har, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task A_secret_sent_in_a_url_is_redacted_as_the_url_holds_it()
+    {
+        await using var server = await EchoServer.StartAsync();
+        const string Secret = "P@ss^word|1"; // the URL escapes ^ and | but not @: neither URL encoding of the value
+        var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        var environment = workspace.CreateEnvironment("prod");
+        environment.SetValues([new KeyValueEntry { Key = "pass", Value = Secret, Type = "secret" }]);
+        workspace.ActiveEnvironment = environment;
+        using var runner = new RequestRunner(workspace) { History = new HistoryStore(Path.Combine(TestFiles.NewTempDirectory(), "history"), 10) };
+        using var recorder = Start();
+        runner.Recorder = recorder;
+
+        var exchange = await runner.SendAsync(workspace.CreateCollection("API"), null, new HttpRequestSpec { Url = server.Url("echo/login") + "?user=ada&pass={{pass}}" }, _ct);
+
+        Assert.Equal("?user=ada&pass=P@ss%5Eword%7C1", JsonNode.Parse(exchange.Response!.Body)!["rawQuery"]!.GetValue<string>());
+        var har = await File.ReadAllTextAsync(recorder.Save(Path.Combine(_root, "url-form.har")).Path, _ct);
+        var stored = Encoding.UTF8.GetString(runner.History.ReadBody(Assert.Single(runner.History.Load()))!);
+        foreach (var form in (string[])[Secret, "P@ss%5Eword%7C1"])
+        {
+            Assert.DoesNotContain(form, har, StringComparison.Ordinal);
+            Assert.DoesNotContain(form, stored, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task A_secret_with_a_hash_or_a_question_mark_is_redacted_as_the_url_holds_it()
+    {
+        await using var server = await EchoServer.StartAsync();
+        const string Secret = "P@ss#w?rd 1";
+        var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        var environment = workspace.CreateEnvironment("prod");
+        environment.SetValues([new KeyValueEntry { Key = "pass", Value = Secret, Type = "secret" }]);
+        workspace.ActiveEnvironment = environment;
+        var collection = workspace.CreateCollection("API");
+        using var runner = new RequestRunner(workspace) { History = new HistoryStore(Path.Combine(TestFiles.NewTempDirectory(), "history"), 10) };
+        using var recorder = Start();
+        runner.Recorder = recorder;
+
+        // Its '#' is sent as %23, and in a path variable its '?' as %3F: neither URL encoding of the value gives these forms.
+        var query = await runner.SendAsync(collection, null, new HttpRequestSpec { Url = server.Url("echo/login") + "?user=ada&pass={{pass}}" }, _ct);
+        var path = await runner.SendAsync(collection, null, new HttpRequestSpec { Url = server.Url("echo/keys/:id"), PathVariables = [new() { Key = "id", Value = "{{pass}}" }] }, _ct);
+
+        Assert.Equal("?user=ada&pass=P@ss%23w?rd%201", JsonNode.Parse(query.Response!.Body)!["rawQuery"]!.GetValue<string>());
+        Assert.Equal(server.BaseUri + "echo/keys/P@ss%23w%3Frd%201", path.Request.Uri!.AbsoluteUri);
+        var entries = runner.History.Load();
+        Assert.Equal([server.Url("echo/keys/***"), server.Url("echo/login") + "?user=ada&pass=***"], entries.Select(e => e.Url));
+        var har = await File.ReadAllTextAsync(recorder.Save(Path.Combine(_root, "hash-form.har")).Path, _ct);
+        var stored = string.Concat(entries.Select(e => Encoding.UTF8.GetString(runner.History.ReadBody(e)!)));
+        foreach (var form in (string[])[Secret, "P@ss%23w?rd", "P@ss%23w%3Frd"])
+        {
+            Assert.DoesNotContain(form, har, StringComparison.Ordinal);
+            Assert.DoesNotContain(form, stored, StringComparison.Ordinal);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_key_sent_as_the_basic_user_name_is_in_neither_the_recording_nor_a_report_nor_the_history(bool inUrl)
+    {
+        // Stripe's documented curl takes the secret key as the user name, without a password (-u sk_test_…:, imported as Basic
+        // auth); in the URL, it is its user info. The response quotes the key, as an error message might. (Stripe's sample test
+        // key, split so that secret scanning doesn't take it for a real one.)
+        const string Key = "sk_test_" + "4eC39HqLyjWDarjtT1zdp7dc";
+        await using var server = await EchoServer.StartAsync();
+        var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        using var runner = new RequestRunner(workspace) { History = new HistoryStore(Path.Combine(TestFiles.NewTempDirectory(), "history"), 10) };
+        using var recorder = Start();
+        runner.Recorder = recorder;
+        var url = server.Url($"bytes/{Convert.ToHexString(Encoding.UTF8.GetBytes($"{{\"error\":\"No such key: {Key}\"}}"))}?type=application/json");
+        var auth = new AuthSpec { Type = "basic" };
+        auth.Set("username", Key);
+        auth.Set("password", "");
+        var spec = inUrl ? new HttpRequestSpec { Url = url.Replace("://", $"://{Key}:@", StringComparison.Ordinal) } : new HttpRequestSpec { Url = url, Auth = auth };
+
+        var exchange = await runner.SendAsync(workspace.CreateCollection("API"), null, spec, _ct);
+
+        Assert.Contains(Key, Encoding.UTF8.GetString(exchange.Response!.Body), StringComparison.Ordinal);
+        var path = recorder.Save(Path.Combine(_root, "stripe.har")).Path;
+        var report = new Redactor().ForReport(exchange); // as termrest run --report-json redacts its report
+        var entry = Assert.Single(runner.History.Load());
+        foreach (var text in (string[])
+        [
+            await File.ReadAllTextAsync(path, _ct),
+            report.Url(exchange.Request.Url, "url") + report.Text($"expected '{Key}' to be revoked", "tests"),
+            await File.ReadAllTextAsync(runner.History.FilePath, _ct),
+            Encoding.UTF8.GetString(runner.History.ReadBody(entry)!),
+        ])
+        {
+            Assert.DoesNotContain(Key, text, StringComparison.Ordinal);
+        }
+
+        Assert.Equal(inUrl ? "Basic (from the URL)" : "Basic", Entries(ReadHar(path))[0]!["_termrest"]!["auth"]!.GetValue<string>());
+        Assert.True(HistoryEntry.HasMaskedCredentials(entry.ReadSpec())); // sending it again asks for the key
+    }
+
+    [Fact]
+    public void A_secret_is_redacted_where_json_escapes_it_as_python_or_go_does()
+    {
+        // Python's json.dumps (Flask, Django, httpbin, TermRest's Python scripts) writes non-ASCII characters as lower-case
+        // \u escapes; Go's encoding/json writes < > & as \u003c \u003e \u0026.
+        using var recorder = Start();
+        var exchange = Exchange("https://example.com/login", """{"form":{"pin":"Gr\u00fc\u00dfe-2024"},"go":"k3y\u003c\u0026\u003ev4lue"}"""u8.ToArray(), method: "POST");
+        exchange.Request.Body = new PreparedBody { Kind = PreparedBodyKind.Text, Text = """{"pin": "Gr\u00fc\u00dfe-2024"}""", ContentType = "application/json" };
+        exchange.Request.SecretValues.UnionWith(["Grüße-2024", "k3y<&>v4lue"]);
+
+        recorder.Record(exchange);
+        var entry = Assert.Single(Entries(ReadHar(recorder.Save(Path.Combine(_root, "escaped.har")).Path)))!;
+
+        Assert.Equal("""{"pin": "[REDACTED]"}""", entry["request"]!["postData"]!["text"]!.GetValue<string>());
+        Assert.Equal("""{"form":{"pin":"[REDACTED]"},"go":"[REDACTED]"}""", entry["response"]!["content"]!["text"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void A_body_in_a_charset_dotnet_does_not_support_is_recorded_as_text()
+    {
+        using var recorder = Start();
+        recorder.Record(Exchange("https://example.com/utf7", [.. "Hi Mom -+Jjo--! "u8, 0xE9], "text/plain; charset=utf-7"));
+
+        var har = ReadHar(recorder.Save(Path.Combine(_root, "utf7.har")).Path);
+
+        Assert.Null(recorder.LastError);
+        Assert.Equal("Hi Mom -+Jjo--! \uFFFD", Assert.Single(Entries(har))!["response"]!["content"]!["text"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void A_body_in_a_legacy_code_page_is_recorded_as_the_text_it_is()
+    {
+        using var recorder = Start();
+        recorder.Record(Exchange("https://example.com/legacy", [.. "caf"u8, 0xE9], "text/plain; charset=windows-1252"));
+
+        var har = ReadHar(recorder.Save(Path.Combine(_root, "legacy.har")).Path);
+
+        Assert.Equal("café", Assert.Single(Entries(har))!["response"]!["content"]!["text"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void A_text_body_whose_byte_order_mark_says_utf16_or_utf32_is_recorded_as_text_with_its_secrets_redacted()
+    {
+        const string Secret = "s3cr3t-wide-value";
+        using var recorder = Start();
+        foreach (var encoding in (Encoding[])[Encoding.Unicode, Encoding.BigEndianUnicode, Encoding.UTF32])
+        {
+            // No charset: only the mark says how the echoed secret is encoded.
+            var exchange = Exchange("https://example.com/wide", [.. encoding.Preamble, .. encoding.GetBytes($"<echo>{Secret}</echo>")], "text/xml");
+            exchange.Request.SecretValues.Add(Secret);
+            recorder.Record(exchange);
+        }
+
+        var path = recorder.Save(Path.Combine(_root, "wide.har")).Path;
+
+        Assert.All(Entries(ReadHar(path)), entry =>
+        {
+            var content = entry!["response"]!["content"]!;
+            Assert.Null(content["encoding"]);
+            Assert.Equal("<echo>[REDACTED]</echo>", content["text"]!.GetValue<string>());
+        });
+        Assert.DoesNotContain(Secret, File.ReadAllText(path), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_utf16_body_without_a_byte_order_mark_is_recorded_in_the_byte_order_its_text_shows()
+    {
+        // RFC 2781 lets an unmarked "UTF-16" be either byte order: a SOAP fault, say, that echoes the token.
+        const string Secret = "s3cr3t-token-value";
+        using var recorder = Start();
+        foreach (var encoding in (Encoding[])[Encoding.BigEndianUnicode, Encoding.Unicode])
+        {
+            var exchange = Exchange("https://example.com/soap", encoding.GetBytes($"<faultstring>Token {Secret} is not valid</faultstring>"), "text/xml; charset=\"UTF-16\"");
+            exchange.Request.SecretValues.Add(Secret);
+            recorder.Record(exchange);
+        }
+
+        var path = recorder.Save(Path.Combine(_root, "unmarked.har")).Path;
+
+        Assert.All(Entries(ReadHar(path)), entry =>
+            Assert.Equal("<faultstring>Token [REDACTED] is not valid</faultstring>", entry!["response"]!["content"]!["text"]!.GetValue<string>()));
+    }
+
+    [Fact]
     public void An_empty_recording_is_a_valid_har_file()
     {
         using var recorder = Start();
@@ -392,6 +697,56 @@ public sealed class RecordingTests : IDisposable
     }
 
     [Fact]
+    public async Task Names_added_while_recording_are_redacted_in_the_requests_recorded_from_then_on()
+    {
+        var recorder = Start("ssn");
+        var before = Exchange("https://example.com/before");
+        before.SentHeaders.Add(new("X-Tenant-Key", "t-123456"));
+        recorder.Record(before);
+        await recorder.WhenWritten();
+
+        Assert.Equal(["Tenant-Key"], recorder.AddRedactNames(["SSN", "Tenant-Key"]));
+        Assert.Empty(recorder.AddRedactNames(["tenant_key"])); // the same name
+        var after = Exchange("https://example.com/after");
+        after.SentHeaders.Add(new("X-Tenant-Key", "t-123456"));
+        recorder.Record(after);
+        await recorder.WhenWritten();
+        recorder.Dispose(); // TermRest ended: the recording recovered next time lists the names too
+
+        using var recovered = RequestRecorder.Recover(Assert.Single(RequestRecorder.FindUnsaved(_root)));
+        var har = ReadHar(recovered.Save(Path.Combine(_root, "added.har")).Path);
+
+        Assert.Equal(["t-123456", "[REDACTED]"], Entries(har).Select(e => Header(e!["request"]!["headers"], "X-Tenant-Key")));
+        Assert.Equal(["ssn", "Tenant-Key"], har["log"]!["_termrest"]!["redaction"]!["extraNames"]!.AsArray().Select(n => n!.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task Variables_named_like_a_name_removed_from_the_settings_while_recording_stay_redacted()
+    {
+        const string tenant = "contoso-7f3a9b2c";
+        await using var server = await EchoServer.StartAsync();
+        var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        workspace.Settings.RecordingRedact = ["tenant-id"];
+        using var runner = new RequestRunner(workspace);
+        runner.LocalVariables["base"] = server.BaseUri.ToString().TrimEnd('/');
+        runner.LocalVariables["tenantId"] = tenant; // not typed "secret": redacted for its name
+        var collection = PostmanCollection.Create("Recorded");
+        using var recorder = Start("tenant-id");
+        runner.Recorder = recorder;
+        var spec = new HttpRequestSpec { Url = "{{base}}/echo/tenants/{{tenantId}}/users" };
+
+        await runner.SendAsync(runner.Prepare(collection, null, spec), _ct);
+        workspace.Settings.RecordingRedact = null; // removed in the settings: the recording goes on redacting it
+        await runner.SendAsync(runner.Prepare(collection, null, spec), _ct);
+        var path = recorder.Save(Path.Combine(_root, "removed.har")).Path;
+
+        Assert.DoesNotContain(tenant, await File.ReadAllTextAsync(path, _ct), StringComparison.Ordinal);
+        Assert.Equal(
+            [$"{server.BaseUri}echo/tenants/[REDACTED]/users", $"{server.BaseUri}echo/tenants/[REDACTED]/users"],
+            Entries(ReadHar(path)).Select(e => e!["request"]!["url"]!.GetValue<string>()));
+    }
+
+    [Fact]
     public async Task An_unsaved_recording_is_found_and_saved_after_termrest_ended()
     {
         var recorder = Start();
@@ -406,7 +761,7 @@ public sealed class RecordingTests : IDisposable
         empty.Dispose(); // nothing recorded: nothing to recover
 
         var unsaved = Assert.Single(RequestRecorder.FindUnsaved(_root));
-        Assert.Equal((recorder.TempDirectory, 2, "tests"), (unsaved.TempDirectory, unsaved.Requests, unsaved.WorkspaceName));
+        Assert.Equal((recorder.TempDirectory, "tests"), (unsaved.TempDirectory, unsaved.WorkspaceName));
         Assert.False(Directory.Exists(empty.TempDirectory));
 
         using var recovered = RequestRecorder.Recover(unsaved);
@@ -434,6 +789,136 @@ public sealed class RecordingTests : IDisposable
 
         Assert.Equal(expected switch { "system" => systemTemp, "configured" => custom, _ => expected }, chosen);
         Assert.Equal(systemTemp, RequestRecorder.ChooseTempRoot(false, null, null, systemTemp, _ => true, _ => false)); // no /var/tmp
+    }
+
+    [Fact]
+    public void Secrets_are_redacted_by_name_in_json_that_is_cut_off_not_utf8_or_labelled_as_text()
+    {
+        using var recorder = Start();
+        recorder.Record(Exchange("https://example.com/cut", Encoding.UTF8.GetBytes("{\"access_token\":\"tok-Cut-12345678\",\"note\":\"café")[..^1]));
+        recorder.Record(Exchange("https://example.com/latin1", [.. "{\"name\":\"Caf"u8, 0xE9, .. "\",\"access_token\":\"tok-Latin-12345678\"}"u8]));
+        recorder.Record(Exchange("https://example.com/html", "{\"access_token\":\"tok-Html-12345678\",\"token_type\":\"Bearer\"}"u8.ToArray(), "text/html"));
+
+        // After a UTF-8 byte order mark: JSON from a file saved with one (as PHP echoes it, as text/html or with no type).
+        byte[] bom = [0xEF, 0xBB, 0xBF];
+        recorder.Record(Exchange("https://example.com/bom", [.. bom, .. "{\"access_token\":\"tok-Bom-12345678\"}"u8], "text/html; charset=UTF-8"));
+        recorder.Record(Exchange("https://example.com/bom-unlabelled", [.. bom, .. " [{\"access_token\":\"tok-Bare-12345678\"}]"u8], null));
+        recorder.Record(Exchange("https://example.com/bom-json", [.. bom, .. "{\"access_token\":\"tok-Json-12345678\"}"u8]));
+
+        var path = recorder.Save(Path.Combine(_root, "text.har")).Path;
+
+        foreach (var entry in Entries(ReadHar(path)))
+        {
+            var content = entry!["response"]!["content"]!;
+            Assert.Null(content["encoding"]);
+            Assert.Contains("\"access_token\":\"[REDACTED]\"", content["text"]!.GetValue<string>(), StringComparison.Ordinal);
+        }
+
+        Assert.DoesNotContain("tok-", File.ReadAllText(path), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_raw_form_data_body_is_recorded_as_text_without_the_values_of_parts_named_like_credentials()
+    {
+        // A browser's "Copy as cURL" of a login form, imported: a raw body, and the Content-Type with its boundary.
+        const string Body = "------WebKitFormBoundaryX\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nHunter2-Secret\r\n"
+            + "------WebKitFormBoundaryX\r\nContent-Disposition: form-data; name=\"credentials\"; filename=\"credentials.json\"\r\nContent-Type: application/json\r\n\r\n{\"type\":\"service_account\"}\r\n"
+            + "------WebKitFormBoundaryX--\r\n";
+        using var recorder = Start();
+        var login = Exchange("https://example.com/login", "{\"echo\":\"Hunter2-Secret\"}"u8.ToArray(), method: "POST");
+        login.Request.Body = new PreparedBody { Kind = PreparedBodyKind.Text, Text = Body };
+        login.SentHeaders.Add(new("Content-Type", "multipart/form-data; boundary=----WebKitFormBoundaryX"));
+        recorder.Record(login);
+        recorder.Record(Exchange("https://example.com/me?pw=Hunter2-Secret"));
+
+        var path = recorder.Save(Path.Combine(_root, "form-data.har")).Path;
+
+        Assert.DoesNotContain("Hunter2-Secret", File.ReadAllText(path), StringComparison.Ordinal);
+        var entries = Entries(ReadHar(path));
+        var postData = entries[0]!["request"]!["postData"]!;
+        Assert.Null(postData["_encoding"]);
+        Assert.Equal(Body.Replace("Hunter2-Secret", "[REDACTED]", StringComparison.Ordinal), postData["text"]!.GetValue<string>()); // the file as sent
+        Assert.Contains(entries[0]!["_termrest"]!["redacted"]!.AsArray(), n => n!["in"]!.GetValue<string>() == "request.postData" && n["name"]?.GetValue<string>() == "password");
+        Assert.Equal("{\"echo\":\"[REDACTED]\"}", entries[0]!["response"]!["content"]!["text"]!.GetValue<string>());
+        Assert.Equal("https://example.com/me?pw=[REDACTED]", entries[1]!["request"]!["url"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task A_text_body_that_is_not_utf8_at_all_is_written_as_replacement_characters()
+    {
+        var recorder = Start(); // not disposed if writing hangs: disposing would wait for it
+        recorder.Record(Exchange("https://example.com/garbage", Enumerable.Repeat((byte)0x80, 200_000).ToArray(), "text/plain"));
+
+        await recorder.WhenWritten().WaitAsync(TimeSpan.FromSeconds(30), _ct);
+        var content = Entries(ReadHar(recorder.Save(Path.Combine(_root, "garbage.har")).Path))[0]!["response"]!["content"]!;
+
+        Assert.Equal(new string('\uFFFD', 200_000), content["text"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Only_private_folders_are_recovered_and_damaged_details_are_ignored()
+    {
+        string Leftover(string details, bool shared = false)
+        {
+            var directory = Path.Combine(_root, RequestRecorder.DirectoryPrefix + Guid.NewGuid().ToString("N"));
+            if (OperatingSystem.IsWindows())
+            {
+                Directory.CreateDirectory(directory);
+            }
+            else
+            {
+                // As TermRest makes them (0700), or readable by others (0755): possibly another user's, in a shared /tmp.
+                var mode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+                mode |= shared ? UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute : 0;
+                Directory.CreateDirectory(directory, mode);
+                File.SetUnixFileMode(directory, mode);
+            }
+
+            File.WriteAllText(Path.Combine(directory, RequestRecorder.SpoolFileName), "{\n}\n");
+            File.WriteAllText(Path.Combine(directory, RequestRecorder.InfoFileName), details);
+            return directory;
+        }
+
+        string[] damaged = ["{\"startedAt\": 1}", "{\"startedAt\": \"2026-11-05T13:29:29-07:00\", \"processId\": \"42\"}", "[]", "{"];
+        var expected = damaged.Select(details => Leftover(details)).ToList();
+        if (!OperatingSystem.IsWindows())
+        {
+            Leftover("{}", shared: true);
+        }
+
+        Assert.Equal(expected.Order(), RequestRecorder.FindUnsaved(_root).Select(u => u.TempDirectory).Order());
+    }
+
+    [Fact]
+    public void The_temporary_file_is_read_in_pieces_and_finding_a_recording_stops_at_its_first_request()
+    {
+        var first = "{\n  \"a\": \"" + new string('x', 65_523) + "\"\n}"; // its last line break is the first byte of the second read
+        var second = "{\n  \"b\": 1\n}";
+        var spool = Encoding.UTF8.GetBytes(first + "\n" + second + "\n{\n  \"cut\": \"off" + new string(' ', 400_000));
+        using var stream = new MemoryStream(spool);
+
+        Assert.Equal([(0L, 65_536L), (65_537L, (long)second.Length)], RequestRecorder.Scan(stream).Select(e => (e.Offset, e.Length)));
+
+        Assert.Single(RequestRecorder.Scan(stream, max: 1));
+        Assert.True(stream.Position < spool.Length / 2, $"{stream.Position} of {spool.Length} bytes read.");
+    }
+
+    [Fact]
+    public void Recording_waits_when_requests_are_sent_faster_than_they_are_written()
+    {
+        using var recorder = Start();
+        var body = new byte[2 * 1024 * 1024];
+        new Random(7).NextBytes(body);
+        var most = 0;
+        for (var i = 0; i < 12; i++)
+        {
+            recorder.Record(Exchange($"https://example.com/{i}", body, "application/octet-stream"));
+            most = Math.Max(most, recorder.PendingWrites);
+        }
+
+        Assert.True(most <= RequestRecorder.MaxPendingWrites, $"{most} requests waited to be written.");
+        Assert.Equal(12, recorder.Count);
+        recorder.Discard();
     }
 
     public void Dispose() => _pki.Dispose();

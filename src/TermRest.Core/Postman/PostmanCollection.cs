@@ -19,6 +19,9 @@ public sealed class PostmanCollection
 
     private ICollectionStorage? _storage;
 
+    /// <summary>What the JSON file held when last read or written (see <see cref="Save"/>).</summary>
+    private FileStamp? _stamp;
+
     private PostmanCollection(JsonObject root, string? filePath, TextFileInfo fileInfo)
     {
         Root = root;
@@ -96,10 +99,12 @@ public sealed class PostmanCollection
             return V3CollectionStorage.Load(path);
         }
 
-        var (text, info) = TextFile.Read(path);
+        var (text, info) = TextFile.Read(path, out var stamp);
         try
         {
-            return Parse(text, path, info);
+            var collection = Parse(text, path, info);
+            collection._stamp = stamp;
+            return collection;
         }
         catch (Exception ex) when (ex is System.Text.Json.JsonException or InvalidDataException)
         {
@@ -147,9 +152,23 @@ public sealed class PostmanCollection
 
     /// <summary>
     /// Writes this collection (any format) as a new Postman v3 YAML collection folder and returns it. Long values are
-    /// wrapped at <paramref name="lineWidth"/> (null or 0: not wrapped).
+    /// wrapped at <paramref name="lineWidth"/> (null or 0: not wrapped). On Unix it is as private as this collection's file.
     /// </summary>
     public PostmanCollection ConvertToV3(string directory, int? lineWidth = null) => V3CollectionStorage.ConvertFrom(this, directory, lineWidth);
+
+    /// <summary>
+    /// The secret variables (of the collection and its folders) whose values <see cref="ConvertToV3"/> leaves out: Postman's
+    /// v3 collections keep secret values out of their files.
+    /// </summary>
+    public List<string> SecretValuesLeftOutOfV3() => IsV3 ? [] : V3Convert.SecretValuesLeftOut(Root);
+
+    /// <summary>
+    /// The collection and folders whose auth is a list of v3 credential sets chosen by URL rules: <see cref="ExportV21Json"/>
+    /// keeps the first set only (v2.1 has one auth per folder), which Postman then applies to every URL.
+    /// </summary>
+    public List<string> CredentialSetsLeftOutOfV21() =>
+        [.. Descendants().OfType<FolderNode>().Prepend(RootNode).Where(f => f.Json[V3Convert.AuthSetsProperty] is JsonArray)
+            .Select(f => f is CollectionRootNode ? $"collection '{Name}'" : $"folder '{f.PathInCollection}'")];
 
     /// <summary>The collection as a Postman v2.1 JSON document (for any source format).</summary>
     public string ExportV21Json()
@@ -170,6 +189,7 @@ public sealed class PostmanCollection
             {
                 case JsonObject obj:
                     obj.Remove("x-v3-type");
+                    obj.Remove(V3.V3Convert.AuthSetsProperty); // v2.1 has one auth per folder: the first set, in "auth"
                     foreach (var (_, value) in obj)
                     {
                         RemoveV3Markers(value);
@@ -187,7 +207,16 @@ public sealed class PostmanCollection
         }
     }
 
-    public void Save(string? path = null)
+    /// <summary>
+    /// Saves the collection: a JSON file whole, a v3 folder only where it changed. A v3 file that could not be read when
+    /// the collection was loaded is never saved over: when changes belong in it, everything else is saved and an
+    /// <see cref="IOException"/> names it (the collection stays dirty).
+    /// </summary>
+    /// <param name="overwriteChanged">
+    /// Write files that changed on disk since they were read too; otherwise they are left alone and
+    /// <see cref="IO.FileChangedException"/> names them (the collection stays dirty).
+    /// </param>
+    public void Save(string? path = null, bool overwriteChanged = false)
     {
         if (_storage is not null)
         {
@@ -196,13 +225,21 @@ public sealed class PostmanCollection
                 throw new NotSupportedException("A v3 collection folder is saved in place; use 'termrest convert' to write another format.");
             }
 
-            _storage.Save(this);
+            _storage.Save(this, overwriteChanged);
             SetDirty(false);
             return;
         }
 
         path ??= FilePath ?? throw new InvalidOperationException("The collection has no file path yet.");
-        TextFile.WriteAtomic(path, Serialize(), FileInfo);
+        var fullPath = Path.GetFullPath(path);
+        var samePath = FilePath is not null && string.Equals(fullPath, Path.GetFullPath(FilePath), StringComparison.OrdinalIgnoreCase);
+        if (!overwriteChanged && samePath && _stamp is not null && File.Exists(fullPath) && _stamp.HasChanged(fullPath))
+        {
+            throw new FileChangedException([fullPath]);
+        }
+
+        TextFile.WriteAtomic(path, Serialize(), FileInfo, out var stamp);
+        _stamp = stamp;
         FilePath = path;
         SetDirty(false);
     }
