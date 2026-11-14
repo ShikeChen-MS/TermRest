@@ -4,6 +4,7 @@ using Terminal.Gui.Input;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using TermRest.Core.History;
+using TermRest.Tui.Dialogs;
 
 namespace TermRest.Tui.Views;
 
@@ -15,9 +16,9 @@ internal sealed class HistoryView : View
 {
     private readonly TextField _filter;
     private readonly ListView _list;
-    private readonly ObservableCollection<string> _rows = [];
     private readonly List<HistoryEntry> _all = [];
     private readonly List<HistoryEntry> _shown = [];
+    private ObservableCollection<string> _rows = [];
     private string _emptyText = "No requests sent yet.";
     private bool _refreshing;
 
@@ -33,6 +34,10 @@ internal sealed class HistoryView : View
 
         _list = new ListView { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill() };
         _list.SetSource(_rows);
+
+        // ListView's Ctrl+N (down) would hide the window's New request; Ctrl+P (up) goes with it.
+        _list.KeyBindings.Remove(Key.N.WithCtrl);
+        _list.KeyBindings.Remove(Key.P.WithCtrl);
         _list.ValueChanged += (_, e) =>
         {
             // Only the user's selection opens an entry; refreshing the list does not replace the editor's request.
@@ -102,19 +107,28 @@ internal sealed class HistoryView : View
 
     public int Count => _all.Count;
 
+    /// <summary>Entries listed at most: as many as the history keeps (it deletes older ones, and their response bodies).</summary>
+    public int Limit { get; set; } = int.MaxValue;
+
     public IReadOnlyList<string> Rows => _rows;
 
     public void SetEntries(IEnumerable<HistoryEntry> entries, string emptyText)
     {
         _all.Clear();
-        _all.AddRange(entries);
+        _all.AddRange(entries.Take(Limit));
         _emptyText = emptyText;
         ApplyFilter();
     }
 
+    /// <summary>Lists a new entry first; the oldest beyond <see cref="Limit"/> go, as they go from the history.</summary>
     public void Prepend(HistoryEntry entry)
     {
         _all.Insert(0, entry);
+        if (_all.Count > Limit)
+        {
+            _all.RemoveRange(Limit, _all.Count - Limit);
+        }
+
         ApplyFilter();
     }
 
@@ -137,19 +151,18 @@ internal sealed class HistoryView : View
         {
             _shown.Clear();
             _shown.AddRange(filter.Length == 0 ? _all : _all.Where(e => Matches(e, filter)));
-            _rows.Clear();
-            foreach (var entry in _shown)
-            {
-                _rows.Add(Format(entry));
-            }
 
-            if (_shown.Count == 0)
+            // New rows each time: the list measures all its rows again after each row added to them.
+            _rows = _shown.Count == 0 ? [filter.Length == 0 ? _emptyText : "No match."] : new ObservableCollection<string>(_shown.Select(Format));
+            _list.SetSource(_rows);
+            if (_shown.Count > 0)
             {
-                _rows.Add(filter.Length == 0 ? _emptyText : "No match.");
+                _list.SelectedItem = previous is null ? 0 : Math.Max(0, _shown.IndexOf(previous));
             }
             else
             {
-                _list.SelectedItem = previous is null ? 0 : Math.Max(0, _shown.IndexOf(previous));
+                // No row is selected, which would scroll the list to it: back to the top, where the message is.
+                _list.Viewport = _list.Viewport with { X = 0, Y = 0 };
             }
         }
         finally
@@ -173,6 +186,6 @@ internal sealed class HistoryView : View
         var time = local.Date == DateTime.Today ? local.ToString("HH:mm", CultureInfo.InvariantCulture) : local.ToString("MM-dd", CultureInfo.InvariantCulture);
         var status = entry.Status?.ToString(CultureInfo.InvariantCulture) ?? "ERR";
         var target = Uri.TryCreate(entry.Url, UriKind.Absolute, out var uri) ? uri.PathAndQuery : entry.Url;
-        return $"{time} {status,-3} {entry.Method,-6} {target}";
+        return Ui.Drawable($"{time} {status,-3} {entry.Method,-6} {target}");
     }
 }

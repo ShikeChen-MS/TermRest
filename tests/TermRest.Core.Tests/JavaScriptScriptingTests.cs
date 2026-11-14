@@ -134,6 +134,15 @@ public class JavaScriptScriptingTests
               () => pm.expect('a').to.exist,
               () => pm.expect(new Date(5)).to.be.a('date'),
               () => pm.expect({}).to.be.empty,
+              () => pm.expect([1, 2]).to.have.lengthOf.above(1),
+              () => pm.expect([1, 2]).to.have.lengthOf.at.least(2),
+              () => pm.expect([1, 2]).to.have.lengthOf.within(1, 3),
+              () => pm.expect(Object.freeze({})).to.be.frozen,
+              () => pm.expect(pm.response).to.be.postmanResponse,
+              () => pm.expect(1).to.not.be.null.and.not.undefined,
+              () => pm.expect([1, 2]).to.have.lengthOf.at.least(1).and.at.most(10),
+              () => pm.expect([1, 2]).to.have.lengthOf(2).and.be.above(1),
+              () => pm.expect([1, 2]).to.have.lengthOf('2'),
             ];
             const failing = [
               [() => pm.expect(404).to.equal(200), 'expected 404 to equal 200'],
@@ -150,6 +159,37 @@ public class JavaScriptScriptingTests
               [() => pm.response.to.have.header('X-Missing'), "expected response to have header with key 'X-Missing'"],
               [() => pm.response.to.be.clientError, 'expected response code to be 4XX but found 200'],
               [() => pm.expect.fail('boom'), 'boom'],
+              [() => pm.expect(null).to.be.within(0, 120), 'expected null to be a number or a date'],
+              [() => pm.expect('42').to.not.be.within(0, 1), "expected '42' to be a number or a date"],
+              [() => pm.expect(null).to.be.closeTo(1, 0.5), 'expected null to be a number'],
+              [() => pm.expect('1.5').to.be.closeTo(1.4, 0.2), "expected '1.5' to be a number"],
+              [() => pm.expect(1.5).to.be.closeTo(1.4), 'the arguments to closeTo or approximately must be numbers, and a delta is required'],
+              [() => pm.expect([1, 2]).to.have.lengthOf.above(5), 'expected [ 1, 2 ] to have a length above 5 but got 2'],
+              [() => pm.expect(false).to.be.ture, 'Error: Invalid Chai property: ture. Did you mean "true"?'],
+              [() => pm.expect([1]).to.be.array, 'Error: Invalid Chai property: array. Did you mean "any"?'],
+              [() => pm.expect([1]).to.include.membres([1]), 'Error: Invalid Chai property: membres. Did you mean "members"?'],
+              [() => pm.response.to.be.created, 'Error: Invalid Chai property: created. Did you mean "nested"?'],
+              [() => pm.response.to.be.withoutContent, 'expected response code to be 204 but found 200'],
+              [() => pm.expect(null).to.exists, 'expected null to exist'],
+              [() => pm.expect({}).to.be.sealed, 'expected {} to be sealed'],
+              [() => pm.expect(undefined).to.not.be.null.and.not.undefined, 'expected undefined not to be undefined'],
+              [() => pm.expect(1).to.not.not.equal(1), 'expected 1 to not equal 1'],
+              [() => pm.expect([1, 2]).to.have.lengthOf.at.least(1).and.at.most(1), 'expected [ 1, 2 ] to have a length at most 1 but got 2'],
+              [() => pm.expect([1, 2]).to.have.length.equal(2), 'expected [ 1, 2 ] to equal 2'],
+              [() => pm.expect(new Date(5)).to.be.within(1, 9), 'the arguments to within must be dates'],
+              [() => pm.expect(5).to.not.be.within('1', '9'), 'the arguments to within must be numbers'],
+              [() => pm.expect([1, 2]).to.have.lengthOf.within('1', 3), 'the arguments to within must be numbers'],
+              [() => pm.expect(new Date(0)).to.be.within(new Date(5), new Date(9)), 'expected 1970-01-01T00:00:00.000Z to be within 1970-01-01T00:00:00.005Z..1970-01-01T00:00:00.009Z'],
+              [() => pm.expect(null).to.not.have.property('error'), 'Target cannot be null or undefined.'],
+              [() => pm.expect(undefined).to.have.nested.property('a.b'), 'Target cannot be null or undefined.'],
+              [() => pm.expect(null, 'data').to.not.have.own.property('a'), 'data: Target cannot be null or undefined.'],
+              [() => pm.expect(5).to.be.above('1'), 'the argument to above must be a number'],
+              [() => pm.expect(5).to.not.be.lte('9'), 'the argument to most must be a number'],
+              [() => pm.expect(new Date(5)).to.be.below(9), 'the argument to below must be a date'],
+              [() => pm.expect([1, 2]).to.have.lengthOf.at.least('1'), 'the argument to least must be a number'],
+              [() => pm.expect([1, 2]).to.not.have.lengthOf('2'), 'expected [ 1, 2 ] to not have a length of 2'],
+              [() => pm.expect({}).to.have.lengthOf(undefined), "expected {} to have property 'length'"],
+              [() => pm.expect(null).to.have.lengthOf(0), 'Target cannot be null or undefined.'],
             ];
             passing.forEach((fn, index) => pm.test('passes ' + index, fn));
             failing.forEach(([fn, message], index) => pm.test('fails ' + index + '|' + message, fn));
@@ -168,14 +208,180 @@ public class JavaScriptScriptingTests
         var results = exchange.Scripts!;
         Assert.True(results.Error is null, results.Describe());
         var failures = results.Tests.Where(t => t.Name.StartsWith("fails ", StringComparison.Ordinal)).ToList();
-        Assert.Equal(14, failures.Count);
+        Assert.Equal(45, failures.Count);
         Assert.All(results.Tests.Where(t => !t.Name.StartsWith("fails ", StringComparison.Ordinal)), t => Assert.True(t.Passed, $"{t.Name}: {t.Error}"));
-        Assert.Equal(31, results.Tests.Count(t => t.Passed));
+        Assert.Equal(40, results.Tests.Count(t => t.Passed));
         Assert.All(failures, t =>
         {
             Assert.False(t.Passed, t.Name);
             Assert.Equal(t.Name[(t.Name.IndexOf('|', StringComparison.Ordinal) + 1)..], t.Error);
         });
+
+        var noContent = await runner.SendAsync(collection, null, JavaScript(server.Url("status/204"), test: """
+            pm.test('no content', () => pm.response.to.be.withoutContent.and.not.withBody);
+            """), null, _ct);
+
+        Assert.Equal(204, noContent.Response!.StatusCode);
+        Assert.True(noContent.Scripts!.Error is null, noContent.Scripts.Describe());
+        Assert.Equal([("no content", true)], noContent.Scripts.Tests.Select(t => (t.Name, t.Passed)));
+    }
+
+    /// <summary>
+    /// A stand-in for ajv in the workspace's node_modules (scripts take it from there): it checks only a schema's
+    /// <c>type</c> and <c>format</c>. As ajv 8 with <c>strict: false</c>, it logs a format it doesn't know and ignores it;
+    /// as ajv 6 (<paramref name="version"/> 6), it knows <c>email</c> and throws on a format it doesn't know (unless told to
+    /// ignore it). With <paramref name="formats"/>, a stand-in for ajv-formats that adds <c>email</c>: as the real one, it
+    /// works with ajv 7 and later only (it sets <c>ajv.opts.code.formats</c>).
+    /// </summary>
+    private static void WriteAjv(string root, bool formats, int version = 8)
+    {
+        var ajv = Path.Combine(root, "node_modules", "ajv");
+        Directory.CreateDirectory(ajv);
+        File.WriteAllText(Path.Combine(ajv, "index.js"), version >= 7
+            ? """
+              module.exports = class Ajv {
+                constructor(opts) { this.opts = Object.assign({ code: {} }, opts); this.formats = {}; }
+                addFormat(name, check) { this.formats[name] = check; return this; }
+                validate(schema, data) {
+                  const type = Array.isArray(data) ? 'array' : data === null ? 'null' : typeof data;
+                  const errors = schema.type === undefined || schema.type === type ? [] : [{ message: 'must be ' + schema.type }];
+                  if (schema.format !== undefined && this.formats[schema.format] === undefined) {
+                    this.opts.logger.warn('unknown format "' + schema.format + '" ignored in schema at path "#"');
+                  } else if (schema.format !== undefined && !this.formats[schema.format](data)) {
+                    errors.push({ message: 'must match format "' + schema.format + '"' });
+                  }
+                  this.errors = errors.length > 0 ? errors : null;
+                  return this.errors === null;
+                }
+                errorsText() { return this.errors ? 'data ' + this.errors.map(e => e.message).join(', ') : 'No errors'; }
+              };
+              """
+            : """
+              module.exports = class Ajv {
+                constructor(opts) { this._opts = opts; this._formats = { email: s => /^[^@\s]+@[^@\s]+$/.test(s) }; }
+                validate(schema, data) {
+                  const type = Array.isArray(data) ? 'array' : data === null ? 'null' : typeof data;
+                  const errors = schema.type === undefined || schema.type === type ? [] : [{ message: 'should be ' + schema.type }];
+                  if (schema.format !== undefined && this._formats[schema.format] === undefined) {
+                    if (this._opts.unknownFormats !== 'ignore') throw new Error('unknown format "' + schema.format + '" is used in schema at path "#"');
+                    this._opts.logger.warn('unknown format "' + schema.format + '" ignored in schema at path "#"');
+                  } else if (schema.format !== undefined && !this._formats[schema.format](data)) {
+                    errors.push({ message: 'should match format "' + schema.format + '"' });
+                  }
+                  this.errors = errors.length > 0 ? errors : null;
+                  return this.errors === null;
+                }
+                errorsText() { return this.errors ? 'data ' + this.errors.map(e => e.message).join(', ') : 'No errors'; }
+              };
+              """);
+        if (formats)
+        {
+            var addFormats = Path.Combine(root, "node_modules", "ajv-formats");
+            Directory.CreateDirectory(addFormats);
+            File.WriteAllText(Path.Combine(addFormats, "index.js"), "module.exports = ajv => { ajv.opts.code.formats = {}; ajv.addFormat('email', s => /^[^@\\s]+@[^@\\s]+$/.test(s)); };\n");
+        }
+    }
+
+    [Fact]
+    public async Task Json_schema_checks_a_response_body_or_any_value_as_in_postman()
+    {
+        var node = TestJavaScript.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        WriteAjv(workspace.RootPath, formats: false);
+        using var runner = new RequestRunner(workspace);
+        runner.SetJavaScriptRuntime(node);
+
+        var exchange = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), test: """
+            const body = pm.response.json();
+            pm.test('response', () => pm.response.to.have.jsonSchema({ type: 'object' }));
+            pm.test('value', () => pm.expect(body).to.have.jsonSchema({ type: 'object' }));
+            pm.test('part', () => pm.expect([body.method]).to.have.jsonSchema({ type: 'array' }));
+            pm.test('mismatch', () => pm.expect(body).to.have.jsonSchema({ type: 'array' }));
+            pm.test('negated', () => pm.expect(body).to.not.have.jsonSchema({ type: 'object' }));
+            """), null, _ct);
+
+        var results = exchange.Scripts!;
+        Assert.True(results.Error is null, results.Describe());
+        Assert.Equal(
+            [("response", true, null), ("value", true, null), ("part", true, null),
+             ("mismatch", false, "expected data to satisfy schema but found following errors: \ndata must be array"), ("negated", false, "expected data to not satisfy schema")],
+            results.Tests.Select(t => (t.Name, t.Passed, t.Error)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Json_schema_formats_are_checked_as_in_postman_or_the_test_says_what_to_install(bool formats)
+    {
+        // Postman's ajv 6 checks formats; ajv 8 only with ajv-formats, which would otherwise pass anything.
+        var node = TestJavaScript.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        WriteAjv(workspace.RootPath, formats);
+        using var runner = new RequestRunner(workspace);
+        runner.SetJavaScriptRuntime(node);
+
+        var exchange = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), test: """
+            pm.test('valid', () => pm.expect('ada@example.com').to.have.jsonSchema({ type: 'string', format: 'email' }));
+            pm.test('invalid', () => pm.expect('not an email').to.have.jsonSchema({ type: 'string', format: 'email' }));
+            pm.test('unknown', () => pm.expect('555').to.have.jsonSchema({ type: 'string', format: 'phone' }));
+            """), null, _ct);
+
+        var results = exchange.Scripts!;
+        Assert.True(results.Error is null, results.Describe());
+        static string Unknown(string format, bool install) =>
+            $"unknown format \"{format}\" ignored in schema at path \"#\"" + (install ? ": install ajv-formats in the workspace (npm install ajv-formats), as Postman checks formats" : "");
+        (string, bool, string?)[] expected = formats
+            ? [("valid", true, null), ("invalid", false, "expected data to satisfy schema but found following errors: \ndata must match format \"email\""), ("unknown", false, Unknown("phone", false))]
+            : [("valid", false, Unknown("email", true)), ("invalid", false, Unknown("email", true)), ("unknown", false, Unknown("phone", true))];
+        Assert.Equal(expected, results.Tests.Select(t => (t.Name, t.Passed, t.Error)));
+    }
+
+    [Fact]
+    public async Task Json_schema_uses_an_ajv_6_as_it_is_even_where_ajv_formats_is_installed()
+    {
+        // Postman's ajv 6 (or ESLint's) next to ajv-formats (for ajv 8, as npm installs it): ajv 6 checks formats itself.
+        var node = TestJavaScript.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        WriteAjv(workspace.RootPath, formats: true, version: 6);
+        using var runner = new RequestRunner(workspace);
+        runner.SetJavaScriptRuntime(node);
+
+        var exchange = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), test: """
+            pm.test('body', () => pm.response.to.have.jsonSchema({ type: 'object' }));
+            pm.test('invalid', () => pm.expect('not an email').to.have.jsonSchema({ type: 'string', format: 'email' }));
+            pm.test('unknown', () => pm.expect('555').to.have.jsonSchema({ type: 'string', format: 'phone' }));
+            pm.test('ignored', () => pm.expect('555').to.have.jsonSchema({ type: 'string', format: 'phone' }, { unknownFormats: 'ignore' }));
+            """), null, _ct);
+
+        var results = exchange.Scripts!;
+        Assert.True(results.Error is null, results.Describe());
+        Assert.Equal(
+            [("body", true, null), ("invalid", false, "expected data to satisfy schema but found following errors: \ndata should match format \"email\""),
+             ("unknown", false, "Error: unknown format \"phone\" is used in schema at path \"#\""), ("ignored", true, null)],
+            results.Tests.Select(t => (t.Name, t.Passed, t.Error)));
+    }
+
+    [Fact]
+    public async Task Dates_and_urls_set_in_scripts_are_their_text()
+    {
+        var node = TestJavaScript.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetJavaScriptRuntime(node);
+
+        var exchange = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), test: """
+            pm.collectionVariables.set('when', new Date(0));
+            pm.collectionVariables.set('site', new URL('https://example.org/a'));
+            pm.collectionVariables.set('flags', { on: true });
+            """), null, _ct);
+
+        Assert.True(exchange.Scripts!.Error is null, exchange.Scripts.Describe());
+        var stored = runner.Session.For(collection);
+        Assert.Equal(("1970-01-01T00:00:00.000Z", "https://example.org/a", """{"on":true}"""), (stored["when"], stored["site"], stored["flags"]));
     }
 
     [Fact]
@@ -210,12 +416,65 @@ public class JavaScriptScriptingTests
         var rejected = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), test: "Promise.reject(new Error('nobody caught this'));"), _ct);
         Assert.Equal("Error: nobody caught this", rejected.Scripts!.Error!.Message);
 
+        // What can't be turned into text fails its script (and its test), not the whole answer: what it logged is kept.
+        var bare = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), test: "console.log('before');\nthrow Object.create(null);"), _ct);
+        Assert.Equal("[object Object]", bare.Scripts!.Error!.Message);
+        Assert.Equal(["before"], bare.Scripts.Logs.Select(l => l.Text));
+        var unreadable = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), test: """
+            const error = new TypeError();
+            Object.defineProperty(error, 'message', { get() { throw new Error('no text'); } });
+            pm.test('unreadable', () => { throw error; });
+            pm.test('bare', () => { throw Object.create(null); });
+            throw error;
+            """), _ct);
+        Assert.Equal("TypeError: (its message could not be read)", unreadable.Scripts!.Error!.Message);
+        Assert.Equal(["TypeError: (its message could not be read)", "[object Object]"], unreadable.Scripts.Tests.Select(t => t.Error));
+
         var skipped = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), preRequest: "pm.execution.skipRequest();"), _ct);
         Assert.Null(skipped.Response);
         Assert.Contains("skipRequest() is not supported by TermRest, so the request is not sent", skipped.ErrorMessage, StringComparison.Ordinal);
 
         var next = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), test: "pm.test('still works', () => {});"), _ct);
         Assert.True(next.Scripts!.Succeeded, next.Scripts.Describe());
+    }
+
+    [Fact]
+    public async Task Scripts_may_set_the_host_and_path_of_the_url_as_text_as_in_postman()
+    {
+        var node = TestJavaScript.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetJavaScriptRuntime(node);
+
+        var moved = await runner.SendAsync(collection, null, JavaScript("https://api.example.com:8443/v1/items?q=1#top", preRequest: $$"""
+            pm.request.url.protocol = 'http';
+            pm.request.url.host = '{{server.BaseUri.Host}}';
+            pm.request.url.port = {{server.BaseUri.Port}};
+            pm.request.url.path = '/echo/moved';
+            pm.request.url.hash = null;
+            console.log(pm.request.url.getHost(), pm.request.url.getPath());
+            """), _ct);
+
+        Assert.True(moved.Scripts!.Succeeded, moved.Scripts.Describe());
+        Assert.Equal([$"{server.BaseUri.Host} /echo/moved"], moved.Scripts.Logs.Select(l => l.Text));
+        var echo = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(moved.Response!.Body))!;
+        Assert.Equal(("/echo/moved", "?q=1"), (echo["path"]!.GetValue<string>(), echo["rawQuery"]!.GetValue<string>()));
+
+        // A request the scripts left unusable fails them, not the whole answer: what they printed, tested and set is kept.
+        var broken = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), preRequest: """
+            console.log('before');
+            pm.collectionVariables.set('kept', 'yes');
+            pm.test('ran', () => {});
+            pm.request.url.query = 'a=1';
+            """), _ct);
+
+        Assert.Null(broken.Response);
+        Assert.StartsWith("The pre-request scripts left a request that cannot be sent: TypeError: ", broken.Scripts!.Error!.Message, StringComparison.Ordinal);
+        Assert.Contains("\nScripts failed\n  The pre-request scripts left", broken.Scripts.Describe(), StringComparison.Ordinal); // they ran
+        Assert.Equal(["before"], broken.Scripts.Logs.Select(l => l.Text));
+        Assert.Equal([("ran", true)], broken.Scripts.Tests.Select(t => (t.Name, t.Passed)));
+        Assert.Equal("yes", runner.Session.For(collection)["kept"]);
     }
 
     [Fact]
@@ -316,6 +575,7 @@ public class JavaScriptScriptingTests
         var refused = await runner.SendAsync(collection, javaScriptOnly, wrong, null, _ct);
         Assert.Null(refused.Response);
         Assert.Equal(0, refused.Scripts!.Ran);
+        Assert.StartsWith("Scripts did not run\n", refused.Scripts.Describe(), StringComparison.Ordinal);
         Assert.Equal(
             "Not sent: This request runs its scripts in Python (its Scripts tab), but there is no Python version of the post-response script of request " +
             "'Users/JavaScript only'. Write it in Python, choose another language, or turn post-response scripts off in its Scripts tab.",
@@ -349,10 +609,22 @@ public class JavaScriptScriptingTests
             child.spawnSync(require('process').execPath, ['-e', "console.log('stray output')"], { stdio: 'inherit' });
             console.log('captured');
             pm.test('still answers', () => {});
+            const process = require('process');
+            if (process.platform === 'linux') {
+              const stat = require('fs').readFileSync('/proc/self/stat', 'utf8');
+              pm.globals.set('session', Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[3]) === process.pid ? 'its own' : "TermRest's");
+            }
             """), _ct);
         Assert.True(stray.Scripts!.Succeeded, stray.Scripts.Describe());
         Assert.Equal(["captured"], stray.Scripts.Logs.Select(l => l.Text));
         Assert.True(runner.ScriptsRunning);
+
+        // Nor can it open TermRest's terminal (/dev/tty) on Linux, where setsid starts the runtime in a session of its own,
+        // which has none; setsid then became the runtime, which still runs (it did not fork it off).
+        if (OperatingSystem.IsLinux() && ScriptRuntimeLocator.Executable("setsid") is not null)
+        {
+            Assert.Equal("its own", runner.Session.Globals.GetValueOrDefault("session"));
+        }
 
         var idle = Stopwatch.StartNew();
         while (runner.ScriptsRunning && idle.Elapsed < TimeSpan.FromSeconds(20))
@@ -363,6 +635,31 @@ public class JavaScriptScriptingTests
         Assert.False(runner.ScriptsRunning);
         var again = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), test: "pm.test('ok', () => {});"), _ct);
         Assert.True(again.Scripts!.Succeeded, again.Scripts.Describe());
+    }
+
+    [Fact]
+    public async Task Halves_of_emoji_do_not_break_the_answer()
+    {
+        var node = TestJavaScript.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetJavaScriptRuntime(node);
+
+        // A line cut at 4,000 characters, and a script's own substring of an emoji (not text: it becomes U+FFFD).
+        var exchange = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), test: """
+            console.log('a' + '😀'.repeat(2000));
+            const half = '😀'.substring(0, 1);
+            console.log('half ' + half + ' and a whole 😀');
+            pm.test('test ' + half, () => {});
+            pm.globals.set('name ' + half, half);
+            """), _ct);
+
+        Assert.Equal(200, exchange.Response!.StatusCode);
+        Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
+        Assert.Equal(["a" + string.Concat(Enumerable.Repeat("😀", 1999)), "half \uFFFD and a whole 😀"], exchange.Scripts.Logs.Select(l => l.Text));
+        Assert.Equal(["test \uFFFD"], exchange.Scripts.Tests.Select(t => t.Name));
+        Assert.Equal("\uFFFD", runner.Session.Globals["name \uFFFD"]);
     }
 
     [Fact]
@@ -398,21 +695,42 @@ public class JavaScriptScriptingTests
     }
 
     [Fact]
+    public async Task What_required_modules_log_goes_to_the_scripts_output()
+    {
+        var node = TestJavaScript.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        await File.WriteAllTextAsync(Path.Combine(workspace.RootPath, "helpers.js"),
+            "module.exports.hi = () => { console.log('from helper module'); console.error('and its error'); };", _ct);
+        using var runner = new RequestRunner(workspace);
+        runner.SetJavaScriptRuntime(node);
+
+        // Modules run outside the scripts' context, with the runtime's own console.
+        var exchange = await runner.SendAsync(collection, null, JavaScript(server.Url("echo"), preRequest: "require('./helpers').hi();\nconsole.log('from script');"), _ct);
+
+        Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
+        Assert.Equal(["from helper module", "error: and its error", "from script"], exchange.Scripts.Logs.Select(l => l.Text));
+    }
+
+    [Fact]
     public async Task The_runtime_check_names_the_runtime_and_its_version()
     {
         var node = TestJavaScript.Require();
         var directory = TestFiles.NewTempDirectory();
 
-        var (ok, message) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.JavaScript, node, directory, _ct);
+        var (ok, message) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.JavaScript, node, _ct);
         Assert.True(ok, message);
         Assert.Matches(@"^(Node\.js|Bun) \d+\.\d+\.\d+ · .+", message);
 
-        var (missingOk, missingMessage) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.JavaScript, "termrest-no-such-runtime", directory, _ct);
+        var (missingOk, missingMessage) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.JavaScript, "termrest-no-such-runtime", _ct);
         Assert.False(missingOk);
         Assert.StartsWith("termrest-no-such-runtime could not be started", missingMessage, StringComparison.Ordinal);
 
         var found = await ScriptRuntimeLocator.FindAsync(ScriptLanguage.JavaScript, directory, runtime => runtime, _ct);
-        Assert.NotNull(found);
-        Assert.Contains(found.Value.Runtime, (string[])["node", "bun"]);
+        if (found is not null || node is "node" or "bun") // TERMREST_TEST_JAVASCRIPT may name one that is not on PATH
+        {
+            Assert.NotNull(found);
+            Assert.Contains(found.Value.Runtime, (string[])["node", "bun"]);
+        }
     }
 }

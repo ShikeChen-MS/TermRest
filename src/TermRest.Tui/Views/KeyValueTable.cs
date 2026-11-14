@@ -25,6 +25,8 @@ internal sealed class KeyValueTable : View
 {
     private readonly KeyValueKind _kind;
     private readonly TableView _table;
+    private readonly EntryRows _rows;
+    private readonly CheckBoxTableSourceWrapperByObject<KeyValueEntry> _checkBoxes;
     private readonly Button _add;
     private readonly Button _remove;
     private List<KeyValueEntry> _entries = [];
@@ -48,8 +50,23 @@ internal sealed class KeyValueTable : View
         _table.Style.ExpandLastColumn = true;
         _table.Style.ShowHorizontalBottomLine = true;
         _table.Style.AlwaysShowHeaders = true;
-        _table.Accepted += (_, _) => EditSelected();
+        // Enter or a double-click edits the row, handled here: a dialog holding the table (Manage environments) stays open.
+        _table.Accepting += (_, e) =>
+        {
+            e.Handled = true;
+            EditSelected();
+        };
         _table.KeyDown += OnTableKeyDown;
+        _table.MouseEvent += OnTableMouseEvent;
+
+        // TableView's Ctrl+N (down) would hide the window's New request; Ctrl+P (up) goes with it.
+        _table.KeyBindings.Remove(Key.N.WithCtrl);
+        _table.KeyBindings.Remove(Key.P.WithCtrl);
+
+        // The checkbox column handles the table's Space key for as long as the table lives (Terminal.Gui never unsubscribes
+        // it), so there is one, over rows that follow the entries. Clicks on it are handled here (OnTableMouseEvent).
+        _rows = new EntryRows(this);
+        _checkBoxes = new CheckBoxTableSourceWrapperByObject<KeyValueEntry>(_table, _rows, e => e.Enabled, SetEnabled);
 
         _add = new Button { Text = "+ Add", X = 0, Y = Pos.AnchorEnd(1), NoDecorations = true, ShadowStyle = null };
         _add.Accepted += (_, _) => AddEntry();
@@ -101,15 +118,8 @@ internal sealed class KeyValueTable : View
             columns["Description"] = e => e.Description ?? "";
         }
 
-        var source = new EnumerableTableSource<KeyValueEntry>(_entries, columns);
-        _table.Table = new CheckBoxTableSourceWrapperByObject<KeyValueEntry>(_table, source, e => e.Enabled, (e, enabled) =>
-        {
-            if (e.Enabled != enabled)
-            {
-                e.Enabled = enabled;
-                RaiseChanged();
-            }
-        });
+        _rows.SetColumns(columns);
+        _table.Table = _checkBoxes;
         _table.Update();
     }
 
@@ -135,15 +145,66 @@ internal sealed class KeyValueTable : View
 
     private void OnTableKeyDown(object? sender, Key key)
     {
+        // Path variables follow the URL's :name segments: rows are neither added nor removed here.
+        if (_kind == KeyValueKind.PathVariables)
+        {
+            return;
+        }
+
         if (key == Key.Delete || key == Key.DeleteChar)
         {
-            RemoveSelected();
-            key.Handled = true;
+            key.Handled = RemoveSelected();
         }
-        else if (key == Key.InsertChar || key == Key.N.WithCtrl)
+        else if (key == Key.InsertChar)
         {
             AddEntry();
             key.Handled = true;
+        }
+    }
+
+    /// <summary>
+    /// Each click on a checkbox turns its row on or off (in the header, all rows) and moves the cursor to the row.
+    /// Terminal.Gui reports a second quick click only as a double click, which the table would take as Edit, and the
+    /// checkbox column alone would leave the cursor where it was.
+    /// </summary>
+    private void OnTableMouseEvent(object? sender, Mouse mouse)
+    {
+        if (mouse.Flags is not (MouseFlags.LeftButtonClicked or MouseFlags.LeftButtonDoubleClicked or MouseFlags.LeftButtonTripleClicked)
+            || mouse.Position is not { } position)
+        {
+            return;
+        }
+
+        var cell = _table.ScreenToCell(position.X, position.Y, out var header);
+        if (header == 0)
+        {
+            var enabled = !_entries.All(e => e.Enabled);
+            foreach (var entry in _entries)
+            {
+                SetEnabled(entry, enabled);
+            }
+        }
+        else if (cell is { X: 0, Y: var row })
+        {
+            SetEnabled(_entries[row], !_entries[row].Enabled);
+            _table.SetSelection(0, row, false);
+            _table.Update();
+        }
+        else
+        {
+            return;
+        }
+
+        _table.SetNeedsDraw();
+        mouse.Handled = true;
+    }
+
+    private void SetEnabled(KeyValueEntry entry, bool enabled)
+    {
+        if (entry.Enabled != enabled)
+        {
+            entry.Enabled = enabled;
+            RaiseChanged();
         }
     }
 
@@ -186,11 +247,12 @@ internal sealed class KeyValueTable : View
         RaiseChanged();
     }
 
-    private void RemoveSelected()
+    /// <summary>Removes the selected row; false when there is none (or rows cannot be removed).</summary>
+    private bool RemoveSelected()
     {
         if (_kind == KeyValueKind.PathVariables || Selected is not { } entry)
         {
-            return;
+            return false;
         }
 
         var index = _entries.IndexOf(entry);
@@ -202,6 +264,7 @@ internal sealed class KeyValueTable : View
         }
 
         RaiseChanged();
+        return true;
     }
 
     private void BulkEdit()
@@ -212,7 +275,7 @@ internal sealed class KeyValueTable : View
         }
 
         var edited = BulkEditDialog.Show(App, Noun, _entries);
-        if (edited is null)
+        if (edited is null || KeyValueEntry.ListEquals(_entries, edited))
         {
             return;
         }
@@ -240,4 +303,31 @@ internal sealed class KeyValueTable : View
         KeyValueKind.Variables => "default",
         _ => null,
     };
+
+    /// <summary>
+    /// The table's rows: the current entries, read when they are needed (Terminal.Gui's
+    /// <see cref="EnumerableTableSource{T}"/> copies them).
+    /// </summary>
+    private sealed class EntryRows(KeyValueTable owner) : IEnumerableTableSource<KeyValueEntry>
+    {
+        private Dictionary<string, Func<KeyValueEntry, object>> _columns = [];
+
+        public string[] ColumnNames { get; private set; } = [];
+
+        public int Columns => ColumnNames.Length;
+
+        public int Rows => owner._entries.Count;
+
+        public object this[int row, int col] => _columns[ColumnNames[col]](owner._entries[row]);
+
+        public void SetColumns(Dictionary<string, Func<KeyValueEntry, object>> columns)
+        {
+            _columns = columns;
+            ColumnNames = [.. columns.Keys];
+        }
+
+        public IEnumerable<KeyValueEntry> GetAllObjects() => owner._entries;
+
+        public KeyValueEntry GetObjectOnRow(int row) => owner._entries[row];
+    }
 }

@@ -34,6 +34,8 @@ internal sealed class CSharpLexer : SyntaxLexer
             _ => 0,
         };
         var name = SyntaxKind.Plain; // the next name: a type after class, new, record …
+        var noQuoteBefore = 0; // the $ and @ before this index lead to no string: their run was looked at already
+        var charBudget = (4 * line.Length) + 256; // characters 'c' literals may scan: unclosed ones scan to the line end
         while (i < line.Length)
         {
             var c = line[i];
@@ -51,7 +53,7 @@ internal sealed class CSharpLexer : SyntaxLexer
                 continue;
             }
 
-            if (QuoteOfString(line, i) is var quote and >= 0)
+            if (i >= noQuoteBefore && QuoteOfString(line, i, out noQuoteBefore) is var quote and >= 0)
             {
                 i = OpenString(line, kinds, i, quote, ref state);
                 name = SyntaxKind.Plain;
@@ -60,7 +62,7 @@ internal sealed class CSharpLexer : SyntaxLexer
 
             if (c == '\'')
             {
-                var end = CharEnd(line, i);
+                var end = CharEnd(line, i, ref charBudget);
                 kinds[i..end].Fill(SyntaxKind.String);
                 i = end;
                 continue;
@@ -103,8 +105,11 @@ internal sealed class CSharpLexer : SyntaxLexer
         return state;
     }
 
-    /// <summary>Where the quotes are if a string starts at <paramref name="i"/> ("…", @"…", $"…", $@"…", """…""", $$"""…"""), else -1.</summary>
-    private static int QuoteOfString(ReadOnlySpan<char> line, int i)
+    /// <summary>
+    /// Where the quotes are if a string starts at <paramref name="i"/> ("…", @"…", $"…", $@"…", """…""", $$"""…"""), else
+    /// -1; <paramref name="runEnd"/> is where its $ and @ end.
+    /// </summary>
+    private static int QuoteOfString(ReadOnlySpan<char> line, int i, out int runEnd)
     {
         var j = i;
         while (j < line.Length && line[j] is '$' or '@')
@@ -112,6 +117,7 @@ internal sealed class CSharpLexer : SyntaxLexer
             j++;
         }
 
+        runEnd = j;
         return At(line, j) == '"' ? j : -1;
     }
 
@@ -212,10 +218,13 @@ internal sealed class CSharpLexer : SyntaxLexer
         return i;
     }
 
-    /// <summary>The end of the character at <paramref name="i"/> ('a', '\n', '\''); just its quote if it does not close.</summary>
-    private static int CharEnd(ReadOnlySpan<char> line, int i)
+    /// <summary>
+    /// The end of the character at <paramref name="i"/> ('a', '\n', '\''); just its quote if it does not close, or if
+    /// <paramref name="budget"/> (characters left to scan on this line) runs out.
+    /// </summary>
+    private static int CharEnd(ReadOnlySpan<char> line, int i, ref int budget)
     {
-        for (var j = i + 1; j < line.Length; j++)
+        for (var j = i + 1; j < line.Length && budget-- > 0; j++)
         {
             if (line[j] == '\\')
             {

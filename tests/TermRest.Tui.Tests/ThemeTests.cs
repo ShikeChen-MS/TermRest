@@ -117,9 +117,109 @@ public sealed class ThemeTests : IDisposable
         Assert.Equal("Dark", copy.TerminalGuiTheme);
         Assert.Equal(Path.Combine(directory, "My Dark-2.json"), ThemeCatalog.WriteCopy(BuiltIn("Dark"), "My Dark", directory));
 
+        // Named for every OS (a workspace's themes are shared through Git): no | or ?, and no two names differing in case.
+        Assert.Equal(Path.Combine(directory, "my dark-3.json"), ThemeCatalog.WriteCopy(BuiltIn("Dark"), "my dark", directory));
+        Assert.Equal(Path.Combine(directory, "Dark - contrast-.json"), ThemeCatalog.WriteCopy(BuiltIn("Dark"), "Dark | contrast?", directory));
+
         File.WriteAllText(path, System.Text.RegularExpressions.Regex.Replace(File.ReadAllText(path), "\"selection\": \"[^\"]*\"", "\"selection\": \"#004080\""));
         var edited = ThemeCatalog.Find(ThemeCatalog.Load(null, errors, _userDirectory), "My Dark")!;
         Assert.Equal(Color.Parse("#004080"), edited.Schemes["Base"].Focus.Background);
+
+        // A copy of a built-in theme starts from it and lists its palette colors by name or #RRGGBB, and nothing else.
+        Assert.All(ThemeCatalog.BuiltIn, theme =>
+        {
+            var file = ThemeFile.CopyOf(theme, "Copy");
+            Assert.Equal((theme.Name, false), (file.Base, file.Schemes is not null));
+            Assert.Equal(ThemePalette.Keys.Select(k => k.Get(theme.Palette).ToString()), file.Palette!.Values);
+        });
+    }
+
+    [Fact]
+    public void A_copy_of_a_custom_theme_looks_the_same_without_the_theme_files_it_builds_on()
+    {
+        // A production theme like the README's, shared in a workspace's .termrest/themes; a theme built on it, which keeps its
+        // scheme roles; and one built on a Terminal.Gui theme.
+        var workspace = TestFiles.NewTempDirectory();
+        var shared = ThemeCatalog.WorkspaceThemesDirectory(workspace);
+        Directory.CreateDirectory(shared);
+        File.WriteAllText(Path.Combine(shared, "Production.json"), """
+            {
+              "name": "Production",
+              "base": "Nord",
+              "palette": { "bar": "#5c0000", "barText": "White", "selection": "DarkRed" },
+              "schemes": { "Base": { "Focus": "white on #8b0000 bold" }, "Success": { "Normal": "on #102030" } }
+            }
+            """);
+        File.WriteAllText(Path.Combine(shared, "Staging.json"), """
+            { "name": "Staging", "base": "Production", "palette": { "get": "Lime" }, "schemes": { "Menu": { "HotNormal": "None on none none" } } }
+            """);
+        File.WriteAllText(Path.Combine(shared, "Night.json"), """
+            { "name": "Night", "base": "Dark", "schemes": { "Dialog": { "Normal": "Yellow on #102030 italic" }, "Warning": { "Disabled": "Orange" } } }
+            """);
+        var errors = new List<string>();
+        var themes = ThemeCatalog.Load(workspace, errors, _userDirectory);
+        var elsewhere = TestFiles.NewTempDirectory(); // the configuration folder of someone without that workspace
+        string[] names = ["Production", "Staging", "Night"];
+        var paths = names.Select(n => ThemeCatalog.WriteCopy(ThemeCatalog.Find(themes, n)!, $"My {n}", UserSettings.ThemesDirectory(elsewhere))).ToList();
+
+        var copies = ThemeCatalog.Load(TestFiles.NewTempDirectory(), errors, elsewhere);
+
+        Assert.Empty(errors);
+        foreach (var name in names)
+        {
+            var (source, copy) = (ThemeCatalog.Find(themes, name)!, ThemeCatalog.Find(copies, $"My {name}")!);
+            Assert.Equal((source.Palette, source.TerminalGuiTheme), (copy.Palette, copy.TerminalGuiTheme));
+            Assert.Equal(source.Schemes.Keys.Order(), copy.Schemes.Keys.Order());
+            Assert.All(source.Schemes, s => Assert.Equal(s.Value, copy.Schemes[s.Key]));
+        }
+
+        // The roles the theme sets stay as they are; the others still follow its palette.
+        File.WriteAllText(paths[0], System.Text.RegularExpressions.Regex.Replace(File.ReadAllText(paths[0]), "\"selection\": \"[^\"]*\"", "\"selection\": \"#004080\""));
+        var edited = ThemeCatalog.Find(ThemeCatalog.Load(null, errors, elsewhere), "My Production")!;
+        Assert.Empty(errors);
+        Assert.Equal(A("White", "#8b0000", TextStyle.Bold), edited.Schemes["Base"].Focus);
+        Assert.Equal(Color.Parse("#004080"), edited.Schemes["Menu"].Focus.Background);
+    }
+
+    [Fact]
+    public void Roles_a_theme_sets_stay_as_set_whatever_their_order_in_the_file()
+    {
+        // Terminal.Gui derives the roles a scheme doesn't set from others: Focus from Normal, Highlight and ReadOnly from Editable.
+        var workspace = TestFiles.NewTempDirectory();
+        var shared = ThemeCatalog.WorkspaceThemesDirectory(workspace);
+        Directory.CreateDirectory(shared);
+        File.WriteAllText(Path.Combine(shared, "Order.json"), """
+            { "name": "Order", "schemes": { "Base": { "Highlight": "Red on Blue none", "ReadOnly": "Yellow on Blue none", "Focus": "Black on White none", "Editable": "White on Black none", "Normal": "Gray on Black none" } } }
+            """);
+        var errors = new List<string>();
+
+        var scheme = ThemeCatalog.Find(ThemeCatalog.Load(workspace, errors, _userDirectory), "Order")!.Schemes["Base"];
+
+        Assert.Empty(errors);
+        Assert.Equal(
+            (A("Red", "Blue", TextStyle.None), A("Yellow", "Blue", TextStyle.None), A("Black", "White", TextStyle.None), A("White", "Black", TextStyle.None), A("Gray", "Black", TextStyle.None)),
+            (scheme.Highlight, scheme.ReadOnly, scheme.Focus, scheme.Editable, scheme.Normal));
+    }
+
+    [Fact]
+    public void A_theme_keeps_the_status_roles_its_base_sets_until_it_changes_that_status_color()
+    {
+        var workspace = TestFiles.NewTempDirectory();
+        var shared = ThemeCatalog.WorkspaceThemesDirectory(workspace);
+        Directory.CreateDirectory(shared);
+        File.WriteAllText(Path.Combine(shared, "Production.json"), """
+            { "name": "Production", "base": "Nord", "schemes": { "Success": { "Normal": "Lime on #102030 bold" }, "Warning": { "Normal": "Gold on #102030 bold" } } }
+            """);
+        File.WriteAllText(Path.Combine(shared, "Staging.json"), """{ "name": "Staging", "base": "Production", "palette": { "warning": "#ffa500" } }""");
+        var errors = new List<string>();
+
+        var themes = ThemeCatalog.Load(workspace, errors, _userDirectory);
+
+        Assert.Empty(errors);
+        var (production, staging) = (ThemeCatalog.Find(themes, "Production")!, ThemeCatalog.Find(themes, "Staging")!);
+        Assert.Equal(A("Lime", "#102030", TextStyle.Bold), staging.Schemes[ThemeCatalog.SuccessScheme].Normal);
+        Assert.Equal(production.Schemes[ThemeCatalog.SuccessScheme], staging.Schemes[ThemeCatalog.SuccessScheme]);
+        Assert.Equal(new Attribute(Color.Parse("#ffa500"), staging.Palette.Background, TextStyle.Bold), staging.Schemes[ThemeCatalog.WarningScheme].Normal);
     }
 
     [Fact]
@@ -181,6 +281,29 @@ public sealed class ThemeTests : IDisposable
     }
 
     [Fact]
+    public void Out_of_range_colors_and_nulls_in_theme_files_are_reported_too()
+    {
+        WriteTheme("odd.json", """
+            {
+              "name": "Odd",
+              "palette": { "bar": "rgb(256,0,0)", "accent": "Yellow" },
+              "schemes": { "Menu": null, "Base": { "Focus": null, "Normal": "White on rgb(0,0,999)", "HotFocus": "White on Blue" } }
+            }
+            """);
+        var errors = new List<string>();
+
+        var odd = ThemeCatalog.Find(ThemeCatalog.Load(null, errors, _userDirectory), "Odd")!;
+
+        Assert.Equal(4, errors.Count);
+        Assert.StartsWith("odd.json: palette color bar: 'rgb(256,0,0)' is not a color", errors[0], StringComparison.Ordinal);
+        Assert.StartsWith("odd.json: Menu: no roles given", errors[1], StringComparison.Ordinal);
+        Assert.StartsWith("odd.json: Base.Focus: empty", errors[2], StringComparison.Ordinal);
+        Assert.Equal("odd.json: Base.Normal: 'rgb(0,0,999)' is not a color", errors[3]);
+        Assert.Equal(Color.Parse("Yellow"), odd.Palette.Accent);
+        Assert.Equal((Color.Parse("White"), Color.Parse("Blue")), (odd.Schemes["Base"].HotFocus.Foreground, odd.Schemes["Base"].HotFocus.Background));
+    }
+
+    [Fact]
     public void Custom_themes_can_build_on_each_other_and_replace_built_in_ones()
     {
         WriteTheme("a-child.json", """{ "name": "Child", "base": "Parent", "palette": { "accent": "Orange" } }""");
@@ -198,6 +321,40 @@ public sealed class ThemeTests : IDisposable
         Assert.Equal(Color.Parse("Cyan"), dark.Palette.Get);
         Assert.Equal(BuiltIn("Dark").Schemes["Base"], dark.Schemes["Base"]);
         Assert.Single(themes, t => t.Name == "Dark");
+    }
+
+    [Fact(Timeout = 10_000)]
+    public async Task Several_theme_files_can_replace_the_theme_they_start_from()
+    {
+        // As after copying Default as a custom theme named Default twice, and once more into the workspace.
+        WriteTheme("Default.json", """{ "name": "Default", "base": "Default", "palette": { "accent": "Orange" } }""");
+        WriteTheme("Default-2.json", """{ "name": "Default", "base": "Default", "palette": { "bar": "#5c0000" } }""");
+        var workspaceRoot = TestFiles.NewTempDirectory();
+        Directory.CreateDirectory(ThemeCatalog.WorkspaceThemesDirectory(workspaceRoot));
+        var workspaceTheme = Path.Combine(ThemeCatalog.WorkspaceThemesDirectory(workspaceRoot), "Default.json");
+        File.WriteAllText(workspaceTheme, """{ "name": "Default", "base": "Default", "palette": { "get": "Cyan" } }""");
+        var errors = new List<string>();
+
+        var themes = await Task.Run(() => ThemeCatalog.Load(workspaceRoot, errors, _userDirectory), TestContext.Current.CancellationToken);
+
+        Assert.Empty(errors);
+        var theme = Assert.Single(themes, t => t.Name == ThemeCatalog.DefaultName);
+        Assert.Equal(workspaceTheme, theme.FilePath);
+        Assert.Equal((Color.Parse("Orange"), Color.Parse("#5c0000"), Color.Parse("Cyan")), (theme.Palette.Accent, theme.Palette.Bar, theme.Palette.Get)); // each starts from the one before
+    }
+
+    [Fact(Timeout = 10_000)]
+    public async Task A_missing_base_is_reported_for_its_file_and_themes_based_on_that_theme_still_build_on_it()
+    {
+        WriteTheme("a-child.json", """{ "name": "Child", "base": "Default", "palette": { "accent": "Orange" } }""");
+        WriteTheme("default.json", """{ "name": "Default", "base": "Defualt", "palette": { "background": "#101010" } }""");
+        var errors = new List<string>();
+
+        var themes = await Task.Run(() => ThemeCatalog.Load(null, errors, _userDirectory), TestContext.Current.CancellationToken);
+
+        Assert.Equal(["default.json: base theme 'Defualt' was not found; using Default"], errors);
+        var child = ThemeCatalog.Find(themes, "Child")!;
+        Assert.Equal((Color.Parse("#101010"), Color.Parse("Orange")), (child.Palette.Background, child.Palette.Accent));
     }
 
     [Fact]
@@ -246,6 +403,21 @@ public sealed class ThemeTests : IDisposable
         Assert.Null(UserSettings.Load(_userDirectory).Theme);
     }
 
+    [Fact]
+    public void User_settings_that_cannot_be_read_are_reported_and_not_saved_over()
+    {
+        var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        Directory.CreateDirectory(_userDirectory);
+        var path = Path.Combine(_userDirectory, "settings.json");
+        File.WriteAllText(path, "{ \"theme\": ");
+
+        TuiApp.ApplyTheme(workspace, userDirectory: _userDirectory);
+
+        Assert.Contains(workspace.LoadErrors, e => e.StartsWith(path, StringComparison.Ordinal));
+        Assert.Throws<IOException>(() => Dialogs.ThemeDialog.Save(workspace, BuiltIn("Nord"), workspaceOnly: false, _userDirectory));
+        Assert.Equal("{ \"theme\": ", File.ReadAllText(path));
+    }
+
     [Theory]
     [InlineData("white on blue", "White", "Blue", TextStyle.Italic)]
     [InlineData("#112233 on rgb(1,2,3) bold underline", "#112233", "#010203", TextStyle.Bold | TextStyle.Underline)]
@@ -261,6 +433,20 @@ public sealed class ThemeTests : IDisposable
 
         Assert.True(ThemeFile.TryParseAttribute(text, fallback, out var attribute, out var problem), problem);
         Assert.Equal(A(foreground, background, style), attribute);
+    }
+
+    [Theory]
+    [InlineData("White", "DarkRed", TextStyle.Bold)]
+    [InlineData("None", "None", TextStyle.None)]
+    [InlineData("#123456", "None", TextStyle.Italic | TextStyle.Underline | TextStyle.Strikethrough)]
+    [InlineData("#80FF0000", "#00000000", TextStyle.Faint)] // partly transparent
+    public void Attributes_are_written_so_that_they_read_back_the_same(string foreground, string background, TextStyle style)
+    {
+        var written = A(foreground, background, style);
+        var fallback = A("Gray", "Black", TextStyle.Blink | TextStyle.Reverse);
+
+        Assert.True(ThemeFile.TryParseAttribute(ThemeFile.FormatAttribute(written), fallback, out var attribute, out var problem), problem);
+        Assert.Equal(written, attribute);
     }
 
     public void Dispose() => ThemeCatalog.Apply(BuiltIn(ThemeCatalog.DefaultName));

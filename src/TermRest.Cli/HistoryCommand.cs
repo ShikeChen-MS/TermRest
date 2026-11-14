@@ -30,7 +30,7 @@ internal static class HistoryCommand
             ApiWorkspace opened;
             try
             {
-                opened = ApiWorkspace.Open(path);
+                opened = ApiWorkspace.Open(path, CollectionLoading.None);
             }
             catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
             {
@@ -41,12 +41,39 @@ internal static class HistoryCommand
             var store = HistoryStore.ForWorkspace(opened.RootPath, opened.Settings.HistoryLimit);
             if (parseResult.GetValue(clear))
             {
-                store.Clear();
+                Exception? bodiesLeft;
+                try
+                {
+                    bodiesLeft = store.Clear();
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Another program has the history file open (an antivirus scan, Get-Content -Wait): nothing was deleted.
+                    Output.Error($"The history could not be cleared ({store.Folder}): {ex.Message}");
+                    return 1;
+                }
+
+                if (bodiesLeft is not null)
+                {
+                    Output.Error($"History cleared, but some response bodies could not be deleted ({store.BodiesFolder}): {bodiesLeft.Message}");
+                    return 1;
+                }
+
                 Output.Info($"History cleared ({store.Folder}).");
                 return 0;
             }
 
-            var entries = store.Load();
+            List<HistoryEntry> entries;
+            try
+            {
+                entries = store.Load();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Output.Error($"The history could not be read ({store.Folder}): {ex.Message}");
+                return 1;
+            }
+
             if (parseResult.GetValue(show) is { } id)
             {
                 var matches = entries.Where(e => e.Id.StartsWith(id, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -56,7 +83,16 @@ internal static class HistoryCommand
                     return 2;
                 }
 
-                Show(matches[0], store, parseResult.GetValue(json));
+                try
+                {
+                    Show(matches[0], store, parseResult.GetValue(json));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    Output.Error($"The response body of {ShortId(matches[0].Id)} could not be read ({store.BodiesFolder}): {ex.Message}");
+                    return 1;
+                }
+
                 return 0;
             }
 
@@ -83,7 +119,7 @@ internal static class HistoryCommand
             {
                 var status = entry.Status?.ToString(CultureInfo.InvariantCulture) ?? "ERR";
                 var where = entry.RequestPath is null ? "" : $"  ({entry.Collection} / {entry.RequestPath})";
-                Console.Out.WriteLine($"{entry.Id[..8]}  {entry.Time.ToLocalTime():yyyy-MM-dd HH:mm:ss}  {status,-4} {HttpExchange.Format(entry.Timing.Total),9}  {entry.Method,-7} {entry.Url}{where}");
+                Console.Out.WriteLine($"{ShortId(entry.Id),-8}  {entry.Time.ToLocalTime():yyyy-MM-dd HH:mm:ss}  {status,-4} {HttpExchange.Format(entry.Timing.Total),9}  {entry.Method,-7} {entry.Url}{where}");
             }
 
             if (entries.Count > listed.Count)
@@ -95,6 +131,9 @@ internal static class HistoryCommand
         });
         return command;
     }
+
+    /// <summary>An entry's id as listed: its first 8 characters (an id edited by hand may have fewer).</summary>
+    private static string ShortId(string id) => id.Length > 8 ? id[..8] : id;
 
     private static void Show(HistoryEntry entry, HistoryStore store, bool json)
     {
@@ -127,8 +166,10 @@ internal static class HistoryCommand
         }
 
         Console.Out.WriteLine();
-        Console.Out.WriteLine(entry.BodySaved
-            ? BodyFormatter.Format(response.Body, response.ContentType) + (entry.BodyTruncated ? "\n… (truncated)" : "")
-            : "(response body not kept)");
+
+        // As the UI says it: the history has no copy of a body that was not empty (it keeps none, or the copy's file is gone).
+        Console.Out.WriteLine(response.Body.Length == 0 && entry.Size > 0
+            ? "(response body not kept)"
+            : BodyFormatter.Format(response.Body, response.ContentType) + (entry.BodyTruncated ? "\n… (truncated)" : ""));
     }
 }

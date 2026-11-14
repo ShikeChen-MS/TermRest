@@ -37,11 +37,17 @@ internal sealed class MainWindow : Runnable
     private readonly Shortcut _environmentShortcut;
     private readonly RecordingIndicator _recordIndicator;
     private readonly Shortcut _message;
+
+    /// <summary>Cancels the requests still on their way when the window closes, those of requests no longer shown too.</summary>
+    private readonly CancellationTokenSource _closing = new();
     private MenuItem? _recordMenuItem;
     private PostmanCollection? _collection;
     private RequestNode? _node;
     private PostmanCollection? _scratch;
     private CancellationTokenSource? _sending;
+
+    /// <summary>Counts the requests shown in the editor, so that a response arriving for an earlier one is not shown under another.</summary>
+    private int _opened;
     private bool _closed;
     private PopoverMenu? _popover;
     private bool _quitConfirmed;
@@ -51,11 +57,20 @@ internal sealed class MainWindow : Runnable
     /// <summary>The history entry shown in the editor (a detached request), if any.</summary>
     private HistoryEntry? _historyEntry;
 
+    /// <summary>
+    /// The request in its collection that the history entry shown was sent from, while it is still there: a request sent
+    /// again from history runs with its folders' scripts and inherits their auth (it is not edited).
+    /// </summary>
+    private RequestNode? _historyOrigin;
+
     /// <summary>Name suggested when a detached request (cURL import, history) is added to a collection.</summary>
     private string? _detachedName;
 
     /// <summary>Where the last recording was saved this session (the next one is suggested there).</summary>
     private string? _recordingFolder;
+
+    /// <summary>The recording error last shown in the status bar: each is shown once (see <see cref="UpdateRecording"/>).</summary>
+    private string? _recordingErrorShown;
 
     /// <summary>What the tree showed for the current collection when <see cref="UpdateTitles"/> last refreshed it.</summary>
     private (object? Item, bool Dirty, string? Name) _treeTitleState;
@@ -86,6 +101,7 @@ internal sealed class MainWindow : Runnable
 
         _requestFrame = new FrameView
         {
+            HotKeySpecifier = Ui.NoHotKey, // its title names the request
             Title = "Request",
             X = Pos.Right(_sidebar),
             Y = Pos.Bottom(_menu),
@@ -101,8 +117,12 @@ internal sealed class MainWindow : Runnable
             // Where a relative body file is looked for when sending: the folder of the collection sending it.
             BaseDirectory = () => (_collection ?? _scratch)?.BaseDirectory ?? Environment.CurrentDirectory,
 
-            // The request's scripts run with those of its collection and folders, in one language.
-            ScriptPlanner = (scripts, settings) => _collection is { } collection ? _runner.PlanScripts(collection, _node, scripts, settings) : null,
+            // Body files from outside the workspace folder are not sent, nor looked at, unless allowed (Tools › Settings).
+            FilesFolder = () => _runner.FilesFolder,
+
+            // The request's scripts run with those of its collection and folders, in one language (a request typed into the
+            // editor a delete emptied is a scratch request, as Send has it).
+            ScriptPlanner = (scripts, settings) => _runner.PlanScripts(_collection ?? (_scratch ??= PostmanCollection.Create("Scratch")), SendContext, scripts, settings),
             DefaultScriptLanguage = _runner.ScriptLanguageOrder[0],
         };
         _requestFrame.Add(_editor);
@@ -118,18 +138,20 @@ internal sealed class MainWindow : Runnable
         _response = new ResponseView();
         _responseFrame.Add(_response);
 
-        _environmentShortcut = new Shortcut { Title = EnvironmentLabel(), Key = Key.F7, BindKeyToApplication = true, Action = ShowEnvironmentMenu };
-        _message = new Shortcut { Title = "", CanFocus = false };
+        // Window shortcuts, not application-wide ones: they must not act behind an open dialog. Names and messages are
+        // shown as written.
+        _environmentShortcut = Ui.AsWritten(new Shortcut { Title = EnvironmentLabel(), Key = Key.F7, Action = ShowEnvironmentMenu });
+        _message = Ui.AsWritten(new Shortcut { Title = "", CanFocus = false });
         var statusBar = new StatusBar(
         [
-            new Shortcut { Title = "Send", Key = Key.F5, BindKeyToApplication = true, Action = Send },
-            new Shortcut { Title = "Save", Key = Key.S.WithCtrl, BindKeyToApplication = true, Action = Save },
-            new Shortcut { Title = "New", Key = Key.N.WithCtrl, BindKeyToApplication = true, Action = NewRequest },
+            new Shortcut { Title = "Send", Key = Key.F5, Action = Send },
+            new Shortcut { Title = "Save", Key = Key.S.WithCtrl, Action = Save },
+            new Shortcut { Title = "New", Key = Key.N.WithCtrl, Action = NewRequest },
             _environmentShortcut,
-            new Shortcut { Title = "Certs", Key = Key.F8, BindKeyToApplication = true, Action = ShowCertificates },
-            new Shortcut { Title = "History", Key = Key.F9, BindKeyToApplication = true, Action = ToggleHistory },
+            new Shortcut { Title = "Certs", Key = Key.F8, Action = ShowCertificates },
+            new Shortcut { Title = "History", Key = Key.F9, Action = ToggleHistory },
             new Shortcut { Title = "Menu", Key = Key.F10 },
-            new Shortcut { Title = "Quit", Key = Key.Q.WithCtrl, BindKeyToApplication = true, Action = Quit },
+            new Shortcut { Title = "Quit", Key = Key.Q.WithCtrl, Action = Quit },
             _message,
         ]);
 
@@ -151,7 +173,12 @@ internal sealed class MainWindow : Runnable
         {
             if (item is RequestNode request)
             {
-                OpenRequest(request);
+                // The request open already only goes to its URL bar: opening it again would clear its response.
+                if (request != _node)
+                {
+                    OpenRequest(request);
+                }
+
                 _editor.FocusUrl();
             }
         };
@@ -188,6 +215,12 @@ internal sealed class MainWindow : Runnable
             Notify($"⚠ {workspace.LoadErrors.Count} problem(s) loading files or the color theme (Help > Workspace info)");
         }
 
+        if (runner.BlockedProxy is not null)
+        {
+            const string notice = "The proxy in this workspace's settings (.termrest/settings.json) is not used until you allow it: Tools > Settings > Save";
+            Notify(_message.Title.Length > 0 ? $"{_message.Title} · {notice}" : $"⚠ {notice}");
+        }
+
         if (RequestRecorder.FindUnsaved().Count is > 0 and var unsaved)
         {
             var notice = $"{unsaved} unsaved recording(s) found: Tools > Recover unsaved recordings";
@@ -195,8 +228,11 @@ internal sealed class MainWindow : Runnable
         }
     }
 
-    /// <summary>Set when the user opens another workspace; the host restarts the UI with it.</summary>
-    public string? NextWorkspacePath { get; private set; }
+    /// <summary>Set when the user opens another workspace (opened already): the host restarts the UI with it.</summary>
+    public ApiWorkspace? NextWorkspace { get; private set; }
+
+    /// <summary>Whether the request shown is on its way (the UI stays quick until its response is shown).</summary>
+    internal bool IsSending => _sending is not null;
 
     // Test hooks (InternalsVisibleTo TermRest.Tui.Tests).
     internal RequestEditor Editor => _editor;
@@ -224,15 +260,17 @@ internal sealed class MainWindow : Runnable
     /// <summary>Selects and opens a request (used by snapshots and tests).</summary>
     internal void ShowRequest(RequestNode node)
     {
-        _tree.Select(node);
-        OpenRequest(node);
+        if (OpenRequest(node))
+        {
+            _tree.Select(node);
+        }
     }
 
     /// <summary>Sends the current request and shows the result without an event loop (used by snapshots).</summary>
     internal async Task SendAndShowAsync(CancellationToken cancellationToken = default)
     {
         var collection = _collection ?? (_scratch ??= PostmanCollection.Create("Scratch"));
-        var exchange = await _runner.SendAsync(collection, _node, _editor.Spec, null, cancellationToken).ConfigureAwait(false);
+        var exchange = await _runner.SendAsync(collection, SendContext, _editor.Spec, null, cancellationToken).ConfigureAwait(false);
         _response.ShowExchange(exchange);
     }
 
@@ -297,16 +335,29 @@ internal sealed class MainWindow : Runnable
 
     // ----- request lifecycle -----------------------------------------------------------------
 
-    private void OpenRequest(RequestNode node)
+    /// <summary>Opens a request in the editor; false when the user keeps the one there (see <see cref="ConfirmDiscardRequest"/>).</summary>
+    private bool OpenRequest(RequestNode node)
     {
+        if (!ConfirmDiscardRequest())
+        {
+            return false;
+        }
+
         CommitEditor();
+        if (node != _node)
+        {
+            DetachSending();
+        }
+
         _collection = node.Collection;
         _node = node;
         _historyEntry = null;
+        _historyOrigin = null;
         _detachedName = null;
         _editor.Load(node.ReadSpec());
         ClearResponse();
         UpdateTitles();
+        return true;
     }
 
     private void StartScratchRequest()
@@ -315,6 +366,7 @@ internal sealed class MainWindow : Runnable
         _collection = _scratch;
         _node = null;
         _historyEntry = null;
+        _historyOrigin = null;
         _detachedName = null;
         _editor.Load(new HttpRequestSpec { Url = "https://postman-echo.com/get?hello=world" });
         ClearResponse();
@@ -339,7 +391,72 @@ internal sealed class MainWindow : Runnable
         UpdateTitles();
     }
 
+    /// <summary>
+    /// Before the request in the editor makes way for another: one that is not in a collection (scratch, imported, from
+    /// history) and was changed would be lost, so the user may add it to a collection first. False when the user cancels.
+    /// </summary>
+    private bool ConfirmDiscardRequest()
+    {
+        if (_node is not null || !_editor.IsModified)
+        {
+            return true;
+        }
+
+        return MessageBox.Query(App!, "Unsaved request", "This request is not in a collection, so your changes to it would be lost.",
+                "Cancel", "Discard", "Add to collection…") switch
+        {
+            2 => AddToCollection(),
+            1 => true,
+            _ => false,
+        };
+    }
+
+    /// <summary>Adds the request in the editor to a collection (asking where and its name), then edits it there; false when cancelled.</summary>
+    private bool AddToCollection()
+    {
+        if (AddRequest() is not { } node)
+        {
+            return false;
+        }
+
+        Adopt(node);
+        return true;
+    }
+
+    /// <summary>
+    /// The request in the editor, now <paramref name="node"/> in a collection, is edited there: it keeps its response, and
+    /// one still on its way is shown under it. What the editor says about its context (inherited auth, scripts) is redone.
+    /// </summary>
+    private void Adopt(RequestNode node)
+    {
+        _collection = node.Collection;
+        _node = node;
+        _historyEntry = null;
+        _historyOrigin = null;
+        _detachedName = null;
+        _editor.RefreshContext();
+        UpdateTitles();
+    }
+
+    /// <summary>
+    /// Sends the request shown, or cancels the one on its way. No exception may leave this async void method: .NET would
+    /// post it to the UI's synchronization context, which throws it back at once, then throw it on the thread pool, ending
+    /// TermRest (and losing unsaved changes). It goes where the main loop's unexpected errors go instead: shown and logged.
+    /// </summary>
     private async void Send()
+    {
+        try
+        {
+            await SendAsync();
+        }
+        catch (Exception ex)
+        {
+            // Once the window no longer runs (quit, another workspace), there is nothing to show it in.
+            TuiApp.ReportUnexpectedError(IsRunning ? App : null, ex);
+        }
+    }
+
+    private async Task SendAsync()
     {
         if (_sending is not null)
         {
@@ -354,13 +471,22 @@ internal sealed class MainWindow : Runnable
             return;
         }
 
+        // Sending *** for a password could count as a failed sign-in (and lock the account): Cancel is the default.
+        if (HasMaskedCredentials
+            && MessageBox.Query(App!, "Masked credentials", "This request has *** for credentials the history masked. Enter them again before sending it.",
+                "Send ***", "Cancel") != 0)
+        {
+            return;
+        }
+
         var collection = _collection ?? (_scratch ??= PostmanCollection.Create("Scratch"));
         var previous = _response.Exchange;
+        var opened = _opened;
         PreparedRequest? prepared = null;
         _response.ShowRunningScripts(); // replaced at once when there are no pre-request scripts
         SetResponseTitle(null);
         _editor.SetSending(true);
-        using var cancellation = new CancellationTokenSource();
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_closing.Token);
         _sending = cancellation;
         var recorder = _runner.Recorder;
         var recordedBefore = recorder?.Count ?? 0;
@@ -368,10 +494,13 @@ internal sealed class MainWindow : Runnable
         try
         {
             // Scripts run first; the request is shown as soon as it is ready to go.
-            exchange = await _runner.SendAsync(collection, _node, _editor.Spec, ready =>
+            exchange = await _runner.SendAsync(collection, SendContext, _editor.Spec, ready =>
             {
                 prepared = ready;
-                _response.ShowSending(ready);
+                if (opened == _opened)
+                {
+                    _response.ShowSending(ready);
+                }
             }, cancellation.Token);
         }
         catch (Exception ex)
@@ -379,9 +508,19 @@ internal sealed class MainWindow : Runnable
             if (prepared is null)
             {
                 // It could not even be prepared (a certificate that does not load…): nothing was sent.
-                _sending = null;
+                if (_sending == cancellation)
+                {
+                    _sending = null;
+                }
+
                 if (_closed)
                 {
+                    return;
+                }
+
+                if (opened != _opened)
+                {
+                    Notify($"⚠ Earlier request not sent: {ex.Message}");
                     return;
                 }
 
@@ -403,7 +542,10 @@ internal sealed class MainWindow : Runnable
         }
         finally
         {
-            _sending = null;
+            if (_sending == cancellation)
+            {
+                _sending = null;
+            }
         }
 
         // The window may have been closed (quit, workspace switch) while the request was in flight.
@@ -412,11 +554,26 @@ internal sealed class MainWindow : Runnable
             return;
         }
 
-        _editor.SetSending(false);
-        _response.ShowExchange(exchange);
+        // Another request may have been opened meanwhile: the response is not shown under it (the history has it).
+        var shown = opened == _opened;
+        if (shown)
+        {
+            _editor.SetSending(false);
+            _response.ShowExchange(exchange);
+        }
+
         var recordedAs = recorder is not null && ReferenceEquals(recorder, _runner.Recorder) && recorder.Count > recordedBefore ? recorder.Count : (int?)null;
-        SetResponseTitle(recordedAs);
+        if (shown)
+        {
+            SetResponseTitle(recordedAs);
+        }
+
         var result = exchange.Response is null ? "" : $"{exchange.Request.Method} {exchange.Request.Uri?.Host} → {exchange.Response.StatusCode}";
+        if (!shown)
+        {
+            result = $"Earlier request: {(result.Length > 0 ? result : exchange.ErrorMessage)}";
+        }
+
         if (recordedAs is not null && exchange.Request.Body.HasFiles)
         {
             result += (result.Length == 0 ? "" : " · ") + "● recorded with the file's path, not its content";
@@ -434,34 +591,12 @@ internal sealed class MainWindow : Runnable
     private void Save()
     {
         CommitEditor();
-        var saved = new List<string>();
-        try
+        var (saved, changed) = Ui.SaveEach(App!, _workspace.RootPath, SaveItems(_workspace, includeCollections: true));
+        if (changed.Count > 0)
         {
-            foreach (var collection in _workspace.Collections.Where(c => c.IsDirty))
-            {
-                collection.Save();
-                saved.Add(Path.GetFileName(collection.FilePath!));
-            }
-
-            foreach (var environment in _workspace.Environments.Where(e => e.IsDirty))
-            {
-                environment.Save();
-                saved.Add(Path.GetFileName(environment.FilePath!));
-            }
-
-            if (_workspace.Globals?.IsDirty == true)
-            {
-                _workspace.Globals.Save();
-            }
-
-            _workspace.SaveSettings();
+            Notify($"⚠ Not saved: {string.Join(", ", changed)} changed on disk.");
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            Ui.Error(App!, "Save failed", ex.Message);
-        }
-
-        if (_node is null && _editor.IsModified)
+        else if (_node is null && _editor.IsModified)
         {
             Notify("This request is not in a collection yet: press Ctrl+N (Request > New request) to add it to one.");
         }
@@ -472,6 +607,28 @@ internal sealed class MainWindow : Runnable
 
         _tree.RefreshAll();
         UpdateTitles();
+    }
+
+    /// <summary>What saving writes: changed collections (when asked), environments and globals, then the settings.</summary>
+    internal static IEnumerable<Ui.SaveItem> SaveItems(ApiWorkspace workspace, bool includeCollections)
+    {
+        var collections = includeCollections ? workspace.Collections.Where(c => c.IsDirty).ToList() : [];
+        foreach (var collection in collections)
+        {
+            yield return new(Path.GetFileName(collection.FilePath!), overwrite => collection.Save(overwriteChanged: overwrite));
+        }
+
+        foreach (var environment in workspace.Environments.Where(e => e.IsDirty).ToList())
+        {
+            yield return new(Path.GetFileName(environment.FilePath!), overwrite => environment.Save(overwriteChanged: overwrite));
+        }
+
+        if (workspace.Globals is { IsDirty: true } globals)
+        {
+            yield return new(Path.GetFileName(globals.FilePath!), overwrite => globals.Save(overwriteChanged: overwrite));
+        }
+
+        yield return new(null, _ => workspace.SaveSettings());
     }
 
     // ----- tree operations -------------------------------------------------------------------
@@ -489,12 +646,47 @@ internal sealed class MainWindow : Runnable
 
     private void NewRequest()
     {
+        var adopting = _node is null; // the request in the editor becomes the new one (see AddRequest)
+        if (AddRequest() is not { } node)
+        {
+            return;
+        }
+
+        if (adopting)
+        {
+            // Before the tree selects it, which would open it as another request (clearing its response, detaching its send).
+            Adopt(node);
+            _tree.Select(node);
+        }
+        else
+        {
+            _tree.Select(node);
+            OpenRequest(node);
+        }
+
+        _editor.FocusUrl();
+    }
+
+    /// <summary>
+    /// Asks for a name and adds a request to the selected folder (or a new collection): the request in the editor when it
+    /// is not in a collection yet (scratch, imported, from history), else an empty one. Null when cancelled.
+    /// </summary>
+    private RequestNode? AddRequest()
+    {
+        // The request shown becomes the new one (it is not in a collection): with *** in it, the collection would send ***.
+        if (HasMaskedCredentials
+            && MessageBox.Query(App!, "Masked credentials", "This request has *** for credentials the history masked: added to a collection like this, it would keep sending ***. Type them again first.",
+                "Add with ***", "Cancel") != 0)
+        {
+            return null;
+        }
+
         var folder = TargetFolder();
         if (folder is null)
         {
             if (!NewCollection())
             {
-                return;
+                return null;
             }
 
             folder = _workspace.Collections[^1].RootNode;
@@ -502,7 +694,7 @@ internal sealed class MainWindow : Runnable
 
         if (Ui.PromptText(App!, "New request", $"Name (in {folder.Collection.Name}{(folder is CollectionRootNode ? "" : " / " + folder.PathInCollection)})", _detachedName ?? "New request") is not { Length: > 0 } name)
         {
-            return;
+            return null;
         }
 
         CommitEditor();
@@ -511,13 +703,12 @@ internal sealed class MainWindow : Runnable
         {
             // A scratch, imported or history request becomes the new request.
             spec = _editor.Spec.Clone();
+            _editor.MarkClean();
         }
 
         var node = folder.Collection.AddRequest(folder, name.Trim(), spec);
         _tree.RefreshItem(folder is CollectionRootNode ? folder.Collection : folder);
-        _tree.Select(node);
-        OpenRequest(node);
-        _editor.FocusUrl();
+        return node;
     }
 
     private bool NewCollection()
@@ -587,10 +778,9 @@ internal sealed class MainWindow : Runnable
         CommitEditor();
         var copy = node.Collection.Duplicate(node);
         _tree.RefreshItem(node.Parent is CollectionRootNode ? node.Collection : node.Parent);
-        _tree.Select(copy);
-        if (copy is RequestNode request)
+        if (copy is not RequestNode request || OpenRequest(request))
         {
-            OpenRequest(request);
+            _tree.Select(copy);
         }
     }
 
@@ -613,23 +803,38 @@ internal sealed class MainWindow : Runnable
             return;
         }
 
-        if (_node is not null && (_node == node || _node.Ancestors().Contains(node)))
+        // Only the request open in the editor makes way: one that is not in a collection stays.
+        var openDeleted = _node is not null && (_node == node || _node.Ancestors().Contains(node));
+        if (openDeleted)
         {
             _node = null;
             _editor.MarkClean();
         }
 
+        // A request from history sent from the deleted request is sent on its own from now on.
+        var forgetOrigin = _historyOrigin is not null && (_historyOrigin == node || _historyOrigin.Ancestors().Contains(node));
+        var originGone = forgetOrigin ? ForgetHistoryOrigin() : null;
+
         node.Collection.Remove(node);
         _tree.RefreshItem(parent is CollectionRootNode ? parent.Collection : parent);
         _tree.RefreshItem(node.Collection);
-        if (_node is null)
+        if (openDeleted)
         {
+            DetachSending();
             _collection = null;
             _editor.Load(new HttpRequestSpec());
             ClearResponse();
         }
+        else if (forgetOrigin)
+        {
+            _editor.RefreshContext(); // without the folders it inherited auth and scripts from
+        }
 
         UpdateTitles();
+        if (originGone is not null)
+        {
+            Notify(originGone);
+        }
     }
 
     private void ShowContextMenu(System.Drawing.Point? position)
@@ -658,15 +863,31 @@ internal sealed class MainWindow : Runnable
             items.Add(new MenuItem("Scrip_ts…", "", () => EditScripts(TargetFolder())));
         }
 
-        if (item is RequestNode)
+        if (item is RequestNode request)
         {
+            // On the right-clicked request: the editor may show another one (from history, imported…) while it stays selected.
             items.Add(new Line());
-            items.Add(new MenuItem("_Send", "", Send));
-            items.Add(new MenuItem("Copy as c_URL", "", CopyAsCurl));
+            items.Add(new MenuItem("_Send", "", () =>
+            {
+                if (UseRequest(request))
+                {
+                    Send();
+                }
+            }));
+            items.Add(new MenuItem("Copy as c_URL", "", () =>
+            {
+                if (UseRequest(request))
+                {
+                    CopyAsCurl();
+                }
+            }));
         }
 
         ShowPopover(items, position);
     }
+
+    /// <summary>Opens a request for an action on it, unless it is open already: then the action takes the changes made to it.</summary>
+    private bool UseRequest(RequestNode request) => request == _node || OpenRequest(request);
 
     // ----- environments, certificates, settings --------------------------------------------
 
@@ -679,7 +900,7 @@ internal sealed class MainWindow : Runnable
         foreach (var environment in _workspace.Environments)
         {
             var env = environment;
-            items.Add(new MenuItem($"{(env == _workspace.ActiveEnvironment ? "● " : "  ")}{env.Name}", "", () => SetEnvironment(env)));
+            items.Add(Ui.AsWritten(new MenuItem($"{(env == _workspace.ActiveEnvironment ? "● " : "  ")}{_workspace.DisplayName(env)}", "", () => SetEnvironment(env))));
         }
 
         items.Add(new Line());
@@ -690,17 +911,23 @@ internal sealed class MainWindow : Runnable
     private void SetEnvironment(PostmanEnvironment? environment)
     {
         _workspace.ActiveEnvironment = environment;
-        _workspace.SaveSettings();
+        Ui.TrySave(App!, _workspace.SaveSettings);
         _environmentShortcut.Title = EnvironmentLabel();
         _editor.RefreshCertificateInfo();
-        Notify($"Environment: {environment?.Name ?? "none"}");
+        Notify($"Environment: {(environment is null ? "none" : _workspace.DisplayName(environment))}");
     }
 
     private void ShowEnvironments()
     {
-        EnvironmentsDialog.Show(App!, _workspace);
-        _environmentShortcut.Title = EnvironmentLabel();
-        _editor.RefreshCertificateInfo();
+        try
+        {
+            EnvironmentsDialog.Show(App!, _workspace);
+        }
+        finally
+        {
+            _environmentShortcut.Title = EnvironmentLabel();
+            _editor.RefreshCertificateInfo();
+        }
     }
 
     private void ShowCertificates()
@@ -721,16 +948,21 @@ internal sealed class MainWindow : Runnable
 
     private void ShowSettings()
     {
-        if (SettingsDialog.Show(App!, _workspace))
+        if (SettingsDialog.Show(App!, _workspace, _runner, out var saved))
         {
             _runner.ConfigureHistory();
+            _editor.RefreshBodyFile(); // files from outside the workspace folder may be allowed now, or no longer
             if (_historyLoaded)
             {
                 LoadHistory();
                 UpdateSidebarTitle();
             }
 
-            Notify("Settings saved.");
+            // A recording that is on redacts the names added to the settings from now on, and keeps any removed.
+            var added = _runner.Recorder?.AddRedactNames(_workspace.Settings.RecordingRedact ?? []) ?? [];
+            var done = saved ? "Settings saved." : "Settings applied for this session, not saved.";
+            Notify(added.Count == 0 ? done
+                : $"{done} The recording also redacts {string.Join(", ", added)} from now on; requests already recorded are unchanged.");
         }
     }
 
@@ -881,6 +1113,14 @@ internal sealed class MainWindow : Runnable
             return;
         }
 
+        // The settings may name more values to redact: a recording made without them could keep those secrets.
+        if (_workspace.SettingsError is { } settingsError)
+        {
+            Ui.Error(App!, "Recording", "The recording could not start: the workspace settings could not be read, so the extra names to redact " +
+                $"(recordingRedact) are unknown. Fix or delete the file, then open the workspace again.\n\n{settingsError}");
+            return;
+        }
+
         RequestRecorder recorder;
         try
         {
@@ -997,8 +1237,12 @@ internal sealed class MainWindow : Runnable
         {
             _recordIndicator.ShowRecording(recorder.StartedAt, recorder.Count);
             _recordMenuItem?.Title = "Stop _recording and save…";
-            if (recorder.LastError is { } error && _message.Title != "⚠ " + error)
+
+            // Once, not again over every later message (a response's status). Compared by reference: each failure sets
+            // a new message, so a request that cannot be recorded for the same reason again is said again.
+            if (recorder.LastError is { } error && !ReferenceEquals(error, _recordingErrorShown))
             {
+                _recordingErrorShown = error;
                 Notify("⚠ " + error);
             }
         }
@@ -1036,6 +1280,20 @@ internal sealed class MainWindow : Runnable
     {
         _response.Clear();
         SetResponseTitle(null);
+    }
+
+    /// <summary>
+    /// Another request is shown in the editor: a request still on its way for the one before goes on (its response goes
+    /// to the history and the status bar, not under this one), and Send sends this one.
+    /// </summary>
+    private void DetachSending()
+    {
+        _opened++;
+        if (_sending is not null)
+        {
+            _sending = null;
+            _editor.SetSending(false);
+        }
     }
 
     private void OnThemeChanged(object? sender, EventArgs e) => _recordIndicator.SetNeedsDraw();
@@ -1084,37 +1342,60 @@ internal sealed class MainWindow : Runnable
 
     private string DescribeInheritedAuth()
     {
-        if (_node is null)
+        // A v3 collection's or folder's credential sets: the URL selects one when the request is sent.
+        static string Describe(AuthSpec auth) => auth.CredentialSets is { } sets
+            ? $"the first of its credential sets ({string.Join(", ", sets.Select(s => s.Name))}) whose URL rules match"
+            : AuthSpec.DisplayName(auth.Type) ?? auth.Type;
+
+        if (SendContext is not { } node)
         {
-            return _collection?.RootNode.Auth is { } rootAuth ? $"Collection auth: {AuthSpec.DisplayName(rootAuth.Type)}" : "No auth is set on the collection.";
+            return _collection?.RootNode.Auth is { } rootAuth ? $"Collection auth: {Describe(rootAuth)}" : "No auth is set on the collection.";
         }
 
-        foreach (var folder in _node.Ancestors())
+        foreach (var folder in node.Ancestors())
         {
             if (folder.Auth is { } auth)
             {
                 var source = folder is CollectionRootNode ? "the collection" : $"folder '{folder.Name}'";
-                return $"Currently: {AuthSpec.DisplayName(auth.Type)} from {source}.";
+                return auth.CredentialSets is null ? $"Currently: {Describe(auth)} from {source}." : $"Currently: from {source}, {Describe(auth)}.";
             }
         }
 
         return "No folder or collection auth is set, so no auth is sent.";
     }
 
-    private string EnvironmentLabel() => $"Env: {_workspace.ActiveEnvironment?.Name ?? "none"}";
+    private string EnvironmentLabel() => $"Env: {(_workspace.ActiveEnvironment is { } active ? _workspace.DisplayName(active) : "none")}";
 
     // ----- workspace ---------------------------------------------------------------------------
 
     private void OpenWorkspace()
     {
-        if (Ui.PickFile(App!, "Open workspace folder", _workspace.RootPath, directory: true) is not { } path || !ConfirmUnsaved())
+        if (Ui.PickFile(App!, "Open workspace folder", _workspace.RootPath, directory: true) is { } path)
+        {
+            OpenWorkspaceFrom(path);
+        }
+    }
+
+    /// <summary>Opens another workspace (after asking about unsaved changes): the host restarts the UI with it.</summary>
+    internal void OpenWorkspaceFrom(string path)
+    {
+        if (!ConfirmUnsaved())
         {
             return;
         }
 
-        NextWorkspacePath = path;
+        try
+        {
+            NextWorkspace = ApiWorkspace.Open(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Ui.Error(App!, "Cannot open workspace", ex.Message);
+            return;
+        }
+
         _quitConfirmed = true;
-        App!.RequestStop();
+        RequestStop();
     }
 
     private void ImportCollection()
@@ -1142,10 +1423,11 @@ internal sealed class MainWindow : Runnable
                 return;
             }
 
-            var collection = _workspace.ImportCollection(path);
+            var collection = _workspace.ImportCollection(path, out var secretValuesLeftOut);
             _tree.Reload(_workspace);
             _tree.Select(collection);
-            Notify($"Imported '{collection.Name}' into {Path.GetRelativePath(_workspace.RootPath, collection.FilePath!)}");
+            var leftOut = secretValuesLeftOut.Count == 0 ? "" : $" · ⚠ the values of its secret variables ({string.Join(", ", secretValuesLeftOut)}) are not written, as in Postman's v3 collections: set them in an environment";
+            Notify($"Imported '{collection.Name}' into {Path.GetRelativePath(_workspace.RootPath, collection.FilePath!)}{leftOut}");
         }
         catch (Exception ex)
         {
@@ -1156,15 +1438,37 @@ internal sealed class MainWindow : Runnable
     private void ReloadCollection(PostmanCollection loaded)
     {
         var reopen = _collection == loaded ? _node?.PathInCollection : null;
-        if (_collection == loaded)
+
+        // A request from history stays in the editor, with the reloaded collection's variables.
+        var fromHistory = _collection == loaded && _node is null;
+
+        // Loaded first: a file that no longer loads throws, and the editor goes on editing its request.
+        var reloaded = _workspace.ReloadCollection(loaded);
+        var detached = _collection == loaded && !fromHistory;
+        if (detached)
         {
-            // Detach the editor first so nothing is written into the copy being replaced.
+            // Detach the editor so nothing is written into the copy that was replaced.
             _node = null;
             _collection = null;
             _editor.MarkClean();
         }
 
-        var reloaded = _workspace.ReloadCollection(loaded);
+        string? originGone = null;
+        if (fromHistory)
+        {
+            _collection = reloaded;
+            if (_historyEntry is { } entry && OriginalRequest(entry, reloaded) is { } original)
+            {
+                _historyOrigin = original;
+            }
+            else
+            {
+                originGone = ForgetHistoryOrigin();
+            }
+
+            _editor.RefreshContext(); // the reloaded folders' auth and scripts
+        }
+
         _tree.Reload(_workspace);
         if (reopen is not null && reloaded.FindRequest(reopen) is { } node)
         {
@@ -1177,20 +1481,23 @@ internal sealed class MainWindow : Runnable
         else
         {
             _tree.Select(reloaded);
-            if (_collection is null)
+
+            // Only the editor this reload detached: a request typed into the one a delete emptied has nothing to do with it.
+            if (detached)
             {
+                DetachSending();
                 _editor.Load(new HttpRequestSpec());
                 ClearResponse();
             }
         }
 
         UpdateTitles();
-        Notify($"Reloaded '{reloaded.Name}' from disk.");
+        Notify($"Reloaded '{reloaded.Name}' from disk.{(originGone is null ? "" : " " + originGone)}");
     }
 
     private void ImportEnvironment()
     {
-        if (Ui.PickFile(App!, "Import Postman environment", null, false, ("Postman environment", [".json"])) is not { } path)
+        if (Ui.PickFile(App!, "Import Postman environment", null, false, ("Postman environment", [".json", ".yaml", ".yml"])) is not { } path)
         {
             return;
         }
@@ -1198,7 +1505,11 @@ internal sealed class MainWindow : Runnable
         try
         {
             var environment = _workspace.ImportEnvironment(path);
-            Notify($"Imported environment '{environment.Name}'");
+
+            // The active environment's label can change: one of the same name adds its file name, its own file a new name.
+            _environmentShortcut.Title = EnvironmentLabel();
+            _editor.RefreshCertificateInfo();
+            Notify(environment.IsGlobals ? $"Imported the workspace's globals: '{environment.Name}'" : $"Imported environment '{_workspace.DisplayName(environment)}'");
         }
         catch (Exception ex)
         {
@@ -1208,16 +1519,32 @@ internal sealed class MainWindow : Runnable
 
     private void CopyAsCurl()
     {
-        if (_collection is null && _scratch is null)
+        // As Send: a request typed into the editor a delete emptied is a scratch request.
+        var prepared = _runner.Prepare(_collection ?? (_scratch ??= PostmanCollection.Create("Scratch")), SendContext, _editor.Spec);
+        if (prepared.Errors.Count > 0)
         {
+            // Not a request TermRest would send (an invalid URL, a missing file, a line break in a header): no command for it,
+            // as on the command line (a command for it would send something else, such as an empty body).
+            Ui.Error(App!, "Copy as cURL", string.Join("\n", prepared.Errors));
             return;
         }
 
-        var prepared = _runner.Prepare(_collection ?? _scratch!, _node, _editor.Spec);
-        var curl = CurlExporter.Export(prepared);
+        string curl;
+        try
+        {
+            curl = CurlExporter.Export(prepared);
+        }
+        catch (NotSupportedException ex)
+        {
+            Ui.Error(App!, "Copy as cURL", ex.Message);
+            return;
+        }
+
+        var masked = HasMaskedCredentials ? " It has *** for the credentials the history masked." : "";
+        var warnings = prepared.Warnings.Count == 0 ? "" : " ⚠ " + string.Join(" ", prepared.Warnings);
         if (Ui.CopyToClipboard(App, curl))
         {
-            Notify("cURL command copied to the clipboard.");
+            Notify("cURL command copied to the clipboard." + masked + warnings);
         }
         else
         {
@@ -1264,20 +1591,48 @@ internal sealed class MainWindow : Runnable
             Notify($"History could not be read: {ex.Message}");
         }
 
+        _history.Limit = _runner.History?.MaxEntries ?? int.MaxValue;
         _history.SetEntries(entries, _runner.History is null ? "History is off (Tools > Settings)." : "No requests yet: send one with F5.");
     }
 
-    /// <summary>Shows a sent request and its recorded response; it can be edited and re-sent, or saved with Ctrl+N.</summary>
-    internal void OpenHistoryEntry(HistoryEntry entry)
+    /// <summary>
+    /// Shows a sent request and its recorded response; it can be edited and re-sent, or saved with Ctrl+N. False when the
+    /// user keeps the request open now (see <see cref="ConfirmDiscardRequest"/>).
+    /// </summary>
+    internal bool OpenHistoryEntry(HistoryEntry entry)
     {
+        // Open already, unchanged: it may be on its way (Send again), and its response is to be shown here.
+        if (entry == _historyEntry && !_editor.IsModified)
+        {
+            return true;
+        }
+
+        if (!ConfirmDiscardRequest())
+        {
+            return false;
+        }
+
         CommitEditor();
+        DetachSending();
         _node = null;
 
-        // Variables keep resolving against the request's collection while it is still in the workspace.
-        _collection = _workspace.Collections.FirstOrDefault(c => c.Name == entry.Collection) ?? (_scratch ??= PostmanCollection.Create("Scratch"));
+        // Variables keep resolving against the request's collection while it is still in the workspace. When several have its
+        // name and which one it was is not known, the request is sent on its own.
+        var collection = CollectionOf(entry, out var namesakes);
+        _collection = collection ?? (_scratch ??= PostmanCollection.Create("Scratch"));
         _historyEntry = entry;
         _detachedName = entry.RequestPath is null ? null : entry.Name;
-        _editor.Load(entry.ReadSpec());
+        var spec = entry.ReadSpec();
+
+        // Sent again, it runs as its request in the collection does (with the scripts of its folders), while that is still
+        // there. Auth it inherited is taken from its folders again: the history has a masked copy of it.
+        _historyOrigin = OriginalRequest(entry, collection);
+        if (entry.AuthInherited && _historyOrigin is not null)
+        {
+            spec.Auth = null;
+        }
+
+        _editor.Load(spec);
         byte[]? body = null;
         try
         {
@@ -1288,9 +1643,21 @@ internal sealed class MainWindow : Runnable
             // The entry is still useful without its body.
         }
 
-        _response.ShowExchange(entry.ToExchange(body));
+        _response.ShowExchange(entry.ToExchange(body), fromHistory: true);
         SetResponseTitle(null);
         UpdateTitles();
+        var masked = HasMaskedCredentials ? "Credentials are *** in the history: type them again before sending." : null;
+        if (namesakes > 1)
+        {
+            var unknown = $"{namesakes} collections are named '{entry.Collection}' and which one this request was sent from is not known: it is sent on its own";
+            Notify(masked is null ? $"⚠ {unknown}, without their variables and scripts." : $"⚠ {unknown}. {masked}");
+        }
+        else if (masked is not null)
+        {
+            Notify("⚠ " + masked);
+        }
+
+        return true;
     }
 
     private void ShowHistoryContextMenu(System.Drawing.Point? position)
@@ -1305,18 +1672,24 @@ internal sealed class MainWindow : Runnable
             new MenuItem("_Open", "", () => OpenHistoryEntry(entry)),
             new MenuItem("_Send again", "", () =>
             {
-                OpenHistoryEntry(entry);
-                Send();
+                if (UseHistoryEntry(entry))
+                {
+                    Send();
+                }
             }),
             new MenuItem("Save to _collection…", "", () =>
             {
-                OpenHistoryEntry(entry);
-                NewRequest();
+                if (UseHistoryEntry(entry))
+                {
+                    NewRequest();
+                }
             }),
             new MenuItem("Copy as c_URL", "", () =>
             {
-                OpenHistoryEntry(entry);
-                CopyAsCurl();
+                if (UseHistoryEntry(entry))
+                {
+                    CopyAsCurl();
+                }
             }),
         };
         if (OriginalRequest(entry) is { } original)
@@ -1334,8 +1707,96 @@ internal sealed class MainWindow : Runnable
         ShowPopover(items, position);
     }
 
-    private RequestNode? OriginalRequest(HistoryEntry entry) =>
-        entry.RequestPath is { } path ? _workspace.Collections.FirstOrDefault(c => c.Name == entry.Collection)?.FindRequest(path) : null;
+    /// <summary>
+    /// The request in its collection a history entry was sent from, while it is there: the one at its exact path. Unlike
+    /// <see cref="PostmanCollection.FindRequest"/>, never one found by its name alone, which may be another request, in
+    /// a folder with other auth and scripts.
+    /// </summary>
+    private RequestNode? OriginalRequest(HistoryEntry entry) => OriginalRequest(entry, CollectionOf(entry, out _));
+
+    /// <param name="collection">The entry's collection, if it is loaded (see <see cref="CollectionOf"/>).</param>
+    private static RequestNode? OriginalRequest(HistoryEntry entry, PostmanCollection? collection)
+    {
+        if (entry.RequestPath is not { } path || collection is null)
+        {
+            return null;
+        }
+
+        // Names may hold slashes, so requests in different folders can share a path: then which one it was is not known.
+        RequestNode? found = null;
+        foreach (var request in collection.AllRequests())
+        {
+            if (request.PathInCollection == path)
+            {
+                if (found is not null && found.Parent != request.Parent)
+                {
+                    return null;
+                }
+
+                found ??= request;
+            }
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// The collection a history entry was sent from, while it is loaded: the one in its file; else (an entry of an earlier
+    /// version, a file renamed since) the one with its name, while no other has that name. Null when several do (then
+    /// <paramref name="namesakes"/> says how many): which one it was is not known.
+    /// </summary>
+    private PostmanCollection? CollectionOf(HistoryEntry entry, out int namesakes)
+    {
+        namesakes = 0;
+        if (entry.CollectionFile is { } file
+            && _workspace.Collections.FirstOrDefault(c => string.Equals(_workspace.FileOf(c), file, StringComparison.OrdinalIgnoreCase)) is { } collection)
+        {
+            return collection;
+        }
+
+        var named = _workspace.Collections.Where(c => c.Name == entry.Collection).ToList();
+        namesakes = named.Count;
+        return namesakes == 1 ? named[0] : null;
+    }
+
+    /// <summary>Opens a history entry for an action on it, unless it is open already: then the action takes the changes made to it.</summary>
+    private bool UseHistoryEntry(HistoryEntry entry) => entry == _historyEntry || OpenHistoryEntry(entry);
+
+    /// <summary>Whether the request shown still has *** for credentials the history masked (see <see cref="HistoryEntry.CredentialsMasked"/>).</summary>
+    private bool HasMaskedCredentials => _historyEntry is { CredentialsMasked: true } && HistoryEntry.HasMaskedCredentials(_editor.Spec);
+
+    /// <summary>The request whose collection context (folder scripts, inherited auth) the request shown is sent in.</summary>
+    private RequestNode? SendContext => _node ?? _historyOrigin;
+
+    /// <summary>
+    /// The request the history entry shown was sent from is gone (deleted, or not found when its collection was reloaded):
+    /// the entry is sent on its own from now on. When it inherited its auth there and still inherits it, the auth it was
+    /// sent with is put back: inheriting now would take the collection's auth, which may be meant for another host. Other
+    /// changes made to the request are kept. Returns what to tell the user, or null when its auth stays as it is.
+    /// </summary>
+    private string? ForgetHistoryOrigin()
+    {
+        _historyOrigin = null;
+        if (_node is not null || _historyEntry is not { AuthInherited: true } entry || _editor.Spec.Auth is not null
+            || entry.ReadSpec().Auth is not { } auth)
+        {
+            return null;
+        }
+
+        var spec = _editor.Spec;
+        spec.Auth = auth;
+        if (_editor.IsModified)
+        {
+            _editor.Replace(spec);
+        }
+        else
+        {
+            _editor.Load(spec);
+        }
+
+        var gone = $"'{entry.RequestPath}' is no longer in its collection: this request now has the auth it was sent with";
+        return HasMaskedCredentials ? $"⚠ {gone}. Credentials are *** in the history: type them again before sending." : $"{gone} (Auth tab).";
+    }
 
     private void DeleteHistoryEntry(HistoryEntry entry)
     {
@@ -1360,9 +1821,13 @@ internal sealed class MainWindow : Runnable
 
         try
         {
-            store.Clear();
+            var bodiesLeft = store.Clear();
             _history.SetEntries([], "History cleared.");
             UpdateSidebarTitle();
+            if (bodiesLeft is not null)
+            {
+                Ui.Error(App!, "History", $"History cleared, but some response bodies could not be deleted: {bodiesLeft.Message}");
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -1405,16 +1870,48 @@ internal sealed class MainWindow : Runnable
         var spec = imported.Spec;
         if (intoCurrent)
         {
-            spec.Description = _editor.Spec.Description;
-            spec.Scripts = _editor.Spec.Scripts;
-            spec.ScriptSettings = _editor.Spec.ScriptSettings;
+            // Pasted into a request from history, a command is a request of its own, as one imported from the menu: not the
+            // request the entry was sent from, whose auth and scripts (its own and its folders') are not meant for the host it
+            // names.
+            var detach = _node is null && _historyEntry is not null;
+            var sending = _sending is not null;
+            if (detach)
+            {
+                DetachSending(); // the entry's request, still on its way, goes on as it would for a menu import
+                _historyEntry = null;
+                _historyOrigin = null;
+                _collection = _scratch ??= PostmanCollection.Create("Scratch");
+                _detachedName = imported.SuggestedName;
+            }
+            else
+            {
+                spec.Description = _editor.Spec.Description;
+                spec.Scripts = _editor.Spec.Scripts;
+                spec.ScriptSettings = _editor.Spec.ScriptSettings;
+            }
+
             _editor.Replace(spec);
+            if (detach)
+            {
+                _editor.RefreshContext();
+                if (sending)
+                {
+                    ClearResponse(); // not "Sending…" for the entry's request, which now arrives on its own
+                }
+            }
         }
         else
         {
+            if (!ConfirmDiscardRequest())
+            {
+                return;
+            }
+
             CommitEditor();
+            DetachSending();
             _node = null;
             _historyEntry = null;
+            _historyOrigin = null;
             _collection = _scratch ??= PostmanCollection.Create("Scratch");
             _detachedName = imported.SuggestedName;
             _editor.Replace(spec);
@@ -1450,6 +1947,7 @@ internal sealed class MainWindow : Runnable
         ("Ctrl+N", "New request"),
         ("F2", "Rename tree item"),
         ("Del", "Delete item, row or entry"),
+        ("Insert", "Add a table row"),
         ("F7", "Switch environment"),
         ("F8", "Client certificates"),
         ("F9", "Collections ⇄ History"),
@@ -1510,6 +2008,7 @@ internal sealed class MainWindow : Runnable
                    $"Color theme: {ThemeCatalog.Current.Name} ({(ThemeCatalog.Current.FilePath ?? "built in")}){(_workspace.Settings.Theme is null ? "" : ", chosen for this workspace")}\n" +
                    $"Certificates: {_workspace.Certificates.Entries.Count} ({Path.GetRelativePath(_workspace.RootPath, _workspace.CertificatesPath)})\n" +
                    $"SSL verification: {(_workspace.Settings.StrictSsl ? "on" : "off")} · CA bundle: {_workspace.Settings.CaBundle ?? "none"}\n" +
+                   $"Proxy: {DescribeProxy()}\n" +
                    $"History: {(_runner.History is { } history ? history.Folder : "off")}\n" +
                    $"Recording: {(_runner.Recorder is { } recorder ? $"on since {recorder.StartedAt:HH:mm:ss}, {recorder.Count} request(s), temporary files in {recorder.TempDirectory}" : $"off (temporary files go to {RequestRecorder.DefaultTempRoot()})")}";
         if (_workspace.LoadErrors.Count > 0)
@@ -1518,6 +2017,20 @@ internal sealed class MainWindow : Runnable
         }
 
         Ui.ShowText(App!, "Workspace", info);
+    }
+
+    /// <summary>The proxy requests go through (its password masked), and a proxy of the workspace's settings that is not allowed.</summary>
+    private string DescribeProxy()
+    {
+        const string system = "system (OS / HTTPS_PROXY settings)";
+        var proxy = _workspace.Settings.Proxy?.Trim();
+        if (!WorkspaceSettings.IsProxyUrl(proxy))
+        {
+            return string.Equals(proxy, "none", StringComparison.OrdinalIgnoreCase) ? "none" : system;
+        }
+
+        var url = PostmanUrl.MaskCredentials(proxy);
+        return _runner.BlockedProxy is null ? url : $"{system}, not the workspace's {url} until you allow it: Tools > Settings > Save";
     }
 
     /// <summary>When wrapping follows the files: the YAML collections whose files are wrapped.</summary>
@@ -1561,7 +2074,7 @@ internal sealed class MainWindow : Runnable
     {
         var dirty = _editor.IsModified || _collection?.IsDirty == true ? " ●" : "";
         var title = _node is not null
-            ? $"Request — {_node.Collection.Name} / {_node.PathInCollection}{dirty}"
+            ? $"Request — {_workspace.DisplayName(_node.Collection)} / {_node.PathInCollection}{dirty}"
             : _historyEntry is { } entry
                 ? $"Request (from history · {entry.Time.ToLocalTime():yyyy-MM-dd HH:mm:ss}){dirty}"
                 : $"Request ({(_detachedName is null ? "scratch" : "imported")}){dirty}";
@@ -1601,7 +2114,7 @@ internal sealed class MainWindow : Runnable
         if (ConfirmUnsaved())
         {
             _quitConfirmed = true;
-            App?.RequestStop();
+            RequestStop();
         }
     }
 
@@ -1609,6 +2122,11 @@ internal sealed class MainWindow : Runnable
     private bool ConfirmUnsaved()
     {
         CommitEditor();
+        if (!ConfirmDiscardRequest())
+        {
+            return false;
+        }
+
         if (_runner.Recorder is { } recorder && !StopRecording(recorder, RecordingDialogPurpose.Close))
         {
             return false;
@@ -1647,6 +2165,13 @@ internal sealed class MainWindow : Runnable
             return true;
         }
 
+        // Also a menu item's key, but Terminal.Gui delivers those only to an open menu.
+        if (key == Key.L.WithCtrl)
+        {
+            _editor.FocusUrl();
+            return true;
+        }
+
         if (key == Key.F12)
         {
             ToggleRecording();
@@ -1668,10 +2193,11 @@ internal sealed class MainWindow : Runnable
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_closed)
         {
             _closed = true;
-            _sending?.Cancel();
+            _closing.Cancel();
+            _closing.Dispose();
             ThemeCatalog.Changed -= OnThemeChanged;
 
             // Closed without saving (normally the user is asked first): the files stay for Tools > Recover.

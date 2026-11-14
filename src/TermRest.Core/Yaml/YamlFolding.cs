@@ -54,13 +54,15 @@ internal static partial class YamlFolding
 
         var builder = new StringBuilder(quoted.Length + 16);
         var start = 0;
+        var escapedLeadingSpace = -1;
         for (var i = 0; i < quoted.Length; i++)
         {
             var ch = quoted[i];
             if (ch == ' ' && At(quoted, i + 1) == '\\' && At(quoted, i + 2) == 'n')
             {
-                // A space before a line break would be lost when the break is folded: escape it.
-                builder.Append(quoted, start, i - start).Append("\\ ");
+                // A space before a line break would be lost when the break is folded: escape it, unless it is a line's
+                // only character, which is escaped already as its leading space (the library escapes it twice).
+                builder.Append(quoted, start, i - start).Append(i == escapedLeadingSpace ? " " : "\\ ");
                 i += 1;
                 start = i;
                 ch = '\\';
@@ -89,6 +91,7 @@ internal static partial class YamlFolding
             if (At(quoted, i + 2) == ' ')
             {
                 builder.Append('\\'); // leading spaces of a continuation line would be dropped
+                escapedLeadingSpace = i + 2;
             }
 
             i += 1;
@@ -136,8 +139,9 @@ internal static partial class YamlFolding
     /// <summary>
     /// <paramref name="text"/> (which must be writable as a block scalar) as a folded block: the <c>&gt;</c> header line and the
     /// content lines indented by <paramref name="indent"/>, without a final line break. Returns null for text that
-    /// cannot be folded without changing it (its first line starts with white space), and, with
-    /// <paramref name="literalWhenUnfoldable"/>, when a line cannot be broken to fit; a literal block is written then.
+    /// cannot be folded without changing it (its first line starts with white space, or a line of only white space
+    /// follows a more-indented one), and, with <paramref name="literalWhenUnfoldable"/>, when a line cannot be broken to
+    /// fit; a literal block is written then.
     /// </summary>
     public static string? FoldedBlock(string text, int indent, int lineWidth, bool literalWhenUnfoldable)
     {
@@ -199,6 +203,11 @@ internal static partial class YamlFolding
         {
             value = value[start.Length..];
             start = LineBreaks().Replace(start, m => m.Value + indentText);
+        }
+
+        if (HasWhiteLineAfterMoreIndented(value))
+        {
+            return null;
         }
 
         var header = (startsWithSpace ? indent > 0 ? "2" : "1" : "") + chomp;
@@ -327,6 +336,11 @@ internal static partial class YamlFolding
                             j = escape - 1; // after skipped white space the library can land inside one
                         }
 
+                        if (j >= 1 && char.IsHighSurrogate(text[j]))
+                        {
+                            j--; // nor between the two halves of a character (an emoji): apart, neither can be written
+                        }
+
                         if (j < 1 || (folds.Count > 0 && j <= folds[^1]))
                         {
                             // Only when the indentation leaves no room at all: keep the line long.
@@ -381,6 +395,31 @@ internal static partial class YamlFolding
         }
 
         return result.ToString();
+    }
+
+    /// <summary>
+    /// Whether a line of only white space follows a more-indented line (empty lines between them or not). The library
+    /// takes it for an empty line and keeps the doubled line break before it, which adds an empty line to the text.
+    /// </summary>
+    private static bool HasWhiteLineAfterMoreIndented(string text)
+    {
+        var moreIndented = false;
+        foreach (var line in text.AsSpan().EnumerateLines())
+        {
+            if (line.IsEmpty)
+            {
+                continue;
+            }
+
+            if (moreIndented && line.TrimStart(" \t").IsEmpty)
+            {
+                return true;
+            }
+
+            moreIndented = line[0] is ' ' or '\t';
+        }
+
+        return false;
     }
 
     /// <summary>

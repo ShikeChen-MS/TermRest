@@ -48,21 +48,21 @@ internal static class ValidateCommand
                         summary = $"collection '{collection.Name}' (schema {collection.SchemaVersion}), {collection.AllRequests().Count()} request(s)";
                     }
 
-                    var expected = Normalize(original, info);
-                    if (serialized == expected)
+                    var written = TextFile.AsWritten(serialized, info);
+                    if (written == original)
                     {
                         Output.Status($"✓ {file}: {summary}; round-trip identical", true);
                     }
                     else
                     {
                         failures++;
-                        var (line, before, after) = FirstDifference(expected, serialized);
+                        var (line, before, after) = FirstDifference(original, written);
                         Output.Status($"✗ {file}: {summary}; differs at line {line}", false);
                         Output.Info($"    original: {before}");
                         Output.Info($"    termrest: {after}");
                     }
                 }
-                catch (Exception ex) when (ex is IOException or InvalidDataException or System.Text.Json.JsonException)
+                catch (Exception ex) when (ex is IOException or InvalidDataException or System.Text.Json.JsonException or UnauthorizedAccessException)
                 {
                     failures++;
                     Output.Status($"✗ {file}: {ex.Message}", false);
@@ -72,12 +72,6 @@ internal static class ValidateCommand
             return failures == 0 ? 0 : 1;
         });
         return command;
-    }
-
-    private static string Normalize(string text, TextFileInfo info)
-    {
-        var normalized = info.UsesCrLf ? text.Replace("\r\n", "\n", StringComparison.Ordinal) : text;
-        return info.HasTrailingNewline ? normalized[..^1] : normalized;
     }
 
     /// <summary>v3 collection folder or YAML environment: loads, and checks that editing would not change other details.</summary>
@@ -101,7 +95,7 @@ internal static class ValidateCommand
                     Output.Status($"✓ {path}: {summary}; every file converts losslessly", true);
 
                     // Unreadable files are reported as load warnings; hidden non-HTTP requests are fine.
-                    return collection.LoadWarnings.All(w => w.Contains("non-HTTP", StringComparison.Ordinal));
+                    return !collection.HasUnreadableFiles;
                 }
 
                 Output.Status($"✗ {path}: {summary}; {problems.Count} file(s) would change when edited", false);
@@ -135,12 +129,21 @@ internal static class ValidateCommand
             var r = i < right.Length ? right[i] : "<end of file>";
             if (l != r)
             {
-                return (i + 1, l.Trim(), r.Trim());
+                if (l.EndsWith('\r') && r.EndsWith('\r'))
+                {
+                    (l, r) = (l[..^1], r[..^1]); // CRLF in both: no part of the difference
+                }
+
+                // Lines that differ in white space only (Postman indents with tabs) show it: \t, \r, and · for a space.
+                return l.Trim() == r.Trim() ? (i + 1, ShowWhiteSpace(l), ShowWhiteSpace(r)) : (i + 1, l.Trim(), r.Trim());
             }
         }
 
         return (0, "", "");
     }
+
+    private static string ShowWhiteSpace(string line) =>
+        line.Replace("\t", "\\t", StringComparison.Ordinal).Replace("\r", "\\r", StringComparison.Ordinal).Replace(' ', '·');
 }
 
 /// <summary><c>termrest certs …</c>: inspect the certificate registry and OS stores.</summary>
@@ -152,10 +155,24 @@ internal static class CertsCommand
 
         var list = new Command("list", "List the workspace certificate registry and test that each certificate loads.");
         var workspaceArg = new Argument<string?>("workspace") { Description = "Workspace folder (default: current directory)", Arity = ArgumentArity.ZeroOrOne };
+        var allowOutsideFiles = new Option<bool>("--allow-outside-files")
+        {
+            Description = "Also open certificate files on network shares outside the workspace folder (default: only where allowed for the workspace in the full-screen UI, Tools › Settings…)",
+        };
         list.Arguments.Add(workspaceArg);
+        list.Options.Add(allowOutsideFiles);
         list.SetAction(parseResult =>
         {
-            var workspace = ApiWorkspace.Open(parseResult.GetValue(workspaceArg) ?? Environment.CurrentDirectory);
+            if (OpenWorkspace(parseResult.GetValue(workspaceArg)) is not { } workspace)
+            {
+                return 2;
+            }
+
+            if (workspace.CertificatesError is not null)
+            {
+                return 1;
+            }
+
             if (workspace.Certificates.Entries.Count == 0)
             {
                 Output.Info($"No certificates registered in {workspace.CertificatesPath}.");
@@ -164,6 +181,8 @@ internal static class CertsCommand
 
             using var provider = new ClientCertificateProvider(workspace.Certificates);
             using var runner = new RequestRunner(workspace);
+            runner.ConfigureFiles();
+            runner.OutsideFilesAllowed |= parseResult.GetValue(allowOutsideFiles);
             var resolver = runner.CreateResolver(null);
             var failures = 0;
             foreach (var entry in workspace.Certificates.Entries)
@@ -174,7 +193,8 @@ internal static class CertsCommand
                 try
                 {
                     var loaded = provider.Load(entry, workspace.RootPath, value =>
-                        value is not null && value.StartsWith("env:", StringComparison.OrdinalIgnoreCase) ? Environment.GetEnvironmentVariable(value[4..]) : resolver.Resolve(value));
+                        value is not null && value.StartsWith("env:", StringComparison.OrdinalIgnoreCase) ? Environment.GetEnvironmentVariable(value[4..]) : resolver.Resolve(value),
+                        runner.FilesFolder);
                     var s = loaded.Summary;
                     Output.Status($"  ✓ {s.Subject} · issuer {s.IssuerCommonName} · expires {s.NotAfter:yyyy-MM-dd}{(s.IsExpired ? " (EXPIRED)" : "")} · key {(s.HasPrivateKey ? "ok" : "MISSING")}", !s.IsExpired && s.HasPrivateKey);
                 }
@@ -214,7 +234,16 @@ internal static class CertsCommand
         match.Arguments.Add(matchWorkspace);
         match.SetAction(parseResult =>
         {
-            var workspace = ApiWorkspace.Open(parseResult.GetValue(matchWorkspace) ?? Environment.CurrentDirectory);
+            if (OpenWorkspace(parseResult.GetValue(matchWorkspace)) is not { } workspace)
+            {
+                return 2;
+            }
+
+            if (workspace.CertificatesError is not null)
+            {
+                return 1;
+            }
+
             if (!Uri.TryCreate(parseResult.GetValue(url), UriKind.Absolute, out var uri))
             {
                 Output.Error("Enter an absolute URL.");
@@ -235,5 +264,38 @@ internal static class CertsCommand
         command.Subcommands.Add(store);
         command.Subcommands.Add(match);
         return command;
+    }
+
+    /// <summary>
+    /// Opens a workspace for the certificate commands (its collections are not needed) and reports what could not be
+    /// read; a registry that could not be read is an error (see <see cref="ApiWorkspace.CertificatesError"/>). Null when
+    /// the workspace does not exist.
+    /// </summary>
+    private static ApiWorkspace? OpenWorkspace(string? path)
+    {
+        ApiWorkspace workspace;
+        try
+        {
+            workspace = ApiWorkspace.Open(path ?? Environment.CurrentDirectory, CollectionLoading.None);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Output.Error(ex.Message);
+            return null;
+        }
+
+        foreach (var error in workspace.LoadErrors)
+        {
+            if (error == workspace.CertificatesError)
+            {
+                Output.Error(error);
+            }
+            else
+            {
+                Output.Warning(error);
+            }
+        }
+
+        return workspace;
     }
 }

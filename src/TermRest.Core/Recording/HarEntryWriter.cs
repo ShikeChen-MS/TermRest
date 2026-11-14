@@ -78,32 +78,48 @@ internal static class HarEntryWriter
         }
     }
 
-    /// <summary>The bytes to write and how: text bodies in another charset (Latin-1, UTF-16 …) are converted to UTF-8.</summary>
+    /// <summary>
+    /// The bytes to write and how: text bodies in another charset (Latin-1, UTF-16 …) are converted to UTF-8, so that the
+    /// secrets in them are found. A UTF-16 or UTF-32 byte order mark says which, also when the Content-Type names no charset.
+    /// </summary>
     internal static (byte[] Data, BodyFormat Format) Classify(byte[] body, string? contentType)
     {
         var format = ExchangeRedactor.DetectFormat(contentType, body);
-        if (format != BodyFormat.Binary || body.Length == 0 || Charset(contentType) is not { } charset
-            || !ExchangeRedactor.IsTextual(ExchangeRedactor.MediaType(contentType)))
+        if (body.Length == 0 || !ExchangeRedactor.IsTextual(ExchangeRedactor.MediaType(contentType)))
         {
             return (body, format);
         }
 
-        try
+        if (WideMark(body) is { } marked)
         {
-            var encoding = Encoding.GetEncoding(charset);
-            if (encoding.CodePage == Encoding.UTF8.CodePage)
-            {
-                return (body, format);
-            }
+            var text = marked.GetString(body, marked.Preamble.Length, body.Length - marked.Preamble.Length);
+            var bytes = Encoding.UTF8.GetBytes(text);
+            return (bytes, ExchangeRedactor.DetectFormat(contentType, bytes));
+        }
 
-            var converted = Encoding.UTF8.GetBytes(encoding.GetString(body));
-            return (converted, ExchangeRedactor.DetectFormat(contentType, converted));
-        }
-        catch (ArgumentException)
+        if (Charset(contentType) is not { } charset || (format != BodyFormat.Binary && System.Text.Unicode.Utf8.IsValid(body)))
         {
-            return (body, format); // a charset this platform does not know
+            return (body, format);
         }
+
+        // As the body is shown (legacy code pages such as windows-1252 included); a charset this platform does not know,
+        // or does not support (UTF-7), leaves the bytes as they are.
+        if (Http.BodyFormatter.GetEncoding(charset) is not { } encoding || encoding.CodePage == Encoding.UTF8.CodePage)
+        {
+            return (body, format);
+        }
+
+        // UTF-16 without a byte order mark in the byte order its text shows, as the body is shown.
+        var converted = Encoding.UTF8.GetBytes(Http.BodyFormatter.InByteOrder(encoding, body).GetString(body));
+        return (converted, ExchangeRedactor.DetectFormat(contentType, converted));
     }
+
+    /// <summary>The UTF-16 or UTF-32 encoding whose byte order mark <paramref name="body"/> starts with; null for none.</summary>
+    private static Encoding? WideMark(byte[] body) => WideEncodings.FirstOrDefault(encoding => body.AsSpan().StartsWith(encoding.Preamble));
+
+    // The UTF-32 little-endian mark starts with the UTF-16 one: it is checked first.
+    private static readonly Encoding[] WideEncodings =
+        [Encoding.UTF32, new UTF32Encoding(bigEndian: true, byteOrderMark: true), Encoding.Unicode, Encoding.BigEndianUnicode];
 
     private static void WriteRequest(Utf8JsonWriter writer, RecordedExchange recorded, string url, List<KeyValuePair<string, string>> headers, PostData? postData)
     {
@@ -186,6 +202,12 @@ internal static class HarEntryWriter
 
         writer.WriteStartObject("content");
         writer.WriteNumber("size", response.Body.LongLength);
+        if (response.ReceivedBodySize is { } received && received != response.Body.LongLength && !response.BodyTruncated)
+        {
+            // Decoded (gzip …): the bytes saved, so that size = bodySize + compression.
+            writer.WriteNumber("compression", response.Body.LongLength - received);
+        }
+
         writer.WriteString("mimeType", response.ContentType ?? "x-unknown");
         if (response.Body.Length > 0)
         {
@@ -202,7 +224,7 @@ internal static class HarEntryWriter
         writer.WriteEndObject();
         writer.WriteString("redirectURL", headers.LastOrDefault(h => h.Key.Equals("Location", StringComparison.OrdinalIgnoreCase)).Value ?? "");
         writer.WriteNumber("headersSize", -1);
-        writer.WriteNumber("bodySize", -1);
+        writer.WriteNumber("bodySize", response.ReceivedBodySize ?? -1);
         writer.WriteEndObject();
     }
 
@@ -545,9 +567,9 @@ internal static class HarEntryWriter
     {
         while (data.Length > TextChunk)
         {
-            // Cut before a UTF-8 continuation byte, never inside a character.
+            // Cut before a UTF-8 continuation byte, never inside a character (a character has at most three).
             var cut = TextChunk;
-            while (cut > 0 && (data[cut] & 0xC0) == 0x80)
+            while (cut > TextChunk - 3 && (data[cut] & 0xC0) == 0x80)
             {
                 cut--;
             }
@@ -756,7 +778,7 @@ internal static class HarEntryWriter
         {
             Name = part.Name,
             FileName = Path.GetFileName(part.FilePath),
-            ContentType = part.ContentType ?? "application/octet-stream",
+            ContentType = part.SentContentType,
             File = FileReference.Create(part.FilePath!, redactor, Location),
             Comment = FileReference.Comment,
         };

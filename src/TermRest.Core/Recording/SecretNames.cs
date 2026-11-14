@@ -22,12 +22,16 @@ public static class SecretNames
     private static readonly string[] Ending =
     [
         "token", "authorization", "cookie", "cookies", "apikey", "accesskey", "secretkey", "subscriptionkey", "functionskey",
-        "masterkey", "sessionkey", "signingkey", "accountkey", "sharedkey", "sessionid", "sessid", "signature", "assertion",
-        "codeverifier", "pwd",
+        "masterkey", "sessionkey", "signingkey", "accountkey", "sharedkey", "authkey", "sessionid", "sessid", "signature",
+        "assertion", "codeverifier", "pwd",
     ];
 
-    // Short names that are credentials only in URLs: Google API keys (?key=) and Azure SAS signatures (?sig=).
-    private static readonly string[] QueryOnly = ["key", "sig"];
+    // Short names that are credentials only in URLs: Google API keys (?key=), Azure SAS signatures (?sig=) and Firebase
+    // ID tokens or database secrets (?auth=).
+    private static readonly string[] QueryOnly = ["key", "sig", "auth"];
+
+    // Names that look like credentials but never hold one (CORS says whether credentials are allowed: "true").
+    private static readonly string[] NotSecret = ["accesscontrolallowcredentials"];
 
     /// <summary>Lowercase ASCII letters and digits of <paramref name="name"/>, without trailing digits (X-Hub-Signature-256 → xhubsignature).</summary>
     public static string Normalize(string? name)
@@ -61,7 +65,8 @@ public static class SecretNames
 
     /// <summary>
     /// Whether values named <paramref name="name"/> are credentials. <paramref name="extraNames"/> (normalized) are
-    /// matched like the built-in endings: "tenantkey" matches X-Tenant-Key and tenant_key.
+    /// matched like the built-in endings: "tenantkey" matches X-Tenant-Key and tenant_key. They win over the names known
+    /// not to be credentials (Access-Control-Allow-Credentials), which only change the built-in rules.
     /// </summary>
     public static bool IsSecret(string? name, NameKind kind, IReadOnlySet<string>? extraNames = null)
     {
@@ -74,6 +79,11 @@ public static class SecretNames
         if (extraNames is not null && extraNames.Any(extra => normalized.EndsWith(extra, StringComparison.Ordinal)))
         {
             return true;
+        }
+
+        if (NotSecret.Contains(normalized, StringComparer.Ordinal))
+        {
+            return false;
         }
 
         if (kind == NameKind.QueryParameter && QueryOnly.Contains(normalized, StringComparer.Ordinal))

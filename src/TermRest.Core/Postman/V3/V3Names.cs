@@ -13,18 +13,28 @@ internal static class V3Names
 
     private static readonly HashSet<string> ReservedNames = new(StringComparer.OrdinalIgnoreCase)
     {
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+        "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³",
+        "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
     };
 
-    /// <summary>A file-system-safe name: characters that are invalid on any OS become "-" (like Postman does).</summary>
+    private static readonly string[] CollectionFolders = ["collections"];
+
+    private static readonly string[] LayoutFolders = ["collections", "environments", "globals"];
+
+    /// <summary>
+    /// A file-system-safe name: characters that are invalid on any OS become "-" (like Postman does), and so do leading
+    /// dots, which would hide the file or folder (folders starting with "." are not loaded, and ".resources" is taken).
+    /// </summary>
     public static string Safe(string name)
     {
         var chars = name.Select(c => c is '/' or '\\' or ':' or '*' or '?' or '"' or '<' or '>' or '|' || char.IsControl(c) ? '-' : c).ToArray();
         var safe = new string(chars).Trim();
         if (safe.Length > MaxLength)
         {
-            safe = safe[..MaxLength];
+            // Never between the two halves of a surrogate pair (an emoji, say): git cannot add a file whose name ends in
+            // half a character, and on Unix .NET writes it as U+FFFD.
+            safe = safe[..(char.IsHighSurrogate(safe[MaxLength - 1]) ? MaxLength - 1 : MaxLength)];
         }
 
         safe = safe.TrimEnd('.', ' ');
@@ -33,7 +43,13 @@ internal static class V3Names
             safe = "untitled";
         }
 
-        return ReservedNames.Contains(safe.Split('.')[0]) ? safe + "-" : safe;
+        var dots = safe.Length - safe.TrimStart('.').Length;
+        safe = new string('-', dots) + safe[dots..];
+
+        // Windows reserves a device name also with an extension (NUL.txt is NUL), spaces before the dot ignored, and so does
+        // Git for Windows: the "-" goes right after the name (con.example.org becomes con-.example.org).
+        var stem = safe.Split('.')[0].TrimEnd(' ');
+        return ReservedNames.Contains(stem) ? string.Concat(stem, "-", safe.AsSpan(stem.Length)) : safe;
     }
 
     public static bool IsRequestFile(string path) =>
@@ -52,20 +68,61 @@ internal static class V3Names
     public static string ResourcesPath(string requestFile) =>
         Path.Combine(Path.GetDirectoryName(requestFile)!, ResourcesDirectory, RequestStem(requestFile) + ".resources");
 
-    /// <summary>A folder is a v3 collection when it has a collection definition or request files of its own.</summary>
+    /// <summary>
+    /// A folder is a v3 collection when it has a collection definition or request files of its own; or, in a workspace's
+    /// <c>postman/collections</c> folder (where Postman keeps collections, and writes no definition for one without settings
+    /// of its own), when its folders have them.
+    /// </summary>
     public static bool IsCollectionDirectory(string directory) =>
         Directory.Exists(directory)
-        && (File.Exists(DefinitionPath(directory))
-            || Directory.EnumerateFiles(directory, "*.request.y*ml").Any(IsRequestFile));
+        && (HasContent(directory) || (IsInCollectionsFolder(directory) && FoldersHaveContent(directory, MaxFolderDepth)));
+
+    private const int MaxFolderDepth = 16;
+
+    private static readonly EnumerationOptions FolderSearch = new() { IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint };
+
+    private static bool HasContent(string directory) =>
+        File.Exists(DefinitionPath(directory)) || Directory.EnumerateFiles(directory, "*.request.y*ml").Any(IsRequestFile);
+
+    /// <summary>Whether folders of <paramref name="directory"/> (not hidden ones, nor links) have definitions or requests.</summary>
+    private static bool FoldersHaveContent(string directory, int depth)
+    {
+        try
+        {
+            return depth > 0 && Directory.EnumerateDirectories(directory, "*", FolderSearch)
+                .Any(sub => !Path.GetFileName(sub).StartsWith('.') && (HasContent(sub) || FoldersHaveContent(sub, depth - 1)));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Whether <paramref name="directory"/> is in a <c>postman/collections</c> folder, where Postman keeps collections.</summary>
+    public static bool IsInCollectionsFolder(string directory)
+    {
+        var parent = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory)));
+        return parent is not null && string.Equals(Path.GetFileName(parent), CollectionFolders[0], StringComparison.OrdinalIgnoreCase)
+               && string.Equals(Path.GetFileName(Path.GetDirectoryName(parent)), "postman", StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>The workspace folder for a collection directory: the folder that holds <c>postman/collections</c>.</summary>
-    public static string WorkspaceRootFor(string collectionDirectory)
+    public static string WorkspaceRootFor(string collectionDirectory) => WorkspaceRootAbove(collectionDirectory, CollectionFolders);
+
+    /// <summary>
+    /// The workspace folder for a file given on its own: the folder that holds <c>postman</c> for a file in
+    /// <c>postman/collections</c>, <c>postman/environments</c> or <c>postman/globals</c>, where the workspace keeps such
+    /// files; else the folder the file is in.
+    /// </summary>
+    public static string WorkspaceRootForFile(string file) => WorkspaceRootAbove(file, LayoutFolders);
+
+    private static string WorkspaceRootAbove(string path, string[] folders)
     {
-        var full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(collectionDirectory));
+        var full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
         var parent = Path.GetDirectoryName(full);
         var grandparent = parent is null ? null : Path.GetDirectoryName(parent);
         if (parent is not null && grandparent is not null
-            && Path.GetFileName(parent).Equals("collections", StringComparison.OrdinalIgnoreCase)
+            && folders.Contains(Path.GetFileName(parent), StringComparer.OrdinalIgnoreCase)
             && Path.GetFileName(grandparent).Equals("postman", StringComparison.OrdinalIgnoreCase)
             && Path.GetDirectoryName(grandparent) is { } root)
         {

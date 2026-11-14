@@ -1,5 +1,7 @@
+using System.Text;
 using Terminal.Gui.App;
 using Terminal.Gui.Input;
+using TermRest.Core.History;
 using TermRest.Core.Workspace;
 using TermRest.Tui.Theming;
 
@@ -20,8 +22,9 @@ public sealed class TuiOptions
 public static class TuiApp
 {
     /// <summary>
-    /// Main loop passes per second. Terminal.Gui's default of 25 handles input and repaints every 40 ms, which lags
-    /// behind the mouse; 60 keeps up while an idle pass stays well under a millisecond.
+    /// Main loop passes per second while the UI is in use (see <see cref="UiPace"/>). Terminal.Gui's default of 25 handles
+    /// input and repaints every 40 ms, which lags behind the mouse; 60 keeps up while an idle pass stays well under a
+    /// millisecond.
     /// </summary>
     internal const ushort IterationsPerSecond = 60;
 
@@ -30,14 +33,20 @@ public static class TuiApp
     {
         options ??= new TuiOptions();
         ConfigureKeyBindings();
-        Application.MaximumIterationsPerSecond = IterationsPerSecond;
-        using var timerResolution = TimerResolution.Request();
+        ApiWorkspace workspace;
+        try
+        {
+            workspace = ApiWorkspace.Open(workspacePath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 2;
+        }
 
-        var path = workspacePath;
         var requestedTheme = options.Theme;
         while (true)
         {
-            var workspace = ApiWorkspace.Open(path);
             var themeErrors = new List<string>();
             var theme = ResolveTheme(workspace, requestedTheme, themeErrors, out var found);
             if (!found && requestedTheme is not null)
@@ -49,30 +58,47 @@ public static class TuiApp
             using var runner = new RequestRunner(workspace) { StrictSslOverride = options.StrictSslOverride, RequireScriptRuntimes = false };
             runner.ConfigureHistory();
             runner.ConfigureScripts();
+            runner.ConfigureProxy();
+            runner.ConfigureFiles();
             using var app = Application.Create();
             app.Init(options.Driver);
             ThemeCatalog.Apply(theme);
             workspace.LoadErrors.AddRange(ThemeProblems(themeErrors));
             using var window = new MainWindow(workspace, runner);
+            using var pace = new UiPace(app, () => window.IsSending);
             app.Run(window, ex => ReportUnexpectedError(app, ex));
-            if (window.NextWorkspacePath is not { } next)
+            if (window.NextWorkspace is not { } next)
             {
                 return 0;
             }
 
-            path = next;
+            workspace = next;
             requestedTheme = null; // the --theme option applies to the first workspace; later ones use the saved choice
         }
     }
 
-    /// <summary>Keeps the UI alive after an unexpected exception: shows it and logs the details.</summary>
-    private static bool ReportUnexpectedError(IApplication app, Exception exception)
+    /// <summary>
+    /// Keeps the UI alive after an unexpected exception: logs the details and, given a UI (<paramref name="app"/>), shows
+    /// the error there.
+    /// </summary>
+    internal static bool ReportUnexpectedError(IApplication? app, Exception exception)
     {
-        var log = Path.Combine(Path.GetTempPath(), "termrest-errors.log");
         try
         {
-            File.AppendAllText(log, $"[{DateTimeOffset.Now:O}] {exception}{Environment.NewLine}{Environment.NewLine}");
-            Dialogs.Ui.Error(app, "Unexpected error", $"{exception.Message}\n\nDetails were written to {log}");
+            string? log;
+            try
+            {
+                log = LogUnexpectedError(exception);
+            }
+            catch (Exception)
+            {
+                log = null; // the error is shown all the same
+            }
+
+            if (app is not null)
+            {
+                Dialogs.Ui.Error(app, "Unexpected error", exception.Message + (log is null ? "" : $"\n\nDetails were written to {log}"));
+            }
         }
         catch (Exception)
         {
@@ -80,6 +106,30 @@ public static class TuiApp
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Appends <paramref name="exception"/> to <c>errors.log</c> in the user's state folder (see
+    /// <see cref="HistoryStore.DefaultStateDirectory"/>), which only the user can read; returns the log's path.
+    /// </summary>
+    internal static string LogUnexpectedError(Exception exception, string? stateDirectory = null)
+    {
+        var folder = stateDirectory ?? HistoryStore.DefaultStateDirectory();
+        var options = new FileStreamOptions { Mode = FileMode.Append, Access = FileAccess.Write, Share = FileShare.Read };
+        if (OperatingSystem.IsWindows())
+        {
+            Directory.CreateDirectory(folder); // in the user's profile: private already
+        }
+        else
+        {
+            Directory.CreateDirectory(folder, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        }
+
+        var log = Path.Combine(folder, "errors.log");
+        using var stream = new FileStream(log, options);
+        stream.Write(Encoding.UTF8.GetBytes($"[{DateTimeOffset.Now:O}] {exception}{Environment.NewLine}{Environment.NewLine}"));
+        return log;
     }
 
     /// <summary>
@@ -117,7 +167,13 @@ public static class TuiApp
     internal static ColorTheme ResolveTheme(ApiWorkspace workspace, string? requested, List<string> errors, out bool found, string? userDirectory = null)
     {
         var themes = ThemeCatalog.Load(workspace.RootPath, errors, userDirectory);
-        var name = ThemeCatalog.SelectedName(requested, workspace.Settings, UserSettings.Load(userDirectory));
+        var user = UserSettings.Load(userDirectory);
+        if (user.LoadError is { } problem && !workspace.LoadErrors.Contains(problem))
+        {
+            workspace.LoadErrors.Add(problem); // the defaults apply then, and the file is not saved over
+        }
+
+        var name = ThemeCatalog.SelectedName(requested, workspace.Settings, user);
         found = name is null || ThemeCatalog.Find(themes, name) is not null;
         return ThemeCatalog.Resolve(name, themes, errors);
     }
@@ -139,6 +195,8 @@ public static class TuiApp
 
         using var runner = new RequestRunner(workspace) { RequireScriptRuntimes = false };
         runner.ConfigureScripts();
+        runner.ConfigureProxy();
+        runner.ConfigureFiles();
         using var app = Application.Create();
         app.Init(Terminal.Gui.Drivers.DriverRegistry.Names.ANSI);
         app.Driver!.SetScreenSize(width, height);

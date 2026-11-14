@@ -1,6 +1,8 @@
+using Terminal.Gui.Input;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using TermRest.Core.Model;
+using TermRest.Tui.Dialogs;
 
 namespace TermRest.Tui.Views;
 
@@ -34,6 +36,10 @@ internal sealed class AuthEditor : View
         Height = Dim.Fill();
         _types = new ListView { X = 0, Y = 0, Width = 28, Height = Dim.Fill() };
         _types.SetSource(_labels);
+
+        // ListView's Ctrl+N (down) would change the auth type instead of the window's New request; Ctrl+P (up) goes with it.
+        _types.KeyBindings.Remove(Key.N.WithCtrl);
+        _types.KeyBindings.Remove(Key.P.WithCtrl);
         _types.ValueChanged += (_, e) =>
         {
             if (!_loading && e.NewValue is int index)
@@ -51,6 +57,15 @@ internal sealed class AuthEditor : View
     public Func<string>? DescribeInherited { get; set; }
 
     public AuthSpec? Auth => _auth;
+
+    /// <summary>Describes again the auth the request inherits (it was added to a collection, or moved to another folder).</summary>
+    public void RefreshInherited()
+    {
+        if (_auth is null)
+        {
+            BuildFields();
+        }
+    }
 
     public void Load(AuthSpec? auth)
     {
@@ -141,7 +156,8 @@ internal sealed class AuthEditor : View
         var y = 0;
         void Note(string text)
         {
-            _fields.Add(new Label { Text = text, X = 0, Y = y, Width = Dim.Fill() });
+            // A note may name a folder or a collection (the auth inherited from it): shown as written.
+            _fields.Add(new Label { HotKeySpecifier = Ui.NoHotKey, Text = text, X = 0, Y = y, Width = Dim.Fill() });
             y += 2;
         }
 
@@ -203,15 +219,15 @@ internal sealed class AuthEditor : View
                 Field("Domain", "domain");
                 break;
             case "bearer":
-                Field("Token", "token");
+                Field("Token", "token", secret: true);
                 break;
             case "apikey":
                 Field("Key", "key");
-                Field("Value", "value");
+                Field("Value", "value", secret: true);
                 Choice("Add to", "in", ["header", "query"], ["Header", "Query params"]);
                 break;
             case "oauth2":
-                Field("Access token", "accessToken");
+                Field("Access token", "accessToken", secret: true);
                 Field("Header prefix", "headerPrefix");
                 Choice("Add token to", "addTokenTo", ["header", "queryParams"], ["Header", "Query params"]);
                 Note("Paste a token; built-in token acquisition (incl. Entra ID with certificates) is on the roadmap.");

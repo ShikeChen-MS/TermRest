@@ -1,8 +1,8 @@
 using System.CommandLine;
-using System.Text;
 using System.Text.Json;
 using TermRest.Core.Http;
 using TermRest.Core.Postman;
+using TermRest.Core.Recording;
 using TermRest.Core.Workspace;
 
 namespace TermRest.Cli;
@@ -35,17 +35,24 @@ internal static class RunCommand
                 return 2;
             }
 
-            if (options.Open(parseResult, path, insecure) is not { Collection: { } target } opened)
+            if (options.Open(parseResult, path, insecure) is not { } opened)
             {
-                if (Directory.Exists(path))
-                {
-                    Output.Error($"'{path}' is not a Postman v3 collection folder; pass the collection itself.");
-                }
-
                 return 2;
             }
 
             using var runner = opened.Runner;
+            if (opened.Collection is not { } target)
+            {
+                // A workspace folder: send finds a request in any of its collections, but run needs one.
+                Output.Error($"'{path}' is not a Postman v3 collection folder; pass the collection itself.");
+                return 2;
+            }
+
+            if (RequestOptions.ReportUnreadableSettings(opened.Workspace))
+            {
+                return 1;
+            }
+
             FolderNode root = target.RootNode;
             if (parseResult.GetValue(folder) is { } folderPath)
             {
@@ -69,7 +76,8 @@ internal static class RunCommand
             Output.Info($"Running {requests.Count} request(s) from '{target.Name}'{(root is CollectionRootNode ? "" : " / " + root.PathInCollection)}" +
                         $"{(runner.Environment is { } env ? $" with environment '{env.Name}'" : "")}\n");
 
-            var results = new List<(RequestNode Node, HttpExchange Exchange, bool Passed)>();
+            var reportPath = parseResult.GetValue(json);
+            var results = new RunResults(reportPath is null ? null : new Redactor(opened.Workspace.Settings.RecordingRedact));
             var notesShown = new HashSet<string>(StringComparer.Ordinal);
             var cancelled = false;
             foreach (var node in requests)
@@ -83,7 +91,6 @@ internal static class RunCommand
 
                 // Passing means a response (not an HTTP error, unless allowed), passing tests and no script errors.
                 var passed = exchange.Response is { } r && (parseResult.GetValue(allowHttpErrors) || r.StatusCode < 400) && exchange.Scripts?.Succeeded != false;
-                results.Add((node, exchange, passed));
                 var status = exchange.Response is { } response ? response.StatusCode.ToString(System.Globalization.CultureInfo.InvariantCulture) : "ERR";
                 Output.Status($"{(passed ? "✓" : "✗")} {status,-4} {HttpExchange.Format(exchange.Timing.Total),9}  {exchange.Request.Method,-7} {node.PathInCollection}", passed);
                 if (exchange.Response is null)
@@ -97,27 +104,21 @@ internal static class RunCommand
                 }
 
                 ScriptOutput.Print(exchange, "      ", notesShown);
+                results.Add(node, exchange, passed);
                 if (!passed && parseResult.GetValue(bail))
                 {
                     break;
                 }
             }
 
-            var failed = results.Count(r => !r.Passed);
-            var tests = results.SelectMany(r => r.Exchange.Scripts?.Tests ?? []).ToList();
-            var testSummary = tests.Count == 0 ? "" : $" (tests: {tests.Count(t => t.Passed)} passed, {tests.Count(t => !t.Passed)} failed)";
-            Output.Info($"\n{(cancelled ? "Run cancelled. " : "")}{results.Count - failed} passed, {failed} failed, {requests.Count - results.Count} skipped{testSummary}");
+            var testSummary = results.TestsPassed + results.TestsFailed == 0 ? "" : $" (tests: {results.TestsPassed} passed, {results.TestsFailed} failed)";
+            Output.Info($"\n{(cancelled ? "Run cancelled. " : "")}{results.Count - results.Failed} passed, {results.Failed} failed, {requests.Count - results.Count} skipped{testSummary}");
+            var unreadable = RequestOptions.ReportUnreadableFiles(target);
 
-            // A cancelled run still saves what it recorded.
-            var recorded = options.SaveRecording(parseResult, runner, recorder);
-            if (parseResult.GetValue(json) is { } reportPath)
-            {
-                // Not tied to the cancellation token: a cancelled run still reports what it did.
-                await File.WriteAllTextAsync(reportPath, BuildReport(target, results), CancellationToken.None);
-                Output.Info($"Report written to {reportPath}");
-            }
-
-            return cancelled ? 130 : failed == 0 && recorded ? 0 : 1;
+            // A cancelled run still saves what it recorded, and reports what it did (not tied to the cancellation token).
+            var recorded = options.SaveRecording(parseResult, runner, recorder, cancellationToken.IsCancellationRequested);
+            var reported = reportPath is null || await WriteReportAsync(reportPath, results.ToJson(target));
+            return cancelled ? 130 : results.Failed == 0 && recorded && reported && !unreadable ? 0 : 1;
         });
 
         return command;
@@ -142,65 +143,160 @@ internal static class RunCommand
         }
     }
 
-    private static string BuildReport(PostmanCollection collection, List<(RequestNode Node, HttpExchange Exchange, bool Passed)> results)
+    /// <summary>
+    /// What a run did: counts and, for <c>--report-json</c>, what the report says of each request. Exchanges are not kept:
+    /// each holds its response body (up to the maximum response size), and a run's memory must not grow with every
+    /// response it receives.
+    /// </summary>
+    /// <param name="secrets">What the report redacts; null when there is no report.</param>
+    private sealed class RunResults(Redactor? secrets)
     {
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
+        private readonly List<ReportEntry> _entries = [];
+
+        public int Count { get; private set; }
+
+        public int Failed { get; private set; }
+
+        public int TestsPassed { get; private set; }
+
+        public int TestsFailed { get; private set; }
+
+        public void Add(RequestNode node, HttpExchange exchange, bool passed)
         {
-            writer.WriteStartObject();
-            writer.WriteString("collection", collection.Name);
-            writer.WriteString("finishedAt", DateTimeOffset.Now);
-            writer.WriteNumber("passed", results.Count(r => r.Passed));
-            writer.WriteNumber("failed", results.Count(r => !r.Passed));
-            writer.WriteStartArray("results");
-            foreach (var (node, exchange, passed) in results)
+            Count++;
+            Failed += passed ? 0 : 1;
+            TestsPassed += exchange.Scripts?.Passed ?? 0;
+            TestsFailed += exchange.Scripts?.Failed ?? 0;
+            if (secrets is null)
+            {
+                return;
+            }
+
+            // Secrets are redacted as in recordings, since reports are kept as CI artifacts: auth credentials, secret
+            // variables and variables named like credentials, URL passwords, and the values a recording redacts by name
+            // (a token in a response, a cookie), wherever they appear, also in the requests that follow.
+            var redact = secrets.ForReport(exchange);
+            var response = exchange.Response;
+            var scripts = exchange.Scripts;
+            _entries.Add(new ReportEntry(
+                node.PathInCollection,
+                exchange.Request.Method,
+                redact.Url(exchange.Request.Url, "url"),
+                passed,
+                response?.StatusCode,
+                response?.Body.LongLength ?? 0,
+                response is null && exchange.ErrorMessage is { } message ? redact.Text(message, "error") : null,
+                scripts?.Tests.Select(t => new ReportTest(redact.Text(t.Name, "tests"), t.Passed, t.Error is null ? null : redact.Text(t.Error, "tests"))).ToList(),
+                scripts?.Error is { } error ? redact.Text(error.ToString(), "scripts") : null,
+                exchange.Timing.Total?.TotalMilliseconds ?? 0));
+        }
+
+        /// <summary>The JSON report (UTF-8).</summary>
+        public byte[] ToJson(PostmanCollection collection)
+        {
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
             {
                 writer.WriteStartObject();
-                writer.WriteString("request", node.PathInCollection);
-                writer.WriteString("method", exchange.Request.Method);
-                writer.WriteString("url", exchange.Request.Url);
-                writer.WriteBoolean("passed", passed);
-                if (exchange.Response is { } response)
+                writer.WriteString("collection", collection.Name);
+                writer.WriteString("finishedAt", DateTimeOffset.Now);
+                writer.WriteNumber("passed", Count - Failed);
+                writer.WriteNumber("failed", Failed);
+                writer.WriteStartArray("results");
+                foreach (var entry in _entries)
                 {
-                    writer.WriteNumber("status", response.StatusCode);
-                    writer.WriteNumber("bytes", response.Body.LongLength);
-                }
-                else
-                {
-                    writer.WriteString("error", exchange.ErrorMessage);
-                }
-
-                if (exchange.Scripts is { } scripts)
-                {
-                    writer.WriteStartArray("tests");
-                    foreach (var test in scripts.Tests)
+                    writer.WriteStartObject();
+                    writer.WriteString("request", entry.Request);
+                    writer.WriteString("method", entry.Method);
+                    writer.WriteString("url", entry.Url);
+                    writer.WriteBoolean("passed", entry.Passed);
+                    if (entry.Status is { } status)
                     {
-                        writer.WriteStartObject();
-                        writer.WriteString("name", test.Name);
-                        writer.WriteBoolean("passed", test.Passed);
-                        if (test.Error is not null)
+                        writer.WriteNumber("status", status);
+                        writer.WriteNumber("bytes", entry.Bytes);
+                    }
+                    else
+                    {
+                        writer.WriteString("error", entry.Error);
+                    }
+
+                    if (entry.Tests is { } tests)
+                    {
+                        writer.WriteStartArray("tests");
+                        foreach (var test in tests)
                         {
-                            writer.WriteString("error", test.Error);
+                            writer.WriteStartObject();
+                            writer.WriteString("name", test.Name);
+                            writer.WriteBoolean("passed", test.Passed);
+                            if (test.Error is not null)
+                            {
+                                writer.WriteString("error", test.Error);
+                            }
+
+                            writer.WriteEndObject();
                         }
 
-                        writer.WriteEndObject();
+                        writer.WriteEndArray();
+                        if (entry.ScriptError is { } scriptError)
+                        {
+                            writer.WriteString("scriptError", scriptError);
+                        }
                     }
 
-                    writer.WriteEndArray();
-                    if (scripts.Error is { } error)
-                    {
-                        writer.WriteString("scriptError", error.ToString());
-                    }
+                    writer.WriteNumber("totalMs", entry.TotalMs);
+                    writer.WriteEndObject();
                 }
 
-                writer.WriteNumber("totalMs", exchange.Timing.Total?.TotalMilliseconds ?? 0);
+                writer.WriteEndArray();
                 writer.WriteEndObject();
             }
 
-            writer.WriteEndArray();
-            writer.WriteEndObject();
+            return stream.ToArray();
+        }
+    }
+
+    /// <summary>What the report says of one request, redacted. <see cref="Status"/> is null when there was no response (see <see cref="Error"/>).</summary>
+    private sealed record ReportEntry(
+        string Request, string Method, string Url, bool Passed, int? Status, long Bytes, string? Error, List<ReportTest>? Tests, string? ScriptError, double TotalMs);
+
+    private sealed record ReportTest(string Name, bool Passed, string? Error);
+
+    /// <summary>
+    /// Writes the report, readable only by the user on Unix as recordings are; missing folders are created. Returns false
+    /// when it could not be written (reported).
+    /// </summary>
+    private static async Task<bool> WriteReportAsync(string path, byte[] report)
+    {
+        try
+        {
+            if (Path.GetDirectoryName(Path.GetFullPath(path)) is { Length: > 0 } directory)
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            var options = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
+            if (!OperatingSystem.IsWindows())
+            {
+                options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            }
+
+            await using (var file = new FileStream(path, options))
+            {
+                await file.WriteAsync(report);
+            }
+
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite); // a file that existed keeps its mode otherwise
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            Output.Error($"The report could not be written to {path}: {ex.Message}");
+            return false;
         }
 
-        return Encoding.UTF8.GetString(stream.ToArray());
+        Output.Info($"Report written to {path}");
+        return true;
     }
 }

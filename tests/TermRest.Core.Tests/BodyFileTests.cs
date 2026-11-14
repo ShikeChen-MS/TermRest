@@ -102,6 +102,18 @@ public sealed class BodyFileTests
     }
 
     [Fact]
+    public void Xml_is_read_in_the_legacy_encoding_its_declaration_names()
+    {
+        // .NET knows these only from its code pages.
+        Assert.Null(Check(Write("jp.xml", [.. "<?xml version='1.0' encoding='Shift_JIS'?>\n<a>"u8, 0x93, 0xFA, 0x96, 0x7B, .. "</a>"u8]), "xml"));
+        Assert.Contains(
+            "The 'a' start tag on line 2 position 2 does not match the end tag of 'b'",
+            Check(Write("bad.xml", [.. "<?xml version=\"1.0\" encoding=\"ISO-8859-15\"?>\n<a>"u8, 0xA4, .. "</b>"u8]), "xml"),
+            StringComparison.Ordinal);
+        Assert.StartsWith("odd.xml is not well-formed XML: System does not support 'x-odd' encoding", Check(Write("odd.xml", "<?xml version=\"1.0\" encoding=\"x-odd\"?><a/>"), "xml"), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Text_types_turn_down_binary_and_utf16_files()
     {
         Assert.Null(Check(Write("notes.txt", "plain text\n"), "text"));

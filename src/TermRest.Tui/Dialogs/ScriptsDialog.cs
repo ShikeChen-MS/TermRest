@@ -18,7 +18,7 @@ internal static class ScriptsDialog
     /// </summary>
     public static ScriptSet? Edit(IApplication app, string owner, ScriptSet scripts, string defaultLanguage)
     {
-        using var dialog = new Dialog { Title = $"Scripts of {owner}", Width = Dim.Percent(90), Height = Dim.Percent(80) };
+        using var dialog = new Dialog { HotKeySpecifier = Ui.NoHotKey, Title = $"Scripts of {owner}", Width = Dim.Percent(90), Height = Dim.Percent(80) };
         dialog.Add(new Label
         {
             X = 1,
@@ -101,7 +101,9 @@ internal static class ScriptsDialog
         var clear = new Button { Text = "Clear values", X = Pos.AnchorEnd(18), Y = y };
         dialog.Add(new Label { Text = "This session", X = 1, Y = y }, session, clear);
         y += 1;
-        var running = new Label { X = 14, Y = y, Width = Dim.Fill(22) };
+
+        // A runtime may be named after its file (my_node): an underscore must not make a key that presses Stop scripts.
+        var running = new Label { X = 14, Y = y, Width = Dim.Fill(22), HotKeySpecifier = Ui.NoHotKey };
         var stop = new Button { Text = "Stop scripts", X = Pos.AnchorEnd(18), Y = y };
         dialog.Add(running, stop);
 
@@ -142,7 +144,7 @@ internal static class ScriptsDialog
         }
 
         user.SetScriptLanguageOrder(rows.Select(r => r.Language));
-        user.Save(userDirectory);
+        Ui.TrySave(app, () => user.Save(userDirectory)); // applied for this session either way
         foreach (var language in ScriptLanguage.All)
         {
             runner.SetRuntime(language, user.GetScriptRuntime(language, workspace.RootPath));
@@ -198,6 +200,7 @@ internal static class ScriptsDialog
         {
             X = Pos.Right(check) + 2,
             Width = Dim.Fill(1),
+            HotKeySpecifier = Ui.NoHotKey, // paths and versions
             Text = current.Length == 0 ? $"None chosen: {ScriptLanguage.Label(language)} scripts do not run." : "",
         };
         dialog.Add(find, check, status);
@@ -234,7 +237,7 @@ internal static class ScriptsDialog
 
         async Task<(string, string?)> Describe(string runtime)
         {
-            var (ok, message) = await ScriptRuntimeLocator.CheckAsync(language, runner.ResolveRuntime(runtime), workspace.RootPath).ConfigureAwait(false);
+            var (ok, message) = await ScriptRuntimeLocator.CheckAsync(language, runner.ResolveRuntime(runtime)).ConfigureAwait(false);
             return ((ok ? "✓ " : "✗ ") + message, null);
         }
 
@@ -243,7 +246,11 @@ internal static class ScriptsDialog
             if (Ui.PickFile(app, $"Choose {name}", workspace.RootPath) is { } path)
             {
                 var relative = Path.GetRelativePath(workspace.RootPath, path);
-                field.Text = relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative) ? path : relative;
+
+                // A name alone (bun.exe, in the workspace's own folder) would be a command, looked for on PATH.
+                field.Text = relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative) ? path
+                    : relative.IndexOfAny(['/', '\\']) < 0 ? "." + Path.DirectorySeparatorChar + relative
+                    : relative;
                 var chosen = field.Text;
                 Run(() => Describe(chosen));
             }
@@ -272,7 +279,7 @@ internal static class ScriptsDialog
                 }, null);
             }
 
-            return ("✓ " + found.Description, found.Runtime);
+            return ((found.Checked ? "✓ " : "") + found.Description, found.Runtime);
         }));
         return new RuntimeRow(language, label, field, browse, up, down, find, check, status);
     }

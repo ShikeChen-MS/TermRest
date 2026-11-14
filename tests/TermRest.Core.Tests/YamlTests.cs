@@ -126,6 +126,60 @@ public class YamlTests
         Assert.True(JsonNode.DeepEquals(changed, YamlFile.Parse(text).Json));
     }
 
+    [Fact]
+    public void Comments_inside_an_edited_block_stay_with_their_entries()
+    {
+        const string source = """
+            headers:
+              # used by the gateway
+              X-Api-Key: abc
+
+              # content negotiation
+              Accept: application/json
+            queryParams:
+              # paging
+              - key: limit
+                value: '50'
+              # from the previous page
+              - key: cursor
+                value: x
+            order: 1000
+
+            """;
+        var file = YamlFile.Parse(source.ReplaceLineEndings("\n"));
+        var changed = (JsonObject)file.Json.DeepClone();
+        changed["headers"]!["Accept"] = "application/xml";
+        changed["queryParams"]![1]!["value"] = "y";
+
+        Assert.Equal(
+            source.ReplaceLineEndings("\n").Replace("Accept: application/json", "Accept: application/xml", StringComparison.Ordinal).Replace("value: x", "value: y", StringComparison.Ordinal),
+            file.Render(changed, YamlStyle.Default));
+
+        // Removed entries and items take their comments along; the others keep theirs.
+        ((JsonObject)changed["headers"]!).Remove("X-Api-Key");
+        ((JsonArray)changed["queryParams"]!).RemoveAt(0);
+        Assert.Equal(
+            "headers:\n\n  # content negotiation\n  Accept: application/xml\nqueryParams:\n  # from the previous page\n  - key: cursor\n    value: y\norder: 1000\n",
+            file.Render(changed, YamlStyle.Default));
+
+        // A blank line after a value that becomes a block scalar would become part of its text: it is dropped.
+        var blocks = YamlFile.Parse("headers:\n  A: x\n\n  B: y\nnote: x\n\nlast: z\n");
+        var edited = (JsonObject)blocks.Json.DeepClone();
+        edited["headers"]!["A"] = "two\nlines\n\n";
+        edited["note"] = "two\nlines\n\n";
+        var text = blocks.Render(edited, YamlStyle.Default);
+        Assert.True(JsonNode.DeepEquals(edited, YamlFile.Parse(text).Json), text);
+
+        // Comments after a block scalar stay, moved left of its text when needed; so do blank lines it does not keep.
+        var commented = YamlFile.Parse("body: x\n\n# next part\nnote: x\n\n    # deep\nlast: z\n");
+        var rewritten = (JsonObject)commented.Json.DeepClone();
+        rewritten["body"] = "two\nlines\n";
+        rewritten["note"] = "two\nlines\n\n";
+        var rendered = commented.Render(rewritten, YamlStyle.Default);
+        Assert.Equal("body: |\n  two\n  lines\n\n# next part\nnote: |+\n  two\n  lines\n\n# deep\nlast: z\n", rendered);
+        Assert.True(JsonNode.DeepEquals(rewritten, YamlFile.Parse(rendered).Json), rendered);
+    }
+
     [Theory]
     [InlineData("plain text")]
     [InlineData("")]
@@ -152,6 +206,8 @@ public class YamlTests
     [InlineData("line1\n\n\n")]
     [InlineData("\nstarts with a break")]
     [InlineData("  indented first line\nsecond")]
+    [InlineData("  \n{\n  \"name\": \"x\"\n}")]
+    [InlineData("    \nfirst line of only spaces")]
     [InlineData("ends with spaces\n   ")]
     [InlineData("tab\there")]
     [InlineData("crlf\r\nline")]
@@ -163,6 +219,8 @@ public class YamlTests
     [InlineData("@at")]
     [InlineData("`tick")]
     [InlineData("12:30")]
+    [InlineData("Accept *")]
+    [InlineData("a *b")]
     public void Written_strings_read_back_unchanged(string value)
     {
         foreach (var style in (YamlStyle[])[YamlStyle.Default, new YamlStyle(PreferSingleQuotes: true)])
@@ -171,6 +229,7 @@ public class YamlTests
             {
                 ["value"] = value,
                 ["list"] = new JsonArray(value, new JsonObject { ["nested"] = value }),
+                ["map"] = new JsonObject { [value] = "as a key" },
             };
 
             var text = YamlFile.Write(root, style);
@@ -250,11 +309,56 @@ public class YamlTests
     }
 
     [Fact]
+    public void A_value_starting_with_an_empty_line_reads_as_postman_writes_it()
+    {
+        // Postman's YAML library writes the first, empty line of such a block with the block's indentation.
+        const string Text = "scripts:\n  - type: afterResponse\n    code: |\n      \n      pm.test('ok', () => {});\n"
+                            + "variables:\n  product: |-\n    \n\n    Insurance\n  newline: |+\n    \n  after: x\n";
+        var file = YamlFile.Parse(Text);
+
+        Assert.Equal("\npm.test('ok', () => {});\n", file.Json["scripts"]![0]!["code"]!.GetValue<string>());
+        Assert.Equal(("\n\nInsurance", "\n", "x"),
+            (file.Json["variables"]!["product"]!.GetValue<string>(), file.Json["variables"]!["newline"]!.GetValue<string>(), file.Json["variables"]!["after"]!.GetValue<string>()));
+
+        // An edit elsewhere keeps those lines as they are.
+        var edited = (JsonObject)file.Json.DeepClone();
+        edited["variables"]!["after"] = "y";
+        Assert.Equal(Text[..^"x\n".Length] + "y\n", file.Render(edited, YamlStyle.Detect([file.Tree])));
+    }
+
+    [Fact]
+    public void Deeply_nested_yaml_is_reported_instead_of_overflowing_the_stack()
+    {
+        Assert.ThrowsAny<FormatException>(() => YamlFile.Parse("url: " + new string('[', 100_000)));
+        Assert.ThrowsAny<FormatException>(() => YamlFile.Parse(string.Concat(Enumerable.Range(0, 300).Select(i => new string(' ', i) + "a:\n"))));
+
+        var node = YamlFile.Parse("a: " + new string('[', 200) + new string(']', 200)).Json["a"];
+        var depth = 0;
+        while (node is JsonArray array)
+        {
+            depth++;
+            node = array.Count > 0 ? array[0] : null;
+        }
+
+        Assert.Equal(200, depth);
+    }
+
+    [Fact]
     public void Json_equality_ignores_key_order_and_number_spelling()
     {
         // The writer relies on these semantics to decide what changed.
         Assert.True(JsonNode.DeepEquals(new JsonObject { ["a"] = 1, ["b"] = 2 }, new JsonObject { ["b"] = 2, ["a"] = 1 }));
         Assert.True(JsonNode.DeepEquals(YamlFile.Parse("a: 1000").Json, new JsonObject { ["a"] = 1000 }));
+    }
+
+    [Fact]
+    public void Integers_too_big_for_a_long_keep_their_digits()
+    {
+        var huge = "1" + new string('0', 309); // beyond even a double
+        var json = YamlFile.Parse($"a: {huge}\nb: -{huge}\nc: 12345678901234567890\n").Json;
+
+        Assert.Equal([huge, "-" + huge, "12345678901234567890"], json.Select(p => p.Value!.ToJsonString()));
+        Assert.Equal($"a: {huge}\n", YamlFile.Write(new JsonObject { ["a"] = json["a"]!.DeepClone() }, YamlStyle.Default));
     }
 
     // ----- wrapping long values ------------------------------------------------------------------------
@@ -471,6 +575,12 @@ public class YamlTests
         string.Concat(Enumerable.Repeat("\\x", 120)),
         "escapes right after a space \u0001\u0002 " + string.Join(" \u0003", Enumerable.Repeat("ab", 40)),
         string.Join(' ', Enumerable.Repeat("\u0007\u0008\u001b", 40)),
+
+        // A line of a single space (a leading and a trailing space at once), and a line of only white space after a
+        // more-indented one: Postman's library writes both so that they read back changed.
+        "pm.test('status', () => {\n \n  pm.response.to.have.status(200);\n});\n  ",
+        "// " + string.Join(' ', Enumerable.Repeat("word", 25)) + "\nif (a) {\n  x();\n  \n}\n",
+        "// " + string.Join(' ', Enumerable.Repeat("word", 25)) + "\nif (a) {\n\tx();\n\n\t\n}\n",
     ];
 
     [Theory]
@@ -500,6 +610,46 @@ public class YamlTests
                 var parsed = YamlFile.Parse(text).Json;
 
                 Assert.True(JsonNode.DeepEquals(root, parsed), $"width {width}:\n{text}\n→ {parsed.ToJsonString()}");
+            }
+        }
+    }
+
+    [Fact]
+    public void Text_that_yaml_reads_as_a_number_of_any_size_is_quoted()
+    {
+        // Postman's library reads these as numbers (an Ethereum address as 1.2488751460129641e+48): they must stay text.
+        var root = new JsonObject
+        {
+            ["address"] = "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+            ["octal"] = "0o" + new string('7', 30),
+            ["huge"] = "1e400",
+            ["plain"] = "0xyz",
+        };
+
+        var text = YamlFile.Write(root, YamlStyle.Default);
+
+        Assert.DoesNotContain("address: 0x", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("octal: 0o", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("huge: 1e400", text, StringComparison.Ordinal);
+        Assert.Contains("plain: 0xyz", text, StringComparison.Ordinal);
+        Assert.True(JsonNode.DeepEquals(root, YamlFile.Parse(text).Json), text);
+    }
+
+    [Fact]
+    public void Wrapping_never_splits_a_character_outside_the_bmp()
+    {
+        // A double-quoted value without spaces is broken with an escaped line break, never between the halves of an emoji:
+        // UTF-8 can't hold them apart (they would be written as U+FFFD).
+        for (var shift = 0; shift < 4; shift++)
+        {
+            var root = new JsonObject { ["url"] = "{{baseUrl}}/v1/widgets?name=" + new string('a', shift) + string.Concat(Enumerable.Repeat("😀b", 80)) };
+            foreach (var width in (int[])[20, 40, 80])
+            {
+                var text = YamlFile.Write(root, new YamlStyle(false).WithLineWidth(width));
+
+                Assert.Contains("\\\n", text, StringComparison.Ordinal);
+                Assert.Equal(text, System.Text.Encoding.UTF8.GetString(System.Text.Encoding.UTF8.GetBytes(text)));
+                Assert.True(JsonNode.DeepEquals(root, YamlFile.Parse(text).Json), text);
             }
         }
     }

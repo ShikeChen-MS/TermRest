@@ -50,7 +50,7 @@ internal static class RecordingDialog
             : $"{requests} recorded since {recorder.StartedAt:HH:mm:ss} ({Duration(DateTimeOffset.Now - recorder.StartedAt)}), {HttpExchange.FormatSize(recorder.Bytes)} so far.";
         var redactions = recorder.IsRecovered || recorder.Redactions == 0 ? "" : $" ({recorder.Redactions.ToString(CultureInfo.InvariantCulture)} values)";
         dialog.Add(
-            new Label { Text = summary, X = 1, Y = 1, Width = Dim.Fill(1) },
+            new Label { Text = summary, X = 1, Y = 1, Width = Dim.Fill(1), HotKeySpecifier = Ui.NoHotKey },
             new Label { Text = $"Secrets are redacted{redactions}: credentials, cookies, tokens and secret variables read {Redactor.Placeholder}.", X = 1, Y = 2, Width = Dim.Fill(1) });
         if (recorder.RequestsWithFiles is var withFiles and > 0)
         {
@@ -59,14 +59,14 @@ internal static class RecordingDialog
         }
         var path = Ui.AddRow(dialog, "Save as", new TextField { Text = defaultPath, Width = Dim.Fill(13) }, 4, 8);
         var browse = new Button { Text = "Browse…", X = Pos.AnchorEnd(12), Y = 4 };
-        browse.Accepted += (_, _) =>
+        Ui.OnPress(browse, () =>
         {
             var folder = Path.GetDirectoryName(path.Text.Trim());
             if (Ui.PickSaveFile(app, "Save recording as", folder) is { } chosen)
             {
                 path.Text = Path.HasExtension(chosen) ? chosen : chosen + ".har";
             }
-        };
+        });
         dialog.Add(
             browse,
             new Label { Text = "JSON in HAR 1.2 format (HTTP Archive): opens in browser dev tools and HAR viewers.", X = 10, Y = 5, Width = Dim.Fill(1) });

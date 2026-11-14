@@ -132,6 +132,74 @@ public static class PostmanUrl
         return queryIndex >= 0 ? s[..queryIndex] : s;
     }
 
+    /// <summary>Where the user info of <paramref name="raw"/> is (user:password in https://user:password@host), as <see cref="Parse"/> reads it.</summary>
+    public static (int Start, int Length)? FindUserInfo(string raw)
+    {
+        var s = StripQueryAndHash(raw.TrimStart());
+        var offset = raw.Length - raw.TrimStart().Length;
+        var protocol = s.IndexOf("://", StringComparison.Ordinal);
+        if (protocol > 0 && !s[..protocol].Contains('/', StringComparison.Ordinal))
+        {
+            offset += protocol + 3;
+            s = s[(protocol + 3)..];
+        }
+
+        var slash = IndexOutsideBraces(s, '/');
+        var at = LastIndexOutsideBraces(slash >= 0 ? s[..slash] : s, '@');
+        return at < 0 ? null : (offset, at);
+    }
+
+    /// <summary>Where the password of <paramref name="raw"/>'s user info is (https://user:password@host), as <see cref="Parse"/> reads it.</summary>
+    public static (int Start, int Length)? FindPassword(string raw)
+    {
+        if (FindUserInfo(raw) is not var (start, length))
+        {
+            return null;
+        }
+
+        var colon = raw.IndexOf(':', start, length);
+        return colon < 0 ? null : (colon + 1, start + length - colon - 1);
+    }
+
+    /// <summary>
+    /// <paramref name="raw"/> with the password of its user info (see <see cref="FindPassword"/>) masked as <c>***</c>; with
+    /// <paramref name="isSecret"/>, only a password it says is one.
+    /// </summary>
+    public static string MaskPassword(string raw, Func<string, bool>? isSecret = null) =>
+        FindPassword(raw) is var (start, length) && length > 0 && raw.AsSpan(start, length) is not "***"
+        && (isSecret is null || isSecret(raw.Substring(start, length)))
+            ? string.Concat(raw.AsSpan(0, start), "***", raw.AsSpan(start + length))
+            : raw;
+
+    /// <summary>
+    /// <paramref name="raw"/> with the credential of its user info masked as <c>***</c>: the password
+    /// (https://user:password@host), or the user name when there is no password (https://user@host, https://user:@host: it
+    /// is then the credential); with <paramref name="isSecret"/>, only a value it says is one.
+    /// </summary>
+    public static string MaskCredentials(string raw, Func<string, bool>? isSecret = null)
+    {
+        var parsed = Parse(raw);
+        if (!string.IsNullOrEmpty(parsed.AuthPassword) || parsed.AuthUser is not { Length: > 0 } user || user == "***" || isSecret?.Invoke(user) == false)
+        {
+            return MaskPassword(raw, isSecret);
+        }
+
+        // The user name starts the authority, after the scheme.
+        var start = raw.Length - raw.TrimStart().Length + (parsed.Protocol is { } protocol ? protocol.Length + 3 : 0);
+        return raw.AsSpan(start).StartsWith(user, StringComparison.Ordinal)
+            ? string.Concat(raw.AsSpan(0, start), "***", raw.AsSpan(start + user.Length))
+            : raw;
+    }
+
+    /// <summary>Where the path of <paramref name="raw"/> (a URL without query and fragment) starts, as <see cref="Parse"/> reads it: its first '/', or -1.</summary>
+    public static int PathStart(string raw)
+    {
+        var start = raw.IndexOf("://", StringComparison.Ordinal);
+        start = start > 0 && !raw.AsSpan(0, start).Contains('/') ? start + 3 : 0;
+        var slash = IndexOutsideBraces(raw[start..], '/');
+        return slash < 0 ? -1 : start + slash;
+    }
+
     public static string? GetHash(string raw)
     {
         var hashIndex = IndexOutsideBraces(raw, '#');

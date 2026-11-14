@@ -61,8 +61,23 @@ public class FolderNode : CollectionNode
 
     public List<CollectionNode> Children { get; } = [];
 
-    /// <summary>Folder-level auth; null means inherit.</summary>
-    public AuthSpec? Auth => PostmanRequestMapper.ReadAuth(Json["auth"], Collection.SchemaVersion);
+    /// <summary>Folder-level auth; null means inherit. A v3 folder's credential sets come with it (see <see cref="AuthSpec.CredentialSets"/>).</summary>
+    public AuthSpec? Auth
+    {
+        get
+        {
+            var auth = PostmanRequestMapper.ReadAuth(Json["auth"], Collection.SchemaVersion);
+            if (auth is not null && Json[V3.V3Convert.AuthSetsProperty] is JsonArray sets)
+            {
+                auth.CredentialSets = [.. sets.OfType<JsonObject>().Select(set => new CredentialSet(
+                    set["name"].GetString() ?? "",
+                    [.. (set["rules"] as JsonArray ?? []).OfType<JsonObject>().Select(rule => KeyValuePair.Create(rule["key"].GetString() ?? "", rule["value"].GetString() ?? ""))],
+                    PostmanRequestMapper.ReadAuth(set["auth"], Collection.SchemaVersion)))];
+            }
+
+            return auth;
+        }
+    }
 
     internal JsonArray EnsureItemArray()
     {

@@ -60,6 +60,7 @@ public sealed class SyntaxTests
     [InlineData("return /^\\d+$/.test(s);", "«K return» «S /^\\d+$/».«F test»(s);")]
     [InlineData("class Client extends Base { static items = new Map(); }", "«K class» «T Client» «K extends» «T Base» { «K static» items = «K new» «T Map»(); }")]
     [InlineData("if (typeof x === 'string' || x.default.delete(1) === undefined) {}", "«K if» («K typeof» x === «S 'string'» || x.default.«F delete»(«N 1») === «N undefined») {}")]
+    [InlineData("const s = `a${`b${1}`}`;", "«K const» s = «S `a${`b${»«N 1»«S }`}`»;")]
     public void JavaScript(string line, string expected) => Assert.Equal(expected, Colored(ScriptLanguage.JavaScript, line));
 
     [Fact]
@@ -161,6 +162,52 @@ public sealed class SyntaxTests
             «C    text #>» «V $a» = «S 'it''s»
             «S fine'»
             """);
+    }
+
+    [Theory]
+    [InlineData(ScriptLanguage.JavaScript, "`${")]
+    [InlineData(ScriptLanguage.Python, "f\"{")]
+    [InlineData(ScriptLanguage.CSharp, "$\"{")]
+    [InlineData(ScriptLanguage.PowerShell, "\"$(")]
+    public void Interpolations_nested_on_a_long_line_do_not_run_out_of_stack(string language, string opening)
+    {
+        var line = string.Concat(Enumerable.Repeat(opening, 30_000));
+        var kinds = new SyntaxKind[line.Length];
+
+        var state = SyntaxLexer.For(language)!.Lex(line, kinds, LexState.Code);
+
+        Assert.Equal((LexMode.String, SyntaxKind.String), (state.Mode, kinds[0]));
+    }
+
+    [Fact]
+    public void Regular_expressions_that_never_close_on_a_long_line_stay_quick()
+    {
+        var line = string.Concat(Enumerable.Repeat("(/[", 30_000)) + "x = /ab/";
+        var kinds = new SyntaxKind[line.Length];
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        SyntaxLexer.For(ScriptLanguage.JavaScript)!.Lex(line, kinds, LexState.Code);
+
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(1), $"took {clock.Elapsed}");
+    }
+
+    [Theory]
+    [InlineData(ScriptLanguage.PowerShell, "[a ", 60_000)] // [types] that never close (6.5 s before)
+    [InlineData(ScriptLanguage.PowerShell, "${", 400_000)] // ${names} that never close
+    [InlineData(ScriptLanguage.CSharp, "$", 90_000)] // $ and @ that lead to no string (7 s before)
+    [InlineData(ScriptLanguage.CSharp, "@", 90_000)]
+    [InlineData(ScriptLanguage.CSharp, "'\\", 90_000)] // 'characters' that never close
+    [InlineData(ScriptLanguage.Python, "'''", 60_000)] // closing quotes counted to the end of the line
+    [InlineData(ScriptLanguage.Python, "\"", 180_000)]
+    public void Scans_that_could_go_to_the_end_of_a_long_line_each_time_stay_quick(string language, string piece, int times)
+    {
+        var line = string.Concat(Enumerable.Repeat(piece, times));
+        var kinds = new SyntaxKind[line.Length];
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        SyntaxLexer.For(language)!.Lex(line, kinds, LexState.Code);
+
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(1), $"took {clock.Elapsed}"); // a few ms
     }
 
     private static void AssertColored(string language, string script, string expected) =>

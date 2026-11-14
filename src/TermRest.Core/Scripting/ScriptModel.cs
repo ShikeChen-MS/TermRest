@@ -243,11 +243,18 @@ public sealed record ScriptTest(string Name, bool Passed, string? Error, string 
 public sealed record ScriptLog(string Phase, string Script, string Text);
 
 /// <summary>
-/// Why scripts stopped: the script that failed and its traceback, or (with no <see cref="Script"/>) why they could not
-/// run at all.
+/// Why scripts stopped: the script that failed and its traceback, or (with no <see cref="Script"/>) what stopped them as a
+/// whole: why they could not run at all (<see cref="NotRun"/>), or a runtime that stopped, or a request they left that
+/// cannot be sent.
 /// </summary>
 public sealed record ScriptError(string Script, string Message, string? Traceback = null)
 {
+    /// <summary>The scripts did not run at all: no runtime is chosen, or no language has them all.</summary>
+    public bool NotRun { get; init; }
+
+    /// <summary>What the error is about: the script that failed, or the scripts as a whole.</summary>
+    public string Heading => Script.Length > 0 ? $"Script error in {Script}" : NotRun ? "Scripts did not run" : "Scripts failed";
+
     /// <summary>What the runtime printed: the traceback, or the message alone.</summary>
     public string Details => string.IsNullOrWhiteSpace(Traceback) ? Message : Traceback.TrimEnd();
 
@@ -327,7 +334,7 @@ public sealed class ScriptResults
 
         if (Error is not null)
         {
-            text.Append(Error.Script.Length == 0 ? "Scripts did not run\n" : $"Script error in {Error.Script}\n")
+            text.Append(Error.Heading).Append('\n')
                 .Append(Indent(Error.Details)).Append("\n\n");
         }
 

@@ -27,8 +27,11 @@ public sealed class RecordingOptions
 /// <summary>A saved recording.</summary>
 public sealed record RecordingResult(string Path, int Requests, long Bytes, int Redactions);
 
-/// <summary>A recording whose temporary files were left behind: TermRest was closed or crashed before it was saved.</summary>
-public sealed record UnsavedRecording(string TempDirectory, DateTimeOffset StartedAt, string? WorkspaceName, string? WorkspaceRoot, int Requests, long Bytes);
+/// <summary>
+/// A recording whose temporary files were left behind: TermRest was closed or crashed before it was saved. Its requests
+/// are counted when it is opened (<see cref="RequestRecorder.Recover"/>).
+/// </summary>
+public sealed record UnsavedRecording(string TempDirectory, DateTimeOffset StartedAt, string? WorkspaceName, string? WorkspaceRoot, long Bytes);
 
 /// <summary>Where an entry is in the temporary file.</summary>
 internal readonly record struct SpoolEntry(long Offset, long Length, DateTimeOffset? StartedAt);
@@ -38,8 +41,8 @@ internal readonly record struct SpoolEntry(long Offset, long Length, DateTimeOff
 /// tools and HAR viewers open.
 /// <list type="bullet">
 /// <item>Memory: each exchange is written to a private temporary file when it completes, on a background thread, so a
-/// recording never grows in memory. Bodies are written in pieces; saving streams the temporary file into the
-/// destination with a small buffer.</item>
+/// recording never grows in memory (when several are still waiting to be written, recording the next one waits).
+/// Bodies are written in pieces; saving streams the temporary file into the destination with a small buffer.</item>
 /// <item>Secrets are redacted before anything is written (see <see cref="Redactor"/>).</item>
 /// <item>Temporary files (see <see cref="DefaultTempRoot"/>) are private to the user and deleted when the recording is
 /// saved or discarded. If TermRest ends before that, <see cref="FindUnsaved"/> finds them and the recording can
@@ -58,9 +61,17 @@ public sealed class RequestRecorder : IDisposable
     /// <summary>Large temporary files on Linux when /tmp is in memory (tmpfs).</summary>
     internal const string LargeTempDirectory = "/var/tmp";
 
+    /// <summary>
+    /// Recorded requests that may wait to be written; <see cref="Record"/> waits beyond that, so a recording does not grow
+    /// in memory when requests are sent faster than they are written.
+    /// </summary>
+    internal const int MaxPendingWrites = 4;
+
     private const string DeletedMarker = "saved";
     private const UnixFileMode PrivateDirectory = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
     private const UnixFileMode PrivateFile = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+    private const UnixFileMode GroupOrOthers = UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+                                              | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute;
     private const int BufferSize = 64 * 1024;
     private const string EntriesMarker = "@@termrest-entries@@";
 
@@ -70,7 +81,7 @@ public sealed class RequestRecorder : IDisposable
     private readonly FileStream _spool;
     private readonly List<SpoolEntry> _entries;
     private readonly Redactor _redactor;
-    private readonly RecordingInfo _info;
+    private RecordingInfo _info;
     private Task _tail = Task.CompletedTask;
     private int _pending;
     private int _redactions;
@@ -131,6 +142,18 @@ public sealed class RequestRecorder : IDisposable
         }
     }
 
+    /// <summary>Requests recorded that are still being written.</summary>
+    internal int PendingWrites
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _pending;
+            }
+        }
+    }
+
     /// <summary>Size of the temporary file.</summary>
     public long Bytes
     {
@@ -172,6 +195,12 @@ public sealed class RequestRecorder : IDisposable
 
     /// <summary>The last problem writing a request, if any (the recording goes on without it).</summary>
     public string? LastError { get; private set; }
+
+    /// <summary>
+    /// The extra names it redacts (normalized; see <see cref="RecordingOptions.RedactNames"/>): those it started with and
+    /// those added since (<see cref="AddRedactNames"/>), which it keeps until it stops.
+    /// </summary>
+    public IReadOnlySet<string> ExtraNames => _redactor.ExtraNames;
 
     /// <summary>
     /// The folder for temporary recording files: <c>$TERMREST_TEMP_DIR</c>, else the user's temporary folder on
@@ -239,7 +268,8 @@ public sealed class RequestRecorder : IDisposable
     /// <summary>
     /// Recordings whose temporary files are left over in <paramref name="tempRoot"/> (default: <see cref="DefaultTempRoot"/>,
     /// plus the system's temporary folder unless <c>$TERMREST_TEMP_DIR</c> is set), oldest first. Recordings that
-    /// another TermRest is still making are skipped; left-over files without a complete request are deleted.
+    /// another TermRest is still making are skipped; left-over files without a complete request are deleted. Only
+    /// folders private to the user are looked at: in a shared folder such as /tmp, others may be another user's.
     /// </summary>
     public static IReadOnlyList<UnsavedRecording> FindUnsaved(string? tempRoot = null)
     {
@@ -261,7 +291,7 @@ public sealed class RequestRecorder : IDisposable
 
             foreach (var directory in directories)
             {
-                if (Inspect(directory) is { } unsaved)
+                if (IsPrivate(directory) && Inspect(directory) is { } unsaved)
                 {
                     found.Add(unsaved);
                 }
@@ -289,7 +319,10 @@ public sealed class RequestRecorder : IDisposable
         }
     }
 
-    /// <summary>Records an exchange (in the background). Requests that were never sent, such as an invalid URL, are skipped.</summary>
+    /// <summary>
+    /// Records an exchange (in the background; this waits only while several earlier requests are still being written).
+    /// Requests that were never sent, such as an invalid URL, are skipped.
+    /// </summary>
     public void Record(HttpExchange exchange, string? environment = null)
     {
         var request = exchange.Request;
@@ -299,11 +332,17 @@ public sealed class RequestRecorder : IDisposable
         }
 
         var recorded = RecordedExchange.Capture(exchange, environment);
+        Task? backlog = null;
         lock (_gate)
         {
             if (!_accepting)
             {
                 return;
+            }
+
+            if (_pending >= MaxPendingWrites)
+            {
+                backlog = _tail;
             }
 
             _pending++;
@@ -316,6 +355,7 @@ public sealed class RequestRecorder : IDisposable
         }
 
         Changed?.Invoke(this, EventArgs.Empty);
+        backlog?.Wait();
     }
 
     /// <summary>Completes when every recorded request has been written to the temporary file.</summary>
@@ -324,6 +364,42 @@ public sealed class RequestRecorder : IDisposable
         lock (_gate)
         {
             return _tail;
+        }
+    }
+
+    /// <summary>
+    /// Adds names to redact (see <see cref="RecordingOptions.RedactNames"/>), as when the workspace settings change while
+    /// recording: the requests written from now on are redacted with them too, and the recording lists them; requests
+    /// written already stay as they are. Names are never removed. Returns the names new to the recording (none once it
+    /// no longer records).
+    /// </summary>
+    public IReadOnlyList<string> AddRedactNames(IEnumerable<string> names)
+    {
+        lock (_gate)
+        {
+            if (!_accepting)
+            {
+                return [];
+            }
+
+            var known = SecretNames.NormalizeAll(_info.RedactNames);
+            List<string> added = [.. names.Where(name => SecretNames.Normalize(name) is { Length: > 0 } normalized && known.Add(normalized))];
+            if (added.Count > 0)
+            {
+                _redactor.AddExtraNames(added);
+                _info = _info with { RedactNames = [.. _info.RedactNames, .. added] };
+                try
+                {
+                    WriteInfo(_info);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Read only for a recording recovered after TermRest ended: its HAR file would not list these names,
+                    // though its requests are redacted with them all the same.
+                }
+            }
+
+            return added;
         }
     }
 
@@ -407,35 +483,59 @@ public sealed class RequestRecorder : IDisposable
         Finish(deleteFiles: _entries.Count == 0);
     }
 
-    /// <summary>Complete entries in a temporary file (each ends with a <c>}</c> line); a cut-off last entry is left out.</summary>
-    internal static List<SpoolEntry> Scan(Stream stream)
+    /// <summary>
+    /// Complete entries in a temporary file (each ends with a <c>}</c> line), the first <paramref name="max"/> of them; a
+    /// cut-off last entry is left out. Stops reading once it has found them.
+    /// </summary>
+    internal static List<SpoolEntry> Scan(Stream stream, int max = int.MaxValue)
     {
         var entries = new List<SpoolEntry>();
         var buffer = new byte[BufferSize];
         stream.Position = 0;
-        long position = 0;
+        long bufferStart = 0; // where buffer[0] is in the file
         long start = 0;
-        byte previous = 0;
-        byte beforePrevious = 0;
+        var kept = 0;
         int read;
-        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+        while (entries.Count < max && (read = stream.Read(buffer, kept, buffer.Length - kept)) > 0)
         {
-            for (var i = 0; i < read; i++, position++)
+            var data = buffer.AsSpan(0, kept + read);
+
+            // Strings never contain raw line breaks, so "\n}\n" only ends a whole (indented) entry.
+            for (var from = 0; entries.Count < max;)
             {
-                // Strings never contain raw line breaks, so "\n}\n" only ends a whole (indented) entry.
-                var current = buffer[i];
-                if (current == (byte)'\n' && previous == (byte)'}' && beforePrevious == (byte)'\n')
+                var index = data[from..].IndexOf("\n}\n"u8);
+                if (index < 0)
                 {
-                    entries.Add(new SpoolEntry(start, position - start, null));
-                    start = position + 1;
+                    break;
                 }
 
-                beforePrevious = previous;
-                previous = current;
+                var end = bufferStart + from + index + 2; // the line break after the "}"
+                entries.Add(new SpoolEntry(start, end - start, null));
+                start = end + 1;
+                from += index + 2;
             }
+
+            // The last two bytes may start a "\n}\n" that the next read completes.
+            kept = Math.Min(2, data.Length);
+            data[^kept..].CopyTo(buffer);
+            bufferStart += data.Length - kept;
         }
 
         return entries;
+    }
+
+    /// <summary>Whether a temporary file ends with a complete entry, as it does unless TermRest ended while writing one.</summary>
+    private static bool EndsWithEntry(Stream stream)
+    {
+        if (stream.Length < 3)
+        {
+            return false;
+        }
+
+        Span<byte> end = stackalloc byte[3];
+        stream.Position = stream.Length - 3;
+        stream.ReadExactly(end);
+        return end.SequenceEqual("\n}\n"u8);
     }
 
     private void Write(RecordedExchange recorded)
@@ -489,6 +589,19 @@ public sealed class RequestRecorder : IDisposable
         {
             ThreadPool.QueueUserWorkItem(_ => changed(this, EventArgs.Empty));
         }
+    }
+
+    /// <summary>Replaces the recording's <c>recording.json</c>: written next to it, then moved over it.</summary>
+    private void WriteInfo(RecordingInfo info)
+    {
+        var path = Path.Combine(TempDirectory, InfoFileName);
+        var temp = path + ".tmp";
+        using (var file = new FileStream(temp, FileOptions(FileMode.Create, FileAccess.Write, FileShare.None)))
+        {
+            file.Write(info.ToJson());
+        }
+
+        File.Move(temp, path, overwrite: true);
     }
 
     /// <summary>Writes the HAR file next to <paramref name="path"/>, then moves it into place (an existing file is replaced only when complete).</summary>
@@ -673,27 +786,44 @@ public sealed class RequestRecorder : IDisposable
                 return null; // being created right now
             }
 
-            int count;
+            bool complete;
             long length;
-            // Exclusive: fails while a running TermRest records into it.
+            // Exclusive: fails while a running TermRest records into it. One complete request is enough to offer it.
             using (var stream = new FileStream(spoolPath, FileMode.Open, FileAccess.Read, FileShare.None))
             {
-                count = Scan(stream).Count;
+                complete = EndsWithEntry(stream) || Scan(stream, max: 1).Count > 0;
                 length = stream.Length;
             }
 
-            if (count == 0)
+            if (!complete)
             {
                 DeleteDirectory(directory);
                 return null;
             }
 
             var info = RecordingInfo.TryRead(Path.Combine(directory, InfoFileName));
-            return new UnsavedRecording(directory, info?.StartedAt ?? new DateTimeOffset(Directory.GetCreationTime(directory)), info?.WorkspaceName, info?.WorkspaceRoot, count, length);
+            return new UnsavedRecording(directory, info?.StartedAt ?? new DateTimeOffset(Directory.GetCreationTime(directory)), info?.WorkspaceName, info?.WorkspaceRoot, length);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return null; // in use, or another user's
+        }
+    }
+
+    /// <summary>
+    /// Whether a folder can be one of this user's recordings: TermRest makes them private (0700 on Unix), never links.
+    /// Others, in a shared folder such as /tmp, may be another user's and are not opened.
+    /// </summary>
+    private static bool IsPrivate(string directory)
+    {
+        try
+        {
+            return new DirectoryInfo(directory).LinkTarget is null
+                   && (OperatingSystem.IsWindows() || (File.GetUnixFileMode(directory) & GroupOrOthers) == 0);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
         }
     }
 
@@ -819,7 +949,8 @@ public sealed class RequestRecorder : IDisposable
             {
                 using var document = JsonDocument.Parse(File.ReadAllBytes(path));
                 var root = document.RootElement;
-                if (!root.TryGetProperty("startedAt", out var started) || !DateTimeOffset.TryParse(started.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var startedAt))
+                if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("startedAt", out var started) || started.ValueKind != JsonValueKind.String
+                    || !DateTimeOffset.TryParse(started.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var startedAt))
                 {
                     return null;
                 }
@@ -828,12 +959,12 @@ public sealed class RequestRecorder : IDisposable
                 var redact = root.TryGetProperty("redact", out var names) && names.ValueKind == JsonValueKind.Array
                     ? names.EnumerateArray().Where(n => n.ValueKind == JsonValueKind.String).Select(n => n.GetString()!).ToArray()
                     : [];
-                var processId = root.TryGetProperty("processId", out var pid) && pid.TryGetInt32(out var id) ? id : 0;
+                var processId = root.TryGetProperty("processId", out var pid) && pid.ValueKind == JsonValueKind.Number && pid.TryGetInt32(out var id) ? id : 0;
                 return new RecordingInfo(startedAt, Text("workspace"), Text("workspaceRoot"), redact, processId);
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
             {
-                return null;
+                return null; // missing or damaged: the recording is still offered, without these details
             }
         }
     }

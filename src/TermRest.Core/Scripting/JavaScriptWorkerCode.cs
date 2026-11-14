@@ -58,6 +58,7 @@ internal static class JavaScriptWorkerCode
           inspect: value => util.inspect(value, { depth: 3, breakLength: Infinity, maxArrayLength: 20, maxStringLength: 300 }),
           require: requireFromWorkspace,
           uuid: () => nodeCrypto.randomUUID(),
+          randomInt: limit => nodeCrypto.randomInt(limit),
           fetch: (...args) => fetch(...args),
           setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, clearImmediate,
           Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, FormData, Headers,
@@ -67,7 +68,7 @@ internal static class JavaScriptWorkerCode
 
         async function run(line) {
           const context = vm.createContext({});
-          const state = { onError: null };
+          const state = { onError: null, console: null };
           active = state;
           try {
             const start = sandboxScript.runInContext(context);
@@ -75,6 +76,7 @@ internal static class JavaScriptWorkerCode
               message: line,
               compile: (name, code) => compile(context, name, code),
               onError: handler => { state.onError = handler; },
+              onConsole: target => { state.console = target; },
             }));
           } finally {
             active = null;
@@ -92,10 +94,22 @@ internal static class JavaScriptWorkerCode
         process.on('uncaughtException', uncaught);
         process.on('unhandledRejection', uncaught);
 
+        // Modules and packages that scripts require run outside the scripts' context, where console is the runtime's own (its
+        // stdout and stderr, which TermRest does not show): while a script runs, what they log goes to the script's output.
+        for (const name of ['log', 'info', 'debug', 'trace', 'warn', 'error', 'dir', 'table', 'assert', 'count', 'countReset', 'time', 'timeLog', 'timeEnd', 'group', 'groupCollapsed', 'groupEnd']) {
+          const own = console[name];
+          if (typeof own === 'function') {
+            console[name] = (...args) => active !== null && active.console !== null ? active.console[name](...args) : own.apply(console, args);
+          }
+        }
+
         let queue = Promise.resolve();
         let partial = [];
+
+        // Halves of surrogate pairs (a script's substring of an emoji) are not text: JSON.stringify writes them as escapes
+        // (\ud83d), which JSON readers may refuse. They become U+FFFD; whole pairs are written as they are.
         function reply(text) {
-          process.stdout.write(MARKER + text + '\n');
+          process.stdout.write(MARKER + text.replace(/\\(\\|ud[89a-f][0-9a-f]{2})/g, (escape, what) => what === '\\' ? escape : '\\ufffd') + '\n');
         }
 
         function receive(chunk) {
@@ -144,14 +158,19 @@ internal static class JavaScriptWorkerCode
             if (typeof value === 'string') return value;
             if (value === null || value === undefined) return '';
             if (typeof value === 'object') {
-              try { return stringify(value); } catch (error) { return String(value); }
+              let json;
+              try { json = stringify(value); } catch (error) { return String(value); }
+
+              // One whose JSON is a string (a Date, a URL …) is that string, without the quotes.
+              return typeof json === 'string' && json.startsWith('"') ? JSON.parse(json) : json;
             }
             return String(value);
           }
 
           function log(line) {
             for (const part of String(line).split(/\r?\n/)) {
-              if (logs.length < MAX_LINES) logs.push({ script: current, text: part.length > 4000 ? part.slice(0, 4000) : part });
+              // Lines are cut at 4,000 characters, not inside a surrogate pair (an emoji).
+              if (logs.length < MAX_LINES) logs.push({ script: current, text: part.length > 4000 ? part.slice(0, /[\ud800-\udbff]/.test(part[3999]) ? 3999 : 4000) : part });
               else dropped++;
             }
           }
@@ -163,23 +182,39 @@ internal static class JavaScriptWorkerCode
             }
           }
 
+          // What a script threw may be any value: one without a prototype, a revoked proxy, or getters that throw. Describing
+          // it never throws (that would fail the whole run instead of the script).
+          function safeString(value) {
+            try { return String(value); } catch (ignored) { }
+            try { return Object.prototype.toString.call(value); } catch (ignored) { return '(a value that cannot be shown)'; }
+          }
+
           function isError(value) {
-            return value !== null && typeof value === 'object' && 'message' in value;
+            try { return value !== null && typeof value === 'object' && 'message' in value; } catch (ignored) { return false; }
+          }
+
+          function nameOf(error) {
+            try { return String(error.name || 'Error'); } catch (ignored) { return 'Error'; }
+          }
+
+          function messageOf(error) {
+            try { return String(error.message); } catch (ignored) { return '(its message could not be read)'; }
           }
 
           function describe(error) {
-            if (!isError(error)) return String(error);
-            const name = error.name || 'Error';
-            return name === 'AssertionError' ? String(error.message) : name + ': ' + error.message;
+            if (!isError(error)) return safeString(error);
+            const name = nameOf(error);
+            return name === 'AssertionError' ? messageOf(error) : name + ': ' + messageOf(error);
           }
 
           function fullDescribe(error) {
-            return isError(error) ? (error.name || 'Error') + ': ' + error.message : String(error);
+            return isError(error) ? nameOf(error) + ': ' + messageOf(error) : safeString(error);
           }
 
           function traceback(error, name, code) {
             const source = String(code).split(/\r?\n/);
-            const stack = isError(error) && typeof error.stack === 'string' ? error.stack : '';
+            let stack = '';
+            try { if (isError(error) && typeof error.stack === 'string') stack = error.stack; } catch (ignored) { }
             const pattern = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':(\\d+)', 'g');
             const frames = [];
             let match;
@@ -280,12 +315,27 @@ internal static class JavaScriptWorkerCode
             changes[scope] = Object.create(null);
           }
 
+          // Postman's dynamic variables, as requests resolve them; the names and words they pick from come with the message.
+          const samples = message.dynamic || {};
+          const ALPHANUMERIC = 'abcdefghijklmnopqrstuvwxyz0123456789';
+          const pick = list => (Array.isArray(list) && list.length > 0 ? String(list[host.randomInt(list.length)]) : '');
+          const randomText = (length, alphabet) => Array.from({ length }, () => alphabet[host.randomInt(alphabet.length)]).join('');
           const dynamic = {
             $guid: () => host.uuid(),
             $randomUUID: () => host.uuid(),
             $timestamp: () => String(Math.floor(Date.now() / 1000)),
             $isoTimestamp: () => new Date().toISOString(),
-            $randomInt: () => String(Math.floor(Math.random() * 1001)),
+            $randomInt: () => String(host.randomInt(1001)),
+            $randomBoolean: () => String(host.randomInt(2) === 1),
+            $randomAlphaNumeric: () => randomText(1, ALPHANUMERIC),
+            $randomHexadecimal: () => randomText(1, '0123456789abcdef'),
+            $randomFirstName: () => pick(samples.firstNames),
+            $randomLastName: () => pick(samples.lastNames),
+            $randomFullName: () => pick(samples.firstNames) + ' ' + pick(samples.lastNames),
+            $randomUserName: () => pick(samples.firstNames).toLowerCase() + '.' + pick(samples.lastNames).toLowerCase() + host.randomInt(100),
+            $randomEmail: () => pick(samples.firstNames).toLowerCase() + '.' + pick(samples.lastNames).toLowerCase() + '@example.com',
+            $randomWord: () => pick(samples.words),
+            $randomPassword: () => randomText(15, ALPHANUMERIC),
           };
 
           function replaceIn(template, lookup) {
@@ -477,6 +527,18 @@ internal static class JavaScriptWorkerCode
             [Symbol.iterator]() { return this.members[Symbol.iterator](); }
           }
 
+          // Postman keeps a URL's host and path as lists, but a script may set either as text (pm.request.url.host =
+          // 'api.example.com', as Postman allows), and null for any part of it means none.
+          function isNone(value) { return value === null || value === undefined; }
+
+          function hostText(host) { return Array.isArray(host) ? host.join('.') : isNone(host) ? '' : String(host); }
+
+          function pathSegments(path) {
+            if (Array.isArray(path)) return path;
+            const text = isNone(path) ? '' : String(path);
+            return text.length === 0 ? [] : text.replace(/^\//, '').split('/');
+          }
+
           class Url {
             constructor(raw) { this.update(raw); }
 
@@ -522,11 +584,11 @@ internal static class JavaScriptWorkerCode
               return this;
             }
 
-            getHost() { return this.host.join('.'); }
+            getHost() { return hostText(this.host); }
 
-            getRemote() { return this.getHost() + (this.port !== undefined ? ':' + this.port : ''); }
+            getRemote() { return this.getHost() + (isNone(this.port) ? '' : ':' + this.port); }
 
-            getPath() { return '/' + this.path.join('/'); }
+            getPath() { return '/' + pathSegments(this.path).join('/'); }
 
             getQueryString() { return this.query.toString(); }
 
@@ -544,12 +606,13 @@ internal static class JavaScriptWorkerCode
             }
 
             toString() {
-              let result = this.protocol !== undefined ? this.protocol + '://' : '';
+              let result = isNone(this.protocol) ? '' : this.protocol + '://';
               result += this.getHost();
-              if (this.port !== undefined) result += ':' + this.port;
-              if (this.path.length > 0) result += '/' + this.path.join('/');
+              if (!isNone(this.port)) result += ':' + this.port;
+              const path = pathSegments(this.path);
+              if (path.length > 0) result += '/' + path.join('/');
               if (this.query.count() > 0) result += '?' + this.query.toString();
-              if (this.hash !== undefined) result += '#' + this.hash;
+              if (!isNone(this.hash)) result += '#' + this.hash;
               return result;
             }
 
@@ -819,10 +882,13 @@ internal static class JavaScriptWorkerCode
             return { exists: true, value };
           }
 
-          function lengthOf(object) {
+          // A length as chai finds it: a map's or set's size, else the length property, which the value must have.
+          function lengthOf(assertion) {
+            const object = assertion._object;
             const kind = typeOf(object);
             if (kind === 'map' || kind === 'set') return object.size;
-            if (object === null || object === undefined) throw new AssertionError('expected ' + inspect(object) + ' to have a length');
+            if (object === null || object === undefined) assertion._fail('Target cannot be null or undefined.');
+            if (!('length' in Object(object))) assertion._fail('expected ' + inspect(object) + " to have property 'length'");
             return object.length;
           }
 
@@ -853,8 +919,49 @@ internal static class JavaScriptWorkerCode
             }
           }
 
+          // Reading a property that no assertion has throws, as in chai: a misspelled .to.be.ture would otherwise check
+          // nothing. Like chai, it leaves out then, catch, inspect and toJSON, which await and serializers look for. Only
+          // the proxies scripts get are checked: chained methods inherit from the objects behind them, which util.inspect
+          // (console.log) reads past the proxy.
+          const targets = new WeakMap();
+          const unchecked = new Set(['then', 'catch', 'inspect', 'toJSON']);
+          const checker = {
+            get(target, key, receiver) {
+              if (typeof key === 'string' && !unchecked.has(key) && !Reflect.has(target, key)) throw new Error('Invalid Chai property: ' + key + suggestion(key));
+              return Reflect.get(target, key, receiver);
+            },
+          };
+
+          function guard(target) {
+            const proxy = new Proxy(target, checker);
+            targets.set(proxy, target);
+            return proxy;
+          }
+
+          // chai's hint for a misspelled property: the closest assertion fewer than 4 edits away, the first on a tie.
+          function suggestion(name) {
+            let best = null;
+            let distance = 4;
+            for (const candidate of Object.getOwnPropertyNames(Assertion.prototype)) {
+              if (candidate === 'constructor' || candidate.startsWith('_') || Math.abs(candidate.length - name.length) >= distance) continue;
+              let row = [...Array(candidate.length + 1).keys()];
+              for (let i = 1; i <= name.length; i++) {
+                const next = [i];
+                for (let j = 1; j <= candidate.length; j++) next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (name[i - 1] === candidate[j - 1] ? 0 : 1));
+                row = next;
+              }
+
+              if (row[candidate.length] < distance) {
+                best = candidate;
+                distance = row[candidate.length];
+              }
+            }
+
+            return best === null ? '' : '. Did you mean "' + best + '"?';
+          }
+
           function expect(value, text) {
-            return new Assertion(value, text);
+            return guard(new Assertion(value, text));
           }
 
           expect.fail = text => { throw new AssertionError(text === undefined ? 'expect.fail()' : String(text)); };
@@ -872,12 +979,13 @@ internal static class JavaScriptWorkerCode
             const callable = function (...args) { return fn.apply(assertion, args); };
             delete callable.length;
             delete callable.name;
-            Object.setPrototypeOf(callable, assertion);
-            return callable;
+            Object.setPrototypeOf(callable, targets.get(assertion) || assertion);
+            return guard(callable);
           }
 
-          getter(['to', 'be', 'been', 'is', 'that', 'which', 'and', 'has', 'have', 'with', 'at', 'of', 'same', 'but', 'does', 'still', 'also'], function () { return this; });
-          getter('not', function () { this._flags.negate = !this._flags.negate; return this; });
+          // In chai's order, so that a misspelled property gets the hint chai gives (the first of equally close ones).
+          getter(['to', 'be', 'been', 'is', 'and', 'has', 'have', 'with', 'that', 'which', 'at', 'of', 'same', 'but', 'does', 'still', 'also'], function () { return this; });
+          getter('not', function () { this._flags.negate = true; return this; });
           for (const name of ['deep', 'nested', 'own', 'ordered', 'any', 'all']) getter(name, function () { this._flags[name] = true; return this; });
 
           const article = type => (/^[aeiou]/i.test(type) ? 'an ' : 'a ') + type;
@@ -911,22 +1019,15 @@ internal static class JavaScriptWorkerCode
 
           function lengthAssertion(expected, text) {
             this._msg(text);
-            this._flags.length = false;
-            const length = lengthOf(this._object);
-            return this._assert(length === expected, 'expected #{this} to have a length of #{exp} but got #{act}', 'expected #{this} to not have a length of #{exp}', expected, length);
+            const length = lengthOf(this);
+            // chai compares with ==, so lengthOf('2') passes for two items.
+            return this._assert(length == expected, 'expected #{this} to have a length of #{exp} but got #{act}', 'expected #{this} to not have a length of #{act}', expected, length);
           }
 
           getter(['a', 'an'], function () { return chainable(this, typeAssertion); });
           getter(['include', 'includes', 'contain', 'contains'], function () { return chainable(this, includeAssertion, function () { this._flags.contains = true; }); });
-          getter('length', function () { return chainable(this, lengthAssertion, function () { this._flags.length = true; }); });
-          method('lengthOf', lengthAssertion);
-
-          // .length.above(2) and the like compare the length.
-          function useLength(assertion) {
-            if (assertion._flags.length !== true) return false;
-            assertion._flags.length = false;
-            return true;
-          }
+          // As in chai, the comparisons after .length or .lengthOf compare the length: .lengthOf.at.least(1).and.at.most(10).
+          getter(['length', 'lengthOf'], function () { return chainable(this, lengthAssertion, function () { this._flags.length = true; }); });
 
           function eqlAssertion(value, text) {
             this._msg(text);
@@ -936,41 +1037,52 @@ internal static class JavaScriptWorkerCode
           method(['equal', 'equals', 'eq'], function (value, text) {
             this._msg(text);
             if (this._flags.deep === true) return eqlAssertion.call(this, value);
-            if (useLength(this)) {
-              const length = lengthOf(this._object);
-              return this._assert(length === value, 'expected #{this} to have a length of #{exp} but got #{act}', 'expected #{this} to not have a length of #{exp}', value, length);
-            }
-
             return this._assert(this._object === value, 'expected #{this} to equal #{exp}', 'expected #{this} to not equal #{exp}', value);
           });
           method(['eql', 'eqls'], eqlAssertion);
 
-          function comparison(test, positive, negative) {
+          // Only numbers and dates are compared: JavaScript would compare null, '' or '42' as numbers.
+          function numberOrDate(assertion) {
+            const kind = typeOf(assertion._object);
+            if (kind !== 'number' && kind !== 'date' && kind !== 'bigint') assertion._fail('expected ' + inspect(assertion._object) + ' to be a number or a date');
+          }
+
+          function comparison(name, test, positive, negative) {
             return function (bound, text) {
               this._msg(text);
-              if (useLength(this)) {
-                const length = lengthOf(this._object);
+              const kind = typeOf(bound);
+              if (this._flags.length === true) {
+                const length = lengthOf(this);
+                if (kind !== 'number') return this._fail('the argument to ' + name + ' must be a number');
                 return this._assert(test(length, bound), 'expected #{this} to have a length ' + positive + ' #{exp} but got #{act}', 'expected #{this} to have a length ' + negative + ' #{exp}', bound, length);
               }
 
-              const kind = typeOf(this._object);
-              if (kind !== 'number' && kind !== 'date' && kind !== 'bigint') return this._fail('expected ' + inspect(this._object) + ' to be a number or a date');
+              if (typeOf(this._object) === 'date' && kind !== 'date') return this._fail('the argument to ' + name + ' must be a date');
+              if (typeOf(this._object) === 'number' && kind !== 'number') return this._fail('the argument to ' + name + ' must be a number');
+              numberOrDate(this);
               return this._assert(test(this._object, bound), 'expected #{this} to be ' + positive + ' #{exp}', 'expected #{this} to be ' + negative + ' #{exp}', bound);
             };
           }
 
-          method(['above', 'gt', 'greaterThan'], comparison((a, b) => a > b, 'above', 'at most'));
-          method(['least', 'gte', 'greaterThanOrEqual'], comparison((a, b) => a >= b, 'at least', 'below'));
-          method(['below', 'lt', 'lessThan'], comparison((a, b) => a < b, 'below', 'at least'));
-          method(['most', 'lte', 'lessThanOrEqual'], comparison((a, b) => a <= b, 'at most', 'above'));
+          method(['above', 'gt', 'greaterThan'], comparison('above', (a, b) => a > b, 'above', 'at most'));
+          method(['least', 'gte', 'greaterThanOrEqual'], comparison('least', (a, b) => a >= b, 'at least', 'below'));
+          method(['below', 'lt', 'lessThan'], comparison('below', (a, b) => a < b, 'below', 'at least'));
+          method(['most', 'lte', 'lessThanOrEqual'], comparison('most', (a, b) => a <= b, 'at most', 'above'));
           method('within', function (start, finish, text) {
             this._msg(text);
-            const range = start + '..' + finish;
-            if (useLength(this)) {
-              const length = lengthOf(this._object);
+            const dates = typeOf(start) === 'date' && typeOf(finish) === 'date';
+            const numbers = typeOf(start) === 'number' && typeOf(finish) === 'number';
+            const range = dates ? start.toISOString() + '..' + finish.toISOString() : start + '..' + finish;
+            if (this._flags.length === true) {
+              const length = lengthOf(this);
+              if (!numbers) return this._fail('the arguments to within must be numbers');
               return this._assert(length >= start && length <= finish, 'expected #{this} to have a length within ' + range, 'expected #{this} to not have a length within ' + range);
             }
 
+            const kind = typeOf(this._object);
+            if (kind === 'date' && !dates) return this._fail('the arguments to within must be dates');
+            if (kind === 'number' && !numbers) return this._fail('the arguments to within must be numbers');
+            numberOrDate(this);
             return this._assert(this._object >= start && this._object <= finish, 'expected #{this} to be within ' + range, 'expected #{this} to not be within ' + range);
           });
           method(['instanceof', 'instanceOf'], function (constructor, text) {
@@ -981,11 +1093,12 @@ internal static class JavaScriptWorkerCode
 
           function propertyAssertion(name, ...rest) {
             const object = this._object;
+            if (object === null || object === undefined) return this._fail('Target cannot be null or undefined.');
             const flags = this._flags;
             let exists = false;
             let value;
             if (flags.nested === true) ({ exists, value } = readPath(object, name));
-            else if (object !== null && object !== undefined) {
+            else {
               exists = flags.own === true ? hasOwn(object, name) : name in Object(object);
               value = exists ? object[name] : undefined;
             }
@@ -1050,7 +1163,7 @@ internal static class JavaScriptWorkerCode
 
             if (pattern !== undefined) {
               what += ' matching ' + inspect(pattern);
-              const thrownText = isError(error) ? String(error.message) : String(error);
+              const thrownText = isError(error) ? messageOf(error) : safeString(error);
               if (ok) ok = typeOf(pattern) === 'regexp' ? pattern.test(thrownText) : thrownText.includes(String(pattern));
             }
 
@@ -1085,6 +1198,11 @@ internal static class JavaScriptWorkerCode
           });
           method(['closeTo', 'approximately'], function (expected, delta, text) {
             this._msg(text);
+            if (typeOf(this._object) !== 'number') return this._fail('expected ' + inspect(this._object) + ' to be a number');
+            if (typeof expected !== 'number' || typeof delta !== 'number') {
+              return this._fail('the arguments to closeTo or approximately must be numbers' + (delta === undefined ? ', and a delta is required' : ''));
+            }
+
             return this._assert(Math.abs(this._object - expected) <= delta, 'expected #{this} to be close to ' + expected + ' +/- ' + delta, 'expected #{this} not to be close to ' + expected + ' +/- ' + delta);
           });
           method(['satisfy', 'satisfies'], function (matcher, text) {
@@ -1098,7 +1216,7 @@ internal static class JavaScriptWorkerCode
           getter('undefined', function () { return this._assert(this._object === undefined, 'expected #{this} to be undefined', 'expected #{this} not to be undefined'); });
           getter('NaN', function () { return this._assert(Number.isNaN(this._object), 'expected #{this} to be NaN', 'expected #{this} not to be NaN'); });
           getter('finite', function () { return this._assert(Number.isFinite(this._object), 'expected #{this} to be a finite number', 'expected #{this} to not be a finite number'); });
-          getter('exist', function () { return this._assert(this._object !== null && this._object !== undefined, 'expected #{this} to exist', 'expected #{this} to not exist'); });
+          getter(['exist', 'exists'], function () { return this._assert(this._object !== null && this._object !== undefined, 'expected #{this} to exist', 'expected #{this} to not exist'); });
           getter('empty', function () {
             const object = this._object;
             const kind = typeOf(object);
@@ -1109,10 +1227,21 @@ internal static class JavaScriptWorkerCode
             else return this._fail('.empty was passed non-string primitive ' + inspect(object));
             return this._assert(empty, 'expected #{this} to be empty', 'expected #{this} not to be empty');
           });
+          getter(['arguments', 'Arguments'], function () {
+            const object = this._object;
+            const type = object !== null && typeof object === 'object' ? Object.prototype.toString.call(object).slice(8, -1) : typeOf(object);
+            return this._assert(type === 'Arguments', 'expected #{this} to be arguments but got ' + type, 'expected #{this} to not be arguments');
+          });
+          for (const [name, test] of [['extensible', Object.isExtensible], ['sealed', Object.isSealed], ['frozen', Object.isFrozen]]) {
+            getter(name, function () { return this._assert(test(this._object), 'expected #{this} to be ' + name, 'expected #{this} to not be ' + name); });
+          }
 
           // Postman's assertions on responses: pm.response.to.have.status(200), .to.be.ok, .to.have.header('Content-Type') …
           const isResponse = value => value !== null && typeof value === 'object' && value[BRAND] === 'response';
           const isRequest = value => value !== null && typeof value === 'object' && value[BRAND] === 'request';
+          for (const [name, test, what] of [['postmanRequest', isRequest, 'request'], ['postmanResponse', isResponse, 'response'], ['postmanRequestOrResponse', value => isRequest(value) || isResponse(value), 'request or response']]) {
+            getter(name, function () { return this._assert(test(this._object), 'expecting a postman ' + what + ' object but got #{this}', 'not expecting a postman ' + what + ' object'); });
+          }
 
           function responseOf(assertion) {
             if (!isResponse(assertion._object)) assertion._fail('expected ' + inspect(assertion._object) + ' to be a response');
@@ -1144,7 +1273,7 @@ internal static class JavaScriptWorkerCode
             const actual = responseOf(this).code;
             return this._assert(actual >= 400 && actual < 600, 'expected response code to be 4XX or 5XX but found #{act}', 'expected response code to not be 4XX or 5XX but found #{act}', undefined, actual);
           });
-          for (const [names, code] of [['accepted', 202], ['badRequest', 400], [['unauthorized', 'unauthorised'], 401], ['forbidden', 403], ['notFound', 404], ['notAcceptable', 406], ['rateLimited', 429]]) {
+          for (const [names, code] of [['accepted', 202], ['withoutContent', 204], ['badRequest', 400], [['unauthorized', 'unauthorised'], 401], ['forbidden', 403], ['notFound', 404], ['notAcceptable', 406], ['rateLimited', 429]]) {
             getter(names, function () { return statusCode(this, code); });
           }
 
@@ -1202,13 +1331,34 @@ internal static class JavaScriptWorkerCode
             if (args.length === 1) return this._assert(exists, 'expected response body json to have path ' + inspect(args[0]), 'expected response body json to not have path ' + inspect(args[0]));
             return this._assert(exists && deepEqual(value, args[1]), 'expected response body json at ' + inspect(args[0]) + ' to contain #{exp} but got #{act}', 'expected response body json at ' + inspect(args[0]) + ' to not contain #{exp}', args[1], value);
           });
+          // As in Postman: a response's (or request's) JSON body, else the value itself (pm.expect(data).to.have.jsonSchema(schema)).
+          // Postman's ajv 6 checks formats (email, date-time …) itself, and fails on one it doesn't know. ajv 7 and later check
+          // them only with the ajv-formats plugin (for those versions only), taken from the workspace when it is there: a
+          // format ajv doesn't know then fails the test rather than going unchecked.
           method('jsonSchema', function (schema, options) {
-            const response = responseOf(this);
+            if (typeOf(schema) !== 'object') return this._fail('expected ' + inspect(schema) + ' to be an object');
+            const object = this._object;
+            const data = isResponse(object) || (isRequest(object) && typeof object.json === 'function') ? object.json() : object;
             const ajvModule = host.require('ajv');
             const Ajv = ajvModule.default || ajvModule;
-            const ajv = new Ajv(Object.assign({ allErrors: true, strict: false }, options));
-            const valid = ajv.validate(schema, JSON.parse(response.text()));
-            return this._assert(valid, 'expected response body to match the JSON schema, but ' + ajv.errorsText(), 'expected response body to not match the JSON schema');
+            const unknownFormats = [];
+            const logger = { log() {}, warn(...args) { const message = args.join(' '); if (message.includes('unknown format')) unknownFormats.push(message); }, error() {} };
+            const ajv = new Ajv(Object.assign({ allErrors: true, strict: false, logger }, options));
+            const pluggable = Boolean(ajv.opts && ajv.opts.code); // ajv 7 and later (ajv 6 has _opts)
+            let addFormats = null;
+            if (pluggable) {
+              try {
+                addFormats = host.require('ajv-formats');
+              } catch (error) {
+                if (!error || error.code !== 'MODULE_NOT_FOUND' || !String(error.message).includes('ajv-formats')) throw error;
+              }
+
+              if (addFormats !== null) (addFormats.default || addFormats)(ajv);
+            }
+
+            const valid = ajv.validate(schema, data);
+            if (pluggable && unknownFormats.length > 0) return this._fail(unknownFormats[0] + (addFormats === null ? ': install ajv-formats in the workspace (npm install ajv-formats), as Postman checks formats' : ''));
+            return this._assert(valid && !ajv.errors, 'expected data to satisfy schema but found following errors: \n' + ajv.errorsText(), 'expected data to not satisfy schema');
           });
 
           // ----- pm.test ------------------------------------------------------------------------------------
@@ -1359,10 +1509,12 @@ internal static class JavaScriptWorkerCode
             return result;
           }
 
+          const scriptConsole = makeConsole();
+          host.onConsole(scriptConsole);
           Object.assign(globalThis, timerFunctions, {
             pm,
             postman,
-            console: makeConsole(),
+            console: scriptConsole,
             require: host.require,
             fetch: (...args) => track(host.fetch(...args)),
             Buffer: host.Buffer,
@@ -1452,14 +1604,22 @@ internal static class JavaScriptWorkerCode
 
             if (phase === 'prerequest') {
               const request = pm.request;
-              result.request = {
-                method: String(request.method),
-                url: String(request.url),
-                headers: request.headers.members
-                  .filter(member => !member.disabled && String(member.key).length > 0)
-                  .map(member => [String(member.key), member.value === null || member.value === undefined ? '' : String(member.value)]),
-                body: request.body.raw === undefined || request.body.raw === null ? null : String(request.body.raw),
-              };
+              try {
+                result.request = {
+                  method: String(request.method),
+                  url: String(request.url),
+                  headers: request.headers.members
+                    .filter(member => !member.disabled && String(member.key).length > 0)
+                    .map(member => [String(member.key), member.value === null || member.value === undefined ? '' : String(member.value)]),
+                  body: request.body.raw === undefined || request.body.raw === null ? null : String(request.body.raw),
+                };
+              } catch (error) {
+                // What the scripts left in pm.request can't be read (a query that is no longer a list …): as in Python, the
+                // request isn't sent, and what the scripts printed, tested and set is kept.
+                if (result.error === null) {
+                  result.error = { script: '', message: 'The pre-request scripts left a request that cannot be sent: ' + fullDescribe(error), traceback: '' };
+                }
+              }
             }
 
             return stringify(result);

@@ -67,15 +67,24 @@ public sealed class OverlayScope(IVariableScope inner, IReadOnlyDictionary<strin
 /// <summary>
 /// Resolves Postman <c>{{variable}}</c> references. Scopes are searched in order (highest precedence first:
 /// local/CLI overrides, environment, collection, globals). Values may reference other variables; resolution is
-/// repeated up to <see cref="MaxDepth"/> times. Unknown variables are left as-is, like Postman does.
+/// repeated up to <see cref="MaxDepth"/> times, and adds at most <see cref="MaxGrowth"/> characters. Unknown variables
+/// are left as-is, like Postman does.
 /// </summary>
 public sealed partial class VariableResolver
 {
     public const int MaxDepth = 10;
 
-    private static readonly string[] FirstNames = ["Ada", "Alan", "Grace", "Linus", "Margaret", "Ken", "Barbara", "Dennis"];
-    private static readonly string[] LastNames = ["Lovelace", "Turing", "Hopper", "Torvalds", "Hamilton", "Thompson", "Liskov", "Ritchie"];
-    private static readonly string[] Words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"];
+    /// <summary>
+    /// How many characters resolving a text may add to it. A value that references itself (or others that reference it)
+    /// several times would multiply the text with every pass: a reference whose value would take the text past this
+    /// limit stays unresolved, and no further pass is made.
+    /// </summary>
+    public const int MaxGrowth = 4 * 1024 * 1024;
+
+    // What {{$randomFirstName}} and the like pick from; scripts get them with each message (their replaceIn resolves the same names).
+    internal static readonly string[] FirstNames = ["Ada", "Alan", "Grace", "Linus", "Margaret", "Ken", "Barbara", "Dennis"];
+    internal static readonly string[] LastNames = ["Lovelace", "Turing", "Hopper", "Torvalds", "Hamilton", "Thompson", "Liskov", "Ritchie"];
+    internal static readonly string[] Words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"];
 
     private readonly IReadOnlyList<IVariableScope> _scopes;
     private readonly TimeProvider _time;
@@ -93,10 +102,35 @@ public sealed partial class VariableResolver
     [GeneratedRegex(@"\{\{([^{}]+)\}\}", RegexOptions.CultureInvariant)]
     private static partial Regex ReferencePattern();
 
-    public static IEnumerable<string> FindReferences(string? text) =>
-        string.IsNullOrEmpty(text) ? [] : ReferencePattern().Matches(text).Select(m => m.Groups[1].Value).Distinct(StringComparer.Ordinal);
+    public static IEnumerable<string> FindReferences(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return [];
+        }
 
-    /// <summary>Replaces all resolvable references. Names that cannot be resolved are added to <paramref name="unresolved"/>.</summary>
+        // Compared before they are copied: a text that MaxGrowth cut short holds the same names many times.
+        var names = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var lookup = seen.GetAlternateLookup<ReadOnlySpan<char>>();
+        foreach (var match in ReferencePattern().EnumerateMatches(text))
+        {
+            var name = text.AsSpan(match.Index + 2, match.Length - 4);
+            if (!lookup.Contains(name))
+            {
+                var copy = name.ToString();
+                names.Add(copy);
+                seen.Add(copy);
+            }
+        }
+
+        return names;
+    }
+
+    /// <summary>
+    /// Replaces all resolvable references, as long as the text grows by at most <see cref="MaxGrowth"/> characters. Names
+    /// that cannot be resolved, or that are left at that limit, are added to <paramref name="unresolved"/>.
+    /// </summary>
     public string Resolve(string? text, ISet<string>? unresolved = null)
     {
         if (string.IsNullOrEmpty(text) || !text.Contains("{{", StringComparison.Ordinal))
@@ -104,23 +138,46 @@ public sealed partial class VariableResolver
             return text ?? "";
         }
 
+        var limit = (long)text.Length + MaxGrowth;
         var current = text;
-        for (var depth = 0; depth < MaxDepth; depth++)
+        var full = false;
+        for (var depth = 0; depth < MaxDepth && !full; depth++)
         {
+            var builder = new StringBuilder();
+            var end = 0;
+            var length = (long)current.Length;
             var replaced = false;
-            current = ReferencePattern().Replace(current, match =>
+            string? name = null;
+            foreach (var match in ReferencePattern().EnumerateMatches(current))
             {
-                var name = match.Groups[1].Value;
-                if (TryResolve(name, out var value, out _))
+                // The same name again (as in a text that grew to the limit) is not copied again.
+                var reference = current.AsSpan(match.Index + 2, match.Length - 4);
+                name = name is not null && reference.SequenceEqual(name) ? name : reference.ToString();
+                if (!TryResolve(name, out var value, out _))
                 {
-                    replaced = true;
-                    return value ?? "";
+                    continue;
                 }
 
-                return match.Value;
-            });
+                value ??= "";
+                if (length + value.Length - match.Length > limit)
+                {
+                    full = true; // left as it is; references after it that fit are still replaced
+                    continue;
+                }
 
-            if (!replaced || !current.Contains("{{", StringComparison.Ordinal))
+                length += value.Length - match.Length;
+                builder.Append(current, end, match.Index - end).Append(value);
+                end = match.Index + match.Length;
+                replaced = true;
+            }
+
+            if (!replaced)
+            {
+                break;
+            }
+
+            current = builder.Append(current, end, current.Length - end).ToString();
+            if (!current.Contains("{{", StringComparison.Ordinal))
             {
                 break;
             }
@@ -137,15 +194,12 @@ public sealed partial class VariableResolver
         return current;
     }
 
-    /// <summary>Looks up a single variable (without nested resolution) and reports the scope it came from.</summary>
+    /// <summary>
+    /// Looks up a single variable (without nested resolution) and reports the scope it came from. A variable takes the place
+    /// of a dynamic one of the same name (<c>$timestamp</c> set by a script), as in Postman and in scripts' replaceIn.
+    /// </summary>
     public bool TryResolve(string name, out string? value, out string? scopeName)
     {
-        if (name.StartsWith('$') && TryDynamic(name, out value))
-        {
-            scopeName = "dynamic";
-            return true;
-        }
-
         foreach (var scope in _scopes)
         {
             if (scope.TryGetValue(name, out value))
@@ -153,6 +207,12 @@ public sealed partial class VariableResolver
                 scopeName = scope.Name;
                 return true;
             }
+        }
+
+        if (name.StartsWith('$') && TryDynamic(name, out value))
+        {
+            scopeName = "dynamic";
+            return true;
         }
 
         value = null;

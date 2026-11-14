@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using TermRest.Core.IO;
@@ -39,6 +41,27 @@ public sealed class UserSettings
     /// (<see cref="ScriptLanguage.All"/>).
     /// </summary>
     public List<string>? ScriptLanguageOrder { get; set; }
+
+    /// <summary>
+    /// The proxy that the user allowed for each workspace folder (<see cref="WorkspaceSettings.Proxy"/>), as a SHA-256
+    /// hash (<c>sha256:…</c>), never the proxy itself: its URL can hold a password. A workspace's settings come with the
+    /// repository it was cloned from, so its proxy URL is used only once allowed here, and again after each change.
+    /// </summary>
+    public Dictionary<string, string>? AllowedProxies { get; set; }
+
+    /// <summary>
+    /// The workspace folders whose requests may send body and form-data files from outside them. Elsewhere only a
+    /// workspace's own files are sent: a collection from a repository someone else wrote could otherwise send the user's
+    /// files (SSH keys, cloud credentials) to a server of its choosing.
+    /// </summary>
+    public List<string>? OutsideFilesAllowed { get; set; }
+
+    /// <summary>
+    /// Why <see cref="Load"/> could not read the file (<c>path: problem</c>), if it could not: these are the defaults then,
+    /// and <see cref="Save"/> does not save over the file.
+    /// </summary>
+    [JsonIgnore]
+    public string? LoadError { get; private set; }
 
     /// <summary>The language order, with every language (see <see cref="ScriptLanguage.Order"/>).</summary>
     public IReadOnlyList<string> GetScriptLanguageOrder() => ScriptLanguage.Order(ScriptLanguageOrder);
@@ -99,6 +122,75 @@ public sealed class UserSettings
         }
     }
 
+    /// <summary>Whether <paramref name="proxy"/> is the proxy allowed for the workspace in <paramref name="workspaceRoot"/>.</summary>
+    public bool IsProxyAllowed(string workspaceRoot, string? proxy)
+    {
+        if (string.IsNullOrWhiteSpace(proxy) || AllowedProxies is null)
+        {
+            return false;
+        }
+
+        var hash = ProxyHash(proxy);
+        return AllowedProxies.Any(p => SameFolder(p.Key, workspaceRoot) && string.Equals(p.Value, hash, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Allows <paramref name="proxy"/> for the workspace in <paramref name="workspaceRoot"/>, in place of the one allowed
+    /// before; null or empty forgets that one. Returns false when nothing changed (there is nothing to save then).
+    /// </summary>
+    public bool AllowProxy(string workspaceRoot, string? proxy)
+    {
+        var hash = string.IsNullOrWhiteSpace(proxy) ? null : ProxyHash(proxy);
+        var keys = AllowedProxies?.Keys.Where(k => SameFolder(k, workspaceRoot)).ToList() ?? [];
+        if (hash is null ? keys.Count == 0 : keys is [var only] && string.Equals(AllowedProxies![only], hash, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        foreach (var key in keys)
+        {
+            AllowedProxies!.Remove(key);
+        }
+
+        if (hash is not null)
+        {
+            AllowedProxies ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            AllowedProxies[NormalizeFolder(workspaceRoot)] = hash;
+        }
+
+        AllowedProxies = AllowedProxies is { Count: 0 } ? null : AllowedProxies;
+        return true;
+    }
+
+    private static string ProxyHash(string proxy) => "sha256:" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(proxy.Trim())));
+
+    /// <summary>Whether requests of the workspace in <paramref name="workspaceRoot"/> may send files from outside it.</summary>
+    public bool AreOutsideFilesAllowed(string workspaceRoot) => OutsideFilesAllowed?.Any(f => SameFolder(f, workspaceRoot)) == true;
+
+    /// <summary>
+    /// Allows, or no longer allows, the requests of the workspace in <paramref name="workspaceRoot"/> to send files from
+    /// outside it. Returns false when nothing changed (there is nothing to save then).
+    /// </summary>
+    public bool AllowOutsideFiles(string workspaceRoot, bool allow)
+    {
+        if (AreOutsideFilesAllowed(workspaceRoot) == allow)
+        {
+            return false;
+        }
+
+        if (allow)
+        {
+            (OutsideFilesAllowed ??= []).Add(NormalizeFolder(workspaceRoot));
+        }
+        else
+        {
+            OutsideFilesAllowed!.RemoveAll(f => SameFolder(f, workspaceRoot));
+            OutsideFilesAllowed = OutsideFilesAllowed.Count == 0 ? null : OutsideFilesAllowed;
+        }
+
+        return true;
+    }
+
     private static bool SameFolder(string a, string b) =>
         string.Equals(NormalizeFolder(a), NormalizeFolder(b), OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
 
@@ -149,7 +241,10 @@ public sealed class UserSettings
     /// <summary>Folder with the user's custom color themes (<c>*.json</c>).</summary>
     public static string ThemesDirectory(string? directory = null) => Path.Combine(directory ?? DefaultDirectory(), "themes");
 
-    /// <summary>Reads <c>settings.json</c> from <paramref name="directory"/> (default: <see cref="DefaultDirectory"/>); defaults when missing or invalid.</summary>
+    /// <summary>
+    /// Reads <c>settings.json</c> from <paramref name="directory"/> (default: <see cref="DefaultDirectory"/>); defaults when
+    /// missing or invalid (see <see cref="LoadError"/>).
+    /// </summary>
     public static UserSettings Load(string? directory = null)
     {
         var path = Path.Combine(directory ?? DefaultDirectory(), "settings.json");
@@ -165,16 +260,19 @@ public sealed class UserSettings
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
-            return new UserSettings();
+            return new UserSettings { LoadError = $"{path}: {ex.Message}" };
         }
     }
 
     /// <summary>Writes <c>settings.json</c> to <paramref name="directory"/> (default: <see cref="DefaultDirectory"/>).</summary>
+    /// <remarks>Refused with an <see cref="IOException"/> while the file holds settings that could not be read (<see cref="LoadError"/>).</remarks>
     public void Save(string? directory = null)
     {
         directory ??= DefaultDirectory();
+        var path = Path.Combine(directory, "settings.json");
+        ApiWorkspace.ThrowIfUnreadable(path, LoadError, "then try again");
         Directory.CreateDirectory(directory);
         var json = JsonSerializer.Serialize(this, CoreJsonContext.Default.UserSettings).Replace("\r\n", "\n", StringComparison.Ordinal);
-        TextFile.WriteAtomic(Path.Combine(directory, "settings.json"), json, new TextFileInfo(false, true, false));
+        TextFile.WriteAtomic(path, json, new TextFileInfo(false, true, false));
     }
 }

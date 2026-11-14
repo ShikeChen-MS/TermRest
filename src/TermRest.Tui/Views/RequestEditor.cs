@@ -6,6 +6,7 @@ using TermRest.Core.Import;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Scripting;
+using TermRest.Tui.Dialogs;
 
 namespace TermRest.Tui.Views;
 
@@ -135,13 +136,13 @@ internal sealed class RequestEditor : View
                 MarkModified();
             }
         };
-        _certificateInfo = new Label { X = 30, Y = 3, Width = Dim.Fill(), Height = 2, Text = "" };
+        // Names a certificate and its file; next to Manage certificates…, which a hotkey from it would press.
+        _certificateInfo = new Label { HotKeySpecifier = Ui.NoHotKey, X = 30, Y = 3, Width = Dim.Fill(), Height = 2, Text = "" };
         var manageCertificates = new Button { Text = "Manage certificates…", X = 30, Y = 5 };
         manageCertificates.Accepted += (_, _) => ManageCertificatesRequested?.Invoke(this, EventArgs.Empty);
         _description = new TextArea { X = 0, Y = 8, Width = Dim.Fill(), Height = Dim.Fill() };
-        _description.UserEdited += (_, _) =>
+        _description.UserEdited += (_, text) =>
         {
-            var text = _description.GetText();
             Spec.Description = text.Length == 0 ? null : text;
             MarkModified();
         };
@@ -198,6 +199,16 @@ internal sealed class RequestEditor : View
         set => _body.BaseDirectory = value;
     }
 
+    /// <summary>The folder whose files the request may send, or null for any (see <see cref="BodyEditor.FilesFolder"/>).</summary>
+    public Func<string?>? FilesFolder
+    {
+        get => _body.FilesFolder;
+        set => _body.FilesFolder = value;
+    }
+
+    /// <summary>Looks the body file up again (after files from outside the workspace folder were allowed, or no longer).</summary>
+    public void RefreshBodyFile() => _body.RefreshFile();
+
     /// <summary>What the Body tab says about the body file (for tests).</summary>
     internal string BodyFileStatus => _body.FileStatus;
 
@@ -220,6 +231,18 @@ internal sealed class RequestEditor : View
 
     /// <summary>Shows again what the request's scripts run (after its collection's scripts or the language order changed).</summary>
     public void RefreshScripts() => _scripts.Refresh();
+
+    /// <summary>
+    /// Shows again what depends on the request's collection and folders, after it was added to a collection: the auth it
+    /// inherits, its body file (a relative path), the scripts that run with it, and its client certificate.
+    /// </summary>
+    public void RefreshContext()
+    {
+        _auth.RefreshInherited();
+        _body.RefreshFile();
+        _scripts.Refresh();
+        RefreshCertificateInfo();
+    }
 
     /// <summary>Whether requests are being recorded: the Body tab then says how body files are recorded.</summary>
     public void SetRecording(bool recording) => _body.Recording = recording;

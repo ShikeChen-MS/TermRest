@@ -80,9 +80,24 @@ internal sealed record YamlStyle(bool PreferSingleQuotes, int LineWidth = 0, boo
 /// When the original YAML is given as a hint, unchanged entries, items and scalars are copied verbatim, so an edit only
 /// touches the lines it has to.
 /// </summary>
-internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
+/// <param name="rewriteEndBlock">Write anew, rather than copy, what ends a source without a final line break with a block
+/// scalar that keeps its last line break (see <see cref="EndsWithOpenBlock"/>).</param>
+internal sealed class YamlWriter(YamlStyle style, YamlTree? source, bool rewriteEndBlock = false)
 {
     private readonly StringBuilder _out = new();
+
+    /// <summary>
+    /// Whether the output ends with a block scalar: a line after it that is indented like its text would be part of it, and
+    /// so would blank lines when it keeps them (<c>|+</c>, <c>&gt;+</c>).
+    /// </summary>
+    private BlockEnd _blockEnd;
+
+    private enum BlockEnd
+    {
+        None,
+        Block,
+        BlockKeepingBlankLines,
+    }
 
     public override string ToString() => _out.ToString();
 
@@ -103,6 +118,7 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
 
         var formattedKey = FormatKey(key);
         _out.Append(formattedKey).Append(':');
+        _blockEnd = BlockEnd.None;
         WriteValue(value, indent, hint?.Value, formattedKey.Length);
     }
 
@@ -114,7 +130,16 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
         foreach (var (key, value) in obj)
         {
             var entryHint = mapping is { IsFlow: false } ? mapping.Find(key) : null;
-            WriteEntry(key, value, indent, entryHint, inline: first && firstInline);
+            var inline = first && firstInline;
+            if (entryHint is not null && !inline && source!.StartsLine(entryHint.Key.Start))
+            {
+                // Comments and blank lines above an entry move with it, as at the top level.
+                var index = mapping!.Entries.IndexOf(entryHint);
+                var start = index > 0 ? mapping.Entries[index - 1].LastLine + 1 : TriviaAbove(entryHint.FirstLine);
+                AppendTrivia(source.Lines(start, entryHint.FirstLine - 1), indent);
+            }
+
+            WriteEntry(key, value, indent, entryHint, inline);
             first = false;
         }
     }
@@ -150,6 +175,7 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
     {
         var items = hint is { IsFlow: false } ? hint.Items : [];
         var used = new bool[items.Count];
+        var placed = new bool[items.Count];
         for (var i = 0; i < array.Count; i++)
         {
             var value = array[i];
@@ -167,18 +193,29 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
             if (equal >= 0)
             {
                 used[equal] = true;
-                if (TryCopyItem(items[equal], indent))
-                {
-                    continue;
-                }
             }
 
-            WriteItem(value, indent, equal >= 0 ? items[equal].Value : SimilarItem(items, used, i, value));
+            var match = equal >= 0 ? equal : SimilarItem(items, used, i, value);
+            if (match >= 0 && !placed[match] && items[match].DashColumn >= 0
+                && source!.StartsLine(source.LineStart(items[match].FirstLine) + items[match].DashColumn))
+            {
+                // Comments and blank lines above an item move with it.
+                placed[match] = true;
+                var start = match > 0 ? items[match - 1].LastLine + 1 : TriviaAbove(items[match].FirstLine);
+                AppendTrivia(source.Lines(start, items[match].FirstLine - 1), indent);
+            }
+
+            if (equal >= 0 && TryCopyItem(items[equal], indent))
+            {
+                continue;
+            }
+
+            WriteItem(value, indent, match >= 0 ? items[match].Value : null);
         }
     }
 
-    /// <summary>The original item that most likely is the edited version of <paramref name="value"/> (for formatting hints).</summary>
-    private static YamlNode? SimilarItem(List<YamlItem> items, bool[] used, int index, JsonNode? value)
+    /// <summary>The index of the original item that most likely is the edited version of <paramref name="value"/> (for formatting hints), or -1.</summary>
+    private static int SimilarItem(List<YamlItem> items, bool[] used, int index, JsonNode? value)
     {
         if (value is JsonObject obj)
         {
@@ -191,19 +228,20 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
                         if (!used[j] && items[j].Value is YamlMappingNode m && m.Find(identity)?.Value is YamlScalarNode s
                             && JsonNode.DeepEquals(s.ToJson(), id))
                         {
-                            return m;
+                            return j;
                         }
                     }
                 }
             }
         }
 
-        return index < items.Count && !used[index] ? items[index].Value : null;
+        return index < items.Count && !used[index] ? index : -1;
     }
 
     private void WriteItem(JsonNode? value, int indent, YamlNode? hint)
     {
         _out.Append(' ', indent).Append('-');
+        _blockEnd = BlockEnd.None;
         switch (value)
         {
             case JsonObject { Count: 0 }:
@@ -231,24 +269,59 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
     private bool TryCopyEntry(YamlEntry hint, JsonNode? value, int indent)
     {
         if (source is null || source.ColumnOf(hint.Key.Start) != indent || !source.StartsLine(hint.Key.Start)
-            || !JsonNode.DeepEquals(Json(hint.Value), value))
+            || !JsonNode.DeepEquals(Json(hint.Value), value) || EndsWithOpenBlock(hint.Value))
         {
             return false;
         }
 
         AppendLines(hint.FirstLine, hint.LastLine);
+        _blockEnd = BlockEndOf(hint.Value);
         return true;
     }
 
     private bool TryCopyItem(YamlItem hint, int indent)
     {
-        if (source is null || hint.DashColumn != indent || !source.StartsLine(source.LineStart(hint.FirstLine) + indent))
+        if (source is null || hint.DashColumn != indent || !source.StartsLine(source.LineStart(hint.FirstLine) + indent) || EndsWithOpenBlock(hint.Value))
         {
             return false;
         }
 
         AppendLines(hint.FirstLine, hint.LastLine);
+        _blockEnd = BlockEndOf(hint.Value);
         return true;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="node"/> ends a source without a final line break with a block scalar that keeps its last line
+    /// break (<c>|</c>, <c>&gt;</c>, <c>|+</c>): its value has none there, but copied before more lines it would get one.
+    /// Only when <c>rewriteEndBlock</c> is set: copied, it is right while it stays last (written without a final line break).
+    /// </summary>
+    private bool EndsWithOpenBlock(YamlNode node)
+    {
+        if (!rewriteEndBlock || source is null || source.Text.EndsWith('\n'))
+        {
+            return false;
+        }
+
+        while (true)
+        {
+            switch (node)
+            {
+                case YamlMappingNode { IsFlow: false, Entries.Count: > 0 } mapping:
+                    node = mapping.Entries[^1].Value;
+                    break;
+                case YamlSequenceNode { IsFlow: false, Items.Count: > 0 } sequence:
+                    node = sequence.Items[^1].Value;
+                    break;
+                case YamlScalarNode { Style: YamlScalarStyle.Literal or YamlScalarStyle.Folded } scalar
+                    when source.Text.AsSpan(scalar.End).IsWhiteSpace():
+                    var header = source.Text.AsSpan(scalar.Start);
+                    var end = header.IndexOfAny(' ', '\t', '\n');
+                    return !(end < 0 ? header : header[..end]).Contains('-');
+                default:
+                    return false;
+            }
+        }
     }
 
     private void AppendLines(int first, int last)
@@ -259,6 +332,50 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
         {
             _out.Append('\n');
         }
+    }
+
+    /// <summary>
+    /// Appends the comment and blank lines that stood above an entry or item now written at <paramref name="indent"/>.
+    /// After a block scalar, the first comment moves left to <paramref name="indent"/> if it is further right, which ends
+    /// the block scalar; blank lines before it are left out when the block scalar keeps blank lines.
+    /// </summary>
+    public void AppendTrivia(string lines, int indent)
+    {
+        if (_blockEnd != BlockEnd.None)
+        {
+            var hash = lines.IndexOf('#');
+            var lineStart = hash < 0 ? lines.Length : lines.LastIndexOf('\n', hash) + 1;
+            var blankLines = _blockEnd == BlockEnd.Block ? new string('\n', lines.AsSpan(0, lineStart).Count('\n')) : "";
+            lines = hash < 0 ? blankLines : blankLines + new string(' ', Math.Min(hash - lineStart, indent)) + lines[hash..];
+        }
+
+        _out.Append(lines);
+    }
+
+    /// <summary>The first of the comment and blank lines directly above <paramref name="line"/> (up to the parent's line).</summary>
+    private int TriviaAbove(int line)
+    {
+        while (line > 0 && source!.Lines(line - 1, line - 1).TrimStart(' ') is var text && (text.Length == 0 || text[0] is '\n' or '#'))
+        {
+            line--;
+        }
+
+        return line;
+    }
+
+    private BlockEnd BlockEndOf(YamlNode node) => node switch
+    {
+        YamlScalarNode { Style: YamlScalarStyle.Literal or YamlScalarStyle.Folded } scalar => BlockEndOf(source!.Text.AsSpan(scalar.Start)),
+        YamlMappingNode { IsFlow: false, Entries.Count: > 0 } mapping => BlockEndOf(mapping.Entries[^1].Value),
+        YamlSequenceNode { IsFlow: false, Items.Count: > 0 } sequence => BlockEndOf(sequence.Items[^1].Value),
+        _ => BlockEnd.None,
+    };
+
+    /// <summary>For a block scalar's text, which starts with its header (such as <c>|2+</c>).</summary>
+    private static BlockEnd BlockEndOf(ReadOnlySpan<char> block)
+    {
+        var end = block.IndexOfAny(' ', '\t', '\n');
+        return (end < 0 ? block : block[..end]).Contains('+') ? BlockEnd.BlockKeepingBlankLines : BlockEnd.Block;
     }
 
     private readonly Dictionary<YamlNode, JsonNode?> _json = new(ReferenceEqualityComparer.Instance);
@@ -283,12 +400,14 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
     /// </summary>
     private string FormatScalar(JsonNode? value, int indent, YamlScalarNode? hint, bool inSequence, int? keyLength)
     {
-        if (hint is not null && source is not null && JsonNode.DeepEquals(Json(hint), value) && CanCopyScalar(hint, indent))
+        if (hint is not null && source is not null && JsonNode.DeepEquals(Json(hint), value) && CanCopyScalar(hint, indent) && !EndsWithOpenBlock(hint))
         {
             var raw = source.Text[hint.Start..hint.End];
+            _blockEnd = BlockEndOf(hint);
             return raw.EndsWith('\n') ? raw[..^1] : raw;
         }
 
+        _blockEnd = BlockEnd.None;
         if (value is not JsonValue scalar)
         {
             return "null";
@@ -312,8 +431,9 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
         if (text.Contains('\n', StringComparison.Ordinal))
         {
             var keep = hint?.Style is YamlScalarStyle.Literal or YamlScalarStyle.Folded ? hint.Style : (YamlScalarStyle?)null;
-            return BlockScalar(text, contentIndent, inSequence, style.LineWidth, keep)
-                   ?? YamlFolding.FoldDoubleQuoted(DoubleQuoted(text), contentIndent, indentAtStart, style.LineWidth);
+            var block = BlockScalar(text, contentIndent, inSequence, style.LineWidth, keep);
+            _blockEnd = block is null ? BlockEnd.None : BlockEndOf(block);
+            return block ?? YamlFolding.FoldDoubleQuoted(DoubleQuoted(text), contentIndent, indentAtStart, style.LineWidth);
         }
 
         var quote = hint?.Style is YamlScalarStyle.SingleQuoted or YamlScalarStyle.DoubleQuoted ? hint.Style : (YamlScalarStyle?)null;
@@ -413,7 +533,8 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
         var indicator = "";
         if (firstContent.StartsWith(' '))
         {
-            if (inSequence)
+            // The YAML reader refuses a block whose first line holds only spaces ("found extra spaces in first line").
+            if (inSequence || firstContent.AsSpan().TrimStart(" \t").IsEmpty)
             {
                 return null;
             }
@@ -536,7 +657,12 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source)
         return builder.Append('"').ToString();
     }
 
-    private static string FormatKey(string key) => IsPlainSafe(key) ? key : DoubleQuoted(key);
+    /// <summary>
+    /// A mapping key as YAML writes it: quoted where a plain one would not read back, also where it holds <c>" *"</c>, as
+    /// YamlDotNet then reads the key, its colon and its value as one string (<c>Accept *: v</c>).
+    /// </summary>
+    private static string FormatKey(string key) =>
+        IsPlainSafe(key) && !key.Contains(" *", StringComparison.Ordinal) ? key : DoubleQuoted(key);
 
     // ----- detecting how a document was wrapped -------------------------------------------------------
 

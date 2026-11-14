@@ -119,7 +119,7 @@ internal sealed class RecordingIndicator : View
         var badge = new Attribute(red.IsDarkColor() ? Color.White : Color.Black, red, TextStyle.Bold);
         var elapsed = DateTimeOffset.Now - since;
         var clock = elapsed.TotalHours >= 1
-            ? elapsed.ToString(@"h\:mm\:ss", CultureInfo.InvariantCulture)
+            ? $"{(int)elapsed.TotalHours}:{elapsed.ToString(@"mm\:ss", CultureInfo.InvariantCulture)}" // past a day too
             : elapsed.ToString(@"mm\:ss", CultureInfo.InvariantCulture);
         var dot = _dotVisible ? "●" : " ";
         var narrow = (SuperView?.Viewport.Width ?? 120) < 100;

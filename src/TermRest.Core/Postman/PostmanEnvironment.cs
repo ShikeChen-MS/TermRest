@@ -22,6 +22,9 @@ public sealed class PostmanEnvironment
     private YamlFile? _yaml;
     private JsonObject? _v3;
 
+    /// <summary>What <see cref="FilePath"/> held when last read or written (see <see cref="Save"/>).</summary>
+    private FileStamp? _stamp;
+
     private PostmanEnvironment(JsonObject root, string? filePath, TextFileInfo fileInfo)
     {
         Root = root;
@@ -71,7 +74,7 @@ public sealed class PostmanEnvironment
 
     public static PostmanEnvironment Load(string path)
     {
-        var (text, info) = TextFile.Read(path);
+        var (text, info) = TextFile.Read(path, out var stamp);
         if (IsYamlPath(path))
         {
             YamlFile yaml;
@@ -88,15 +91,25 @@ public sealed class PostmanEnvironment
             var globals = fileName.Contains(".globals.", StringComparison.OrdinalIgnoreCase);
             var fallbackName = globals ? "Globals" : fileName.Split('.')[0];
             var converted = V3Convert.EnvironmentToV21(yaml.Json, fallbackName, globals);
-            return new PostmanEnvironment(converted, path, info) { _yaml = yaml, _v3 = yaml.Json };
+            return new PostmanEnvironment(converted, path, info) { _yaml = yaml, _v3 = yaml.Json, _stamp = stamp };
         }
 
-        if (PostmanJson.Parse(text) is not JsonObject root)
+        JsonNode? parsed;
+        try
+        {
+            parsed = PostmanJson.Parse(text);
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            throw new InvalidDataException($"'{path}' is not a valid Postman environment: {ex.Message}", ex);
+        }
+
+        if (parsed is not JsonObject root)
         {
             throw new InvalidDataException($"'{path}' is not a Postman environment file.");
         }
 
-        return new PostmanEnvironment(root, path, info);
+        return new PostmanEnvironment(root, path, info) { _stamp = stamp };
     }
 
     public static PostmanEnvironment Create(string name, string? filePath = null, bool globals = false)
@@ -149,35 +162,54 @@ public sealed class PostmanEnvironment
 
     public void MarkDirty() => IsDirty = true;
 
-    public void Save(string? path = null)
+    /// <param name="overwriteChanged">Write <see cref="FilePath"/> even when it changed on disk since it was read (see <see cref="IO.FileChangedException"/>).</param>
+    public void Save(string? path = null, bool overwriteChanged = false)
     {
         path ??= FilePath ?? throw new InvalidOperationException("The environment has no file path yet.");
+        var samePath = FilePath is not null && string.Equals(Path.GetFullPath(path), Path.GetFullPath(FilePath), StringComparison.OrdinalIgnoreCase);
 
         // Converting between JSON and YAML writes the target format's defaults, not the source's BOM and line breaks.
         var info = FilePath is not null && IsYamlPath(FilePath) != IsYamlPath(path)
             ? IsYamlPath(path) ? NewYamlFile : TextFileInfo.PostmanDefault
             : FileInfo;
+
+        // A copy saved elsewhere (an imported or converted environment) is as private as the file it was read from; a file
+        // saved over keeps its own permissions. Also when the path differs only in case, which is another file on Linux.
+        var newFileMode = FilePath is null ? null : TextFile.CopyMode(FilePath);
         if (IsYamlPath(path))
         {
             // Only the changed values are rewritten; the rest of the file keeps its exact text.
             var v3 = V3Convert.EnvironmentToV3(Root, _v3);
-            if (_yaml is null || !JsonNode.DeepEquals(v3, _v3) || !string.Equals(path, FilePath, StringComparison.OrdinalIgnoreCase))
+            if (_yaml is null || !JsonNode.DeepEquals(v3, _v3) || !samePath)
             {
+                ThrowIfChanged(path, samePath, overwriteChanged);
                 var style = (_yaml is null ? YamlStyle.Default : YamlStyle.Detect([_yaml.Tree])).WithLineWidth(YamlLineWidth);
-                var text = _yaml is null ? YamlFile.Write(v3, style) : _yaml.Render(v3, style);
-                TextFile.WriteAtomic(path, info.HasTrailingNewline ? text[..^1] : text, info);
-                _yaml = YamlFile.Parse(text);
+                (var text, info) = YamlFile.WriteChecked(_yaml, v3, style, path, info, out var written);
+                TextFile.WriteAtomic(path, text, info, out var stamp, newFileMode);
+                _stamp = stamp;
+                _yaml = written;
                 _v3 = v3;
             }
         }
         else
         {
-            TextFile.WriteAtomic(path, PostmanJson.Serialize(Root), info);
+            ThrowIfChanged(path, samePath, overwriteChanged);
+            TextFile.WriteAtomic(path, PostmanJson.Serialize(Root), info, out var stamp, newFileMode);
+            _stamp = stamp;
         }
 
         FilePath = path;
         FileInfo = info;
         IsDirty = false;
+    }
+
+    /// <summary>Refuses to save over the file when another program changed it since it was read: that would undo its changes.</summary>
+    private void ThrowIfChanged(string path, bool samePath, bool overwriteChanged)
+    {
+        if (!overwriteChanged && samePath && _stamp is not null && File.Exists(path) && _stamp.HasChanged(path))
+        {
+            throw new FileChangedException([Path.GetFullPath(path)]);
+        }
     }
 
     public override string ToString() => Name;

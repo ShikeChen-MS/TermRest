@@ -32,6 +32,6 @@ internal static class TestPowerShell
         }
 
         return candidates.FirstOrDefault(candidate =>
-            ScriptRuntimeLocator.CheckAsync(ScriptLanguage.PowerShell, candidate, Path.GetTempPath()).GetAwaiter().GetResult().Ok);
+            ScriptRuntimeLocator.CheckAsync(ScriptLanguage.PowerShell, candidate).GetAwaiter().GetResult().Ok);
     }
 }

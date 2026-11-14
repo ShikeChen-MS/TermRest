@@ -1,18 +1,42 @@
+using System.Text;
+
 namespace TermRest.Core.Scripting;
 
 /// <summary>
-/// The Python side of <see cref="ScriptWorker"/>, passed to the interpreter with <c>-c</c> (no file is written). It reads
-/// one JSON message per line, runs the scripts in it with the <c>tr</c> object, and writes one JSON line back. Whatever
-/// scripts print is captured, so it cannot corrupt the protocol.
+/// The Python side of <see cref="ScriptWorker"/>. No file is written: the command line (<c>-c</c>) holds a short bootstrap
+/// (<see cref="Bootstrap"/>) that reads the worker's code, hex-encoded, from the first line of input (<see cref="Preamble"/>)
+/// and runs it. It reads one JSON message per line, runs the scripts in it with the <c>tr</c> object, and writes one JSON
+/// line back. Whatever scripts print is captured, so it cannot corrupt the protocol.
 /// </summary>
 internal static class PythonWorkerCode
 {
-    public const string Source = """
-        import base64, contextlib, io, json, linecache, os, re, sys, traceback, types
+    /// <summary>
+    /// The command (python -c): reads the worker from the first line of a copy of stdin and runs it. The worker reads its
+    /// messages from the same copy (<c>_in</c>), whose buffer may hold the start of the first one already. A runtime that is
+    /// a batch file (a pyenv-win shim, python.bat) gets the command through cmd.exe, which ends a command line at its first
+    /// line break, refuses one over 8,191 characters, and takes " % ! ^ &amp; | &lt; &gt; as its own: the command is a short
+    /// line without them, with a space so that it is passed in quotes (where cmd.exe leaves parentheses alone). Hex needs no
+    /// module: one imported here (os is loaded already) could come from the workspace, which the worker leaves out of
+    /// sys.path while it imports its own.
+    /// </summary>
+    public const string Bootstrap = "import os;_in=open(os.dup(0),encoding='utf-8');exec(bytes.fromhex(_in.readline()).decode())";
 
-        # Requests come on a copy of stdin and answers go to a copy of stdout. Stdin itself then reads nothing and stdout
-        # goes to stderr, so programs that scripts start can neither take a request nor mix their output into an answer.
-        _in = os.fdopen(os.dup(sys.stdin.fileno()), "r", encoding="utf-8")
+    /// <summary>The first line of input: the worker's code, hex-encoded (UTF-8).</summary>
+    public static string Preamble { get; } = Convert.ToHexString(Encoding.UTF8.GetBytes(Source));
+
+    private const string Source = """
+        import sys
+
+        # With -c, Python looks for modules in the current folder (the workspace) first. The worker's own modules come from
+        # Python itself (a types.py in the workspace must not replace them); the scripts then import the workspace's.
+        _workspace = sys.path.pop(0) if sys.path and sys.path[0] == "" else None
+        import base64, datetime, decimal, io, json, linecache, os, re, secrets, traceback, types, uuid
+        if _workspace is not None:
+            sys.path.insert(0, _workspace)
+
+        # Requests come on a copy of stdin (_in, which the bootstrap opened) and answers go to a copy of stdout. Stdin itself
+        # then reads nothing and stdout goes to stderr, so programs that scripts start can neither take a request nor mix
+        # their output into an answer.
         _out = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", newline="\n")
         _null = os.open(os.devnull, os.O_RDONLY)
         os.dup2(_null, sys.stdin.fileno())
@@ -20,6 +44,14 @@ internal static class PythonWorkerCode
         os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
         sys.stdin = io.StringIO()
         sys.stdout = sys.stderr
+
+        # On Linux and macOS, a session of its own, without TermRest's terminal: programs that scripts start (ssh, sudo, gpg)
+        # cannot open /dev/tty to ask over TermRest's screen, and fail at once, as they do without a terminal.
+        if hasattr(os, "setsid"):
+            try:
+                os.setsid()
+            except OSError:
+                pass
         _compiled = {}
         _reference = re.compile(r"\{\{([^{}]+)\}\}")
         _max_lines = 1000
@@ -34,7 +66,110 @@ internal static class PythonWorkerCode
                 return ""
             if isinstance(value, (int, float)):
                 return str(value)
+            # Dates and times, UUIDs and decimals are their text, as in the other languages; anything else becomes JSON.
+            if isinstance(value, (datetime.date, datetime.time)):
+                return value.isoformat()
+            if isinstance(value, (uuid.UUID, decimal.Decimal)):
+                return str(value)
             return json.dumps(value)
+
+
+        class _Output(io.TextIOBase):
+            # What a script prints, as lines of up to 4,000 characters, as many as there is room for: the others are only
+            # counted, so that a script printing without end does not fill the memory.
+
+            def __init__(self, room):
+                super().__init__()
+                self.lines, self.dropped, self._room, self._line = [], 0, room, ""
+
+            def writable(self):
+                return True
+
+            def write(self, text):
+                parts = text.split("\n")
+                parts[0] = self._line + parts[0]
+                for line in parts[:-1]:
+                    self._keep(line.splitlines() or [""])
+                self._line = parts[-1][:4000]
+                return len(text)
+
+            def end(self):
+                self._keep(self._line.splitlines())
+                self._line = ""
+
+            def _keep(self, lines):
+                for line in lines:
+                    if len(self.lines) < self._room:
+                        self.lines.append(line[:4000])
+                    else:
+                        self.dropped += 1
+
+
+        class _Capture(io.TextIOBase):
+            # sys.stdout and sys.stderr from the start: what is written goes to the output of the script that runs, also through
+            # a stream kept since an earlier script (a logging handler's); between scripts, to stderr.
+
+            def __init__(self, stream):
+                super().__init__()
+                self._stream, self._output = stream, None
+
+            def writable(self):
+                return True
+
+            def begin(self, room):
+                self._output = _Output(room)
+
+            def end(self):
+                output, self._output = self._output, None
+                output.end()
+                return output
+
+            def write(self, text):
+                output = self._output
+                if output is not None:
+                    return output.write(text)
+                self._stream.write(text)
+                return len(text)
+
+            def flush(self):
+                if self._output is None:
+                    self._stream.flush()
+
+
+        _capture = _Capture(sys.stderr)
+        sys.stdout = sys.stderr = _capture
+        _alphanumeric = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+        def _dynamic(samples):
+            # Postman's dynamic variables, as requests resolve them; the names and words they pick from come with the message.
+            def pick(key):
+                values = samples.get(key) or []
+                return str(values[secrets.randbelow(len(values))]) if values else ""
+
+            def random_text(length, alphabet=_alphanumeric):
+                return "".join(alphabet[secrets.randbelow(len(alphabet))] for _ in range(length))
+
+            def now():
+                return datetime.datetime.now(datetime.timezone.utc)
+
+            return {
+                "$guid": lambda: str(uuid.uuid4()),
+                "$randomUUID": lambda: str(uuid.uuid4()),
+                "$timestamp": lambda: str(int(now().timestamp())),
+                "$isoTimestamp": lambda: now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+                "$randomInt": lambda: str(secrets.randbelow(1001)),
+                "$randomBoolean": lambda: "true" if secrets.randbelow(2) else "false",
+                "$randomAlphaNumeric": lambda: random_text(1),
+                "$randomHexadecimal": lambda: random_text(1, "0123456789abcdef"),
+                "$randomFirstName": lambda: pick("firstNames"),
+                "$randomLastName": lambda: pick("lastNames"),
+                "$randomFullName": lambda: pick("firstNames") + " " + pick("lastNames"),
+                "$randomUserName": lambda: f"{pick('firstNames').lower()}.{pick('lastNames').lower()}{secrets.randbelow(100)}",
+                "$randomEmail": lambda: f"{pick('firstNames').lower()}.{pick('lastNames').lower()}@example.com",
+                "$randomWord": lambda: pick("words"),
+                "$randomPassword": lambda: random_text(15),
+            }
 
 
         class Scope:
@@ -83,9 +218,10 @@ internal static class PythonWorkerCode
         class Variables(Scope):
             # tr.variables reads every scope (this request, environment, collection, globals) and sets this request's.
 
-            def __init__(self, local, changes, scopes):
+            def __init__(self, local, changes, scopes, dynamic=None):
                 super().__init__(local, changes)
                 self._scopes = scopes
+                self._dynamic = dynamic or {}
 
             def get(self, key, default=None):
                 for values in self._scopes:
@@ -109,8 +245,16 @@ internal static class PythonWorkerCode
                 return value
 
             def replace_in(self, text):
+                def value(match):
+                    name = match.group(1).strip()
+                    found = self.get(name)
+                    if found is not None:
+                        return found
+                    generate = self._dynamic.get(name)
+                    return generate() if generate is not None else match.group(0)
+
                 for _ in range(10):
-                    replaced = _reference.sub(lambda m: self.get(m.group(1).strip(), m.group(0)), text)
+                    replaced = _reference.sub(value, text)
                     if replaced == text:
                         break
                     text = replaced
@@ -187,8 +331,22 @@ internal static class PythonWorkerCode
                 self.name = data.get("name")
                 self.method = data.get("method", "GET")
                 self.url = data.get("url", "")
+                self._writable = writable
                 self.headers = Headers(data.get("headers", []), writable)
                 self.body = data.get("body")
+
+            @property
+            def headers(self):
+                return self._headers
+
+            @headers.setter
+            def headers(self, value):
+                # As with requests: a dict, any other mapping (requests' CaseInsensitiveDict), or (name, value) pairs
+                # replaces the headers.
+                if not isinstance(value, Headers):
+                    pairs = value.items() if callable(getattr(value, "items", None)) else value
+                    value = Headers([(name, _text(item)) for name, item in pairs], self._writable)
+                self._headers = value
 
             def __repr__(self):
                 return f"<{self.method} {self.url}>"
@@ -223,13 +381,25 @@ internal static class PythonWorkerCode
 
 
         def _failure(error):
-            message = str(error)
+            message = _message(error)
             if isinstance(error, AssertionError):
                 if not message:
                     frame = traceback.extract_tb(error.__traceback__)[-1]
                     message = f"assertion failed: {frame.line}" if frame.line else "assertion failed"
                 return message
             return f"{type(error).__name__}: {message}"
+
+
+        def _describe(error):
+            return f"{type(error).__name__}: {_message(error)}"
+
+
+        def _message(error):
+            # An exception's own text, also of one whose __str__ fails (it would fail the whole answer).
+            try:
+                return str(error)
+            except Exception:
+                return "(its message could not be read)"
 
 
         def _tests(results, info):
@@ -276,7 +446,7 @@ internal static class PythonWorkerCode
                 environment=Scope(values["environment"], changes["environment"]),
                 collection_variables=Scope(values["collection"], changes["collection"]),
                 globals=Scope(values["globals"], changes["globals"]),
-                variables=Variables(values["local"], changes["local"], [values["local"], values["environment"], values["collection"], values["globals"]]),
+                variables=Variables(values["local"], changes["local"], [values["local"], values["environment"], values["collection"], values["globals"]], _dynamic(message.get("dynamic") or {})),
                 request=request,
                 response=Response(message["response"]) if message.get("response") else None,
                 info=info,
@@ -286,30 +456,46 @@ internal static class PythonWorkerCode
             dropped = 0
             for script in message.get("scripts") or []:
                 info.script = script["name"]
-                output = io.StringIO()
+                _capture.begin(max(_max_lines - len(logs), 0))
                 stdin = sys.stdin
                 try:
                     code = _compile(script["name"], script["code"])
                     sys.stdin = io.StringIO()
-                    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-                        exec(code, {"__name__": "__termrest__", "tr": tr})
+                    sys.stdout = sys.stderr = _capture
+                    exec(code, {"__name__": "__termrest__", "tr": tr})
                 except SystemExit as stop:
                     if stop.code not in (None, 0):
                         error = {"script": script["name"], "message": f"SystemExit: {stop.code}", "traceback": ""}
                 except BaseException as failure:
-                    error = {"script": script["name"], "message": f"{type(failure).__name__}: {failure}", "traceback": _traceback(failure, script["name"])}
+                    error = {"script": script["name"], "message": _describe(failure), "traceback": _traceback(failure, script["name"])}
                 finally:
                     sys.stdin = stdin
-                lines = output.getvalue().splitlines()
-                room = max(_max_lines - len(logs), 0)
-                logs.extend({"script": script["name"], "text": line[:4000]} for line in lines[:room])
-                dropped += max(len(lines) - room, 0)
+                    sys.stdout = sys.stderr = _capture
+                    output = _capture.end()
+                logs.extend({"script": script["name"], "text": line} for line in output.lines)
+                dropped += output.dropped
                 if error:
                     break
             result = {"changes": changes, "tests": tests, "logs": logs, "dropped": dropped, "error": error}
             if phase == "prerequest":
-                body = request.body if request.body is None else str(request.body)
-                result["request"] = {"method": str(request.method), "url": str(request.url), "headers": request.headers._pairs, "body": body}
+                try:
+                    body = request.body
+                    if isinstance(body, (bytes, bytearray)):
+                        body = bytes(body).decode("utf-8", "replace")  # json.dumps(…).encode(): the text, not "b'…'"
+                    elif isinstance(body, (dict, list, tuple, bool)):
+                        try:
+                            body = _text(body)  # JSON, as variables get it, not Python's text ({'a': 1}, True)
+                        except (TypeError, ValueError) as failure:
+                            result["error"] = error or {"script": "", "message": f"The pre-request scripts set the request body to a {type(body).__name__} that cannot be sent as JSON: {failure}", "traceback": ""}
+                            body = None
+                    elif body is not None:
+                        body = str(body)
+                    headers = [[str(name), str(value)] for name, value in request.headers._pairs]
+                    result["request"] = {"method": str(request.method), "url": str(request.url), "headers": headers, "body": body}
+                except Exception as failure:
+                    # What the scripts left in tr.request can't be read (headers that are not a Headers object …): the
+                    # request isn't sent, and what the scripts printed, tested and set is kept.
+                    result["error"] = error or {"script": "", "message": f"The pre-request scripts left a request that cannot be sent: {_describe(failure)}", "traceback": ""}
             return result
 
 

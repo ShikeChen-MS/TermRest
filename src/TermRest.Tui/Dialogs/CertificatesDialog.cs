@@ -1,10 +1,12 @@
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using Terminal.Gui.App;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using TermRest.Core.Certificates;
+using TermRest.Core.IO;
 using TermRest.Core.Workspace;
 
 namespace TermRest.Tui.Dialogs;
@@ -19,9 +21,9 @@ internal static class CertificatesDialog
     {
         var registry = workspace.Certificates;
         using var dialog = new Dialog { Title = "Client certificates (mutual TLS)", Width = Dim.Percent(92), Height = Dim.Percent(85) };
-        var table = new TableView { X = 1, Y = 1, Width = Dim.Fill(1), Height = Dim.Fill(6), FullRowSelect = true };
+        var table = new TableView { X = 1, Y = 1, Width = Dim.Fill(1), Height = Dim.Fill(8), FullRowSelect = true };
         table.Style.ExpandLastColumn = true;
-        var details = new Label { X = 1, Y = Pos.AnchorEnd(5), Width = Dim.Fill(1), Height = 3, Text = "" };
+        var details = new Label { X = 1, Y = Pos.AnchorEnd(7), Width = Dim.Fill(1), Height = 3, Text = "", HotKeySpecifier = Ui.NoHotKey };
 
         void Refresh(int select)
         {
@@ -46,8 +48,48 @@ internal static class CertificatesDialog
 
         void Persist()
         {
-            workspace.SaveCertificates();
+            try
+            {
+                workspace.SaveCertificates();
+            }
+            catch (FileChangedException)
+            {
+                // A git pull or another TermRest changed the file: saving the list shown here would undo that.
+                if (MessageBox.Query(app, "Changed on disk",
+                        $"{Path.GetRelativePath(workspace.RootPath, workspace.CertificatesPath)} changed on disk since TermRest read it (a git pull, another TermRest).\n\n" +
+                        "Saving the list shown here would undo those changes. Choose Cancel to load the file's entries instead: this change is then not saved.",
+                        "Overwrite", "Cancel") != 0)
+                {
+                    Reload();
+                    return;
+                }
+
+                if (!Ui.TrySave(app, () => workspace.SaveCertificates(overwriteChanged: true)))
+                {
+                    return;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Ui.Error(app, "Save failed", ex.Message);
+                return;
+            }
+
             runner.ReloadCertificates();
+        }
+
+        void Reload()
+        {
+            try
+            {
+                workspace.ReloadCertificates();
+                registry = workspace.Certificates;
+                runner.ReloadCertificates();
+            }
+            catch (Exception ex) when (ex is JsonException or InvalidDataException or IOException or UnauthorizedAccessException)
+            {
+                Ui.Error(app, "Load failed", $"{workspace.CertificatesPath}: {ex.Message}\n\nThe change was not saved.");
+            }
         }
 
         void Add(CertificateEntry? template)
@@ -61,12 +103,13 @@ internal static class CertificatesDialog
             }
         }
 
-        var addPem = new Button { Text = "Add PEM…", X = 1, Y = Pos.AnchorEnd(1) };
-        addPem.Accepted += (_, _) => Add(new CertificateEntry { Cert = new FileSource(), Key = new FileSource() });
-        var addPfx = new Button { Text = "Add PFX…", X = Pos.Right(addPem) + 1, Y = Pos.AnchorEnd(1) };
-        addPfx.Accepted += (_, _) => Add(new CertificateEntry { Pfx = new FileSource() });
-        var addStore = new Button { Text = "Add from OS store…", X = Pos.Right(addPfx) + 1, Y = Pos.AnchorEnd(1) };
-        addStore.Accepted += (_, _) =>
+        // Two rows of buttons, adding and changing entries, so that they fit a terminal of 80 columns.
+        var addPem = new Button { Text = "Add PEM…", X = 1, Y = Pos.AnchorEnd(3) };
+        Ui.OnPress(addPem, () => Add(new CertificateEntry { Cert = new FileSource(), Key = new FileSource() }));
+        var addPfx = new Button { Text = "Add PFX…", X = Pos.Right(addPem) + 1, Y = Pos.AnchorEnd(3) };
+        Ui.OnPress(addPfx, () => Add(new CertificateEntry { Pfx = new FileSource() }));
+        var addStore = new Button { Text = "Add from OS store…", X = Pos.Right(addPfx) + 1, Y = Pos.AnchorEnd(3) };
+        Ui.OnPress(addStore, () =>
         {
             if (StorePickerDialog.Show(app) is { } picked)
             {
@@ -76,9 +119,9 @@ internal static class CertificatesDialog
                     Store = new StoreSource { Location = picked.Source?.Split('\\')[0] ?? "CurrentUser", StoreName = "My", Thumbprint = picked.Thumbprint },
                 });
             }
-        };
-        var edit = new Button { Text = "Edit…", X = Pos.Right(addStore) + 1, Y = Pos.AnchorEnd(1) };
-        edit.Accepted += (_, _) =>
+        });
+        var edit = new Button { Text = "Edit…", X = 1, Y = Pos.AnchorEnd(1) };
+        Ui.OnPress(edit, () =>
         {
             if (Selected() is { } selected && CertificateEntryDialog.Show(app, workspace, selected.Clone(), suggestedUrl) is { } edited)
             {
@@ -87,19 +130,20 @@ internal static class CertificatesDialog
                 Persist();
                 Refresh(index);
             }
-        };
+        });
         var toggle = new Button { Text = "On/Off", X = Pos.Right(edit) + 1, Y = Pos.AnchorEnd(1) };
-        toggle.Accepted += (_, _) =>
+        Ui.OnPress(toggle, () =>
         {
             if (Selected() is { } selected)
             {
+                var index = registry.Entries.IndexOf(selected);
                 selected.Disabled = !selected.Disabled;
                 Persist();
-                Refresh(registry.Entries.IndexOf(selected));
+                Refresh(index);
             }
-        };
+        });
         var remove = new Button { Text = "Remove", X = Pos.Right(toggle) + 1, Y = Pos.AnchorEnd(1) };
-        remove.Accepted += (_, _) =>
+        Ui.OnPress(remove, () =>
         {
             if (Selected() is { } selected && Ui.Confirm(app, "Remove certificate", $"Remove '{selected.Name}' from the workspace registry? (Files and store entries are not deleted.)", "Remove", "Cancel"))
             {
@@ -108,18 +152,21 @@ internal static class CertificatesDialog
                 Persist();
                 Refresh(index);
             }
-        };
+        });
         var test = new Button { Text = "Test", X = Pos.Right(remove) + 1, Y = Pos.AnchorEnd(1) };
-        test.Accepted += (_, _) =>
+        Ui.OnPress(test, () =>
         {
             if (Selected() is { } selected)
             {
                 details.Text = TestLoad(selected, workspace, runner);
             }
-        };
+        });
         table.ValueChanged += (_, _) => details.Text = Selected() is { } s ? $"{s.Name}: {s.DescribeSource()}\nPress Test to load it and check the private key." : "";
-        table.Accepted += (_, _) =>
+
+        // Enter or a double-click on a row tests it, rather than closing the dialog.
+        table.Accepting += (_, e) =>
         {
+            e.Handled = true;
             if (Selected() is { } selected)
             {
                 details.Text = TestLoad(selected, workspace, runner);
@@ -150,7 +197,7 @@ internal static class CertificatesDialog
             var loaded = runner.Certificates.Load(entry, workspace.RootPath, value =>
                 value is not null && value.StartsWith("env:", StringComparison.OrdinalIgnoreCase)
                     ? Environment.GetEnvironmentVariable(value[4..])
-                    : resolver.Resolve(value));
+                    : resolver.Resolve(value), runner.FilesFolder);
             var summary = loaded.Summary;
             var builder = new StringBuilder();
             builder.Append(CultureInfo.InvariantCulture, $"✓ {summary.Subject}  issued by {summary.IssuerCommonName}\n");
@@ -246,7 +293,9 @@ internal static class CertificateEntryDialog
                     result.Store = new StoreSource
                     {
                         Location = location.Value == 1 ? "LocalMachine" : "CurrentUser",
-                        StoreName = "My",
+
+                        // Not shown here: an entry for another store (TrustedPeople…) stays in it.
+                        StoreName = entry.Store?.StoreName ?? "My",
                         Thumbprint = string.IsNullOrWhiteSpace(thumbprint.Text) ? null : CertificateLoader.NormalizeThumbprint(thumbprint.Text),
                         Subject = string.IsNullOrWhiteSpace(subject.Text) ? null : subject.Text.Trim(),
                     };
@@ -295,7 +344,7 @@ internal static class CertificateEntryDialog
     {
         var field = Ui.AddRow(dialog, label, new TextField { Text = value, Width = Dim.Fill(13) }, y);
         var browse = new Button { Text = "Browse…", X = Pos.AnchorEnd(12), Y = y };
-        browse.Accepted += (_, _) =>
+        Ui.OnPress(browse, () =>
         {
             if (Ui.PickFile(app, label, workspace.RootPath) is { } path)
             {
@@ -303,7 +352,7 @@ internal static class CertificateEntryDialog
                 var relative = Path.GetRelativePath(workspace.RootPath, path);
                 field.Text = relative.StartsWith("..", StringComparison.Ordinal) ? path : relative.Replace('\\', '/');
             }
-        };
+        });
         dialog.Add(browse);
         return field;
     }

@@ -1,3 +1,7 @@
+using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace TermRest.Core.Certificates;
@@ -10,6 +14,8 @@ namespace TermRest.Core.Certificates;
 /// </summary>
 public sealed class UrlMatchPattern
 {
+    private static readonly IdnMapping Idn = new();
+
     private readonly string? _scheme;
     private readonly string _host;
     private readonly int? _port;
@@ -83,6 +89,31 @@ public sealed class UrlMatchPattern
         if (host.Length == 0 || (host.Contains('*', StringComparison.Ordinal) && host != "*" && !host.StartsWith("*.", StringComparison.Ordinal)))
         {
             return false;
+        }
+
+        // An IPv6 address is matched as Uri.IdnHost gives it: without brackets, in its shortest form ([0:0::1] is ::1).
+        if (host.StartsWith('['))
+        {
+            if (!host.EndsWith(']') || !IPAddress.TryParse(host[1..^1], out var address) || address.AddressFamily != AddressFamily.InterNetworkV6)
+            {
+                return false;
+            }
+
+            host = address.ToString();
+        }
+
+        // URLs are matched by their host in ASCII (Uri.IdnHost), so a host written in Unicode is matched in its ASCII form.
+        if (!Ascii.IsValid(host))
+        {
+            var wildcard = host.StartsWith("*.", StringComparison.Ordinal) ? "*." : "";
+            try
+            {
+                host = wildcard + Idn.GetAscii(host[wildcard.Length..]);
+            }
+            catch (ArgumentException)
+            {
+                return false; // no URL has such a host
+            }
         }
 
         Regex? pathRegex = pathGlob is "/*" or "*" ? null

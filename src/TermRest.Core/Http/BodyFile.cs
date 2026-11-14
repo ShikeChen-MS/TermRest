@@ -165,25 +165,66 @@ public static class BodyFile
 
         // No DTD processing and no resolver: entities and external references are never followed.
         var settings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Ignore, XmlResolver = null, CloseInput = false };
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                using var reader = XmlReader.Create(stream, settings);
+                for (var nodes = 1; reader.Read(); nodes++)
+                {
+                    if (nodes % 4096 == 0)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+                }
+
+                return null;
+            }
+            catch (XmlException ex)
+            {
+                if (attempt == 0 && ex.InnerException is ArgumentException or NotSupportedException && UseCodePages(stream))
+                {
+                    stream.Position = 0; // read again, now in the encoding the declaration names
+                    continue;
+                }
+
+                var message = ex.Message;
+                var position = message.LastIndexOf(" Line ", StringComparison.Ordinal);
+                return $"{name} is not well-formed XML: {Describe(position > 0 ? message[..position] : message, ex.LineNumber > 0 ? ex.LineNumber : null, ex.LinePosition)}";
+            }
+        }
+    }
+
+    /// <summary>
+    /// Registers the legacy code pages when the XML declaration at the start of <paramref name="stream"/> names one of them
+    /// (windows-1252, ISO-8859-15, Shift_JIS …): XmlReader looks the declared encoding up with
+    /// <see cref="Encoding.GetEncoding(string)"/>, which knows them only once they are registered. Only a file that needs
+    /// them registers them, for the rest of the run (see <see cref="BodyFormatter.GetEncoding"/>). False when they would
+    /// not help.
+    /// </summary>
+    private static bool UseCodePages(FileStream stream)
+    {
+        string? declared;
         try
         {
-            using var reader = XmlReader.Create(stream, settings);
-            for (var nodes = 1; reader.Read(); nodes++)
-            {
-                if (nodes % 4096 == 0)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                }
-            }
-
-            return null;
+            // The declaration is ASCII in the encodings it can name here; a reader of text keeps the encoding it is given.
+            stream.Position = 0;
+            using var text = new StreamReader(stream, Encoding.Latin1, detectEncodingFromByteOrderMarks: false, bufferSize: 1024, leaveOpen: true);
+            using var reader = XmlReader.Create(text, new XmlReaderSettings { DtdProcessing = DtdProcessing.Ignore, XmlResolver = null });
+            declared = reader.Read() && reader.NodeType == XmlNodeType.XmlDeclaration ? reader.GetAttribute("encoding") : null;
         }
-        catch (XmlException ex)
+        catch (XmlException)
         {
-            var message = ex.Message;
-            var position = message.LastIndexOf(" Line ", StringComparison.Ordinal);
-            return $"{name} is not well-formed XML: {Describe(position > 0 ? message[..position] : message, ex.LineNumber > 0 ? ex.LineNumber : null, ex.LinePosition)}";
+            return false;
         }
+
+        if (declared is null || CodePagesEncodingProvider.Instance.GetEncoding(declared) is null)
+        {
+            return false;
+        }
+
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        return true;
     }
 
     /// <summary>Text, HTML and JavaScript: the start of the file must look like text (no UTF-16, no NUL bytes).</summary>

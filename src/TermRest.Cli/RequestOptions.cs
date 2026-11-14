@@ -10,7 +10,7 @@ namespace TermRest.Cli;
 /// <summary>Options shared by <c>send</c> and <c>run</c>.</summary>
 internal sealed class RequestOptions
 {
-    public Option<string?> Environment { get; } = new("--env", "-e") { Description = "Environment name in the workspace, or a *.postman_environment.json file" };
+    public Option<string?> Environment { get; } = new("--env", "-e") { Description = "Environment name in the workspace, or an environment file (*.postman_environment.json, or a v3 *.environment.yaml)" };
 
     public Option<string[]> Variables { get; } = new("--var") { Description = "Set a variable (highest precedence): --var key=value (repeatable)" };
 
@@ -49,6 +49,11 @@ internal sealed class RequestOptions
 
     public Option<bool> NoScripts { get; } = new("--no-scripts") { Description = "Do not run pre-request and test scripts" };
 
+    public Option<bool> AllowOutsideFiles { get; } = new("--allow-outside-files")
+    {
+        Description = "Also send body and form-data files from outside the workspace folder (default: only where allowed for the workspace in the full-screen UI, Tools › Settings…)",
+    };
+
     public void AddTo(Command command)
     {
         command.Options.Add(Environment);
@@ -61,6 +66,7 @@ internal sealed class RequestOptions
         command.Options.Add(PowerShell);
         command.Options.Add(ScriptOrder);
         command.Options.Add(NoScripts);
+        command.Options.Add(AllowOutsideFiles);
     }
 
     /// <summary>
@@ -94,7 +100,8 @@ internal sealed class RequestOptions
     }
 
     /// <summary>Writes the <c>--record</c> file. Returns false when it could not be written (reported; the recording can still be recovered).</summary>
-    public bool SaveRecording(ParseResult parseResult, RequestRunner runner, RequestRecorder? recorder)
+    /// <param name="stopping">Whether the command was cancelled (Ctrl+C): saving a large recording takes a while, so it says what a second Ctrl+C does.</param>
+    public bool SaveRecording(ParseResult parseResult, RequestRunner runner, RequestRecorder? recorder, bool stopping)
     {
         if (recorder is null)
         {
@@ -103,6 +110,12 @@ internal sealed class RequestOptions
 
         runner.Recorder = null;
         var path = parseResult.GetValue(Record)!;
+        if (stopping)
+        {
+            Output.Info($"Saving the recording to {path}…");
+            Output.Info($"  Ctrl+C again ends TermRest at once; open TermRest then and use Tools > Recover unsaved recordings ({recorder.TempDirectory}).");
+        }
+
         try
         {
             var result = recorder.Save(path);
@@ -120,12 +133,13 @@ internal sealed class RequestOptions
     }
 
     /// <summary>Opens the workspace for a collection file or folder and configures a runner. Returns null on error (already reported).</summary>
+    /// <remarks>Of the workspace's collections, only the one given is loaded (all of them for a workspace folder).</remarks>
     public (ApiWorkspace Workspace, PostmanCollection? Collection, RequestRunner Runner)? Open(ParseResult parseResult, string path, Option<bool> insecure)
     {
         ApiWorkspace workspace;
         try
         {
-            workspace = ApiWorkspace.Open(path);
+            workspace = ApiWorkspace.Open(path, CollectionLoading.Requested);
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
         {
@@ -170,19 +184,51 @@ internal sealed class RequestOptions
 
         if (runner.ScriptsEnabled)
         {
-            runner.ConfigureScripts(parseResult.GetValue(Python), parseResult.GetValue(JavaScript), parseResult.GetValue(CSharp), parseResult.GetValue(PowerShell),
-                scriptOrder: scriptOrder);
+            runner.ConfigureScripts(Runtime(Python), Runtime(JavaScript), Runtime(CSharp), Runtime(PowerShell), scriptOrder: scriptOrder);
+            if (runner.UserSettingsError is { } problem)
+            {
+                Output.Warning(problem);
+                Output.Info("  The script runtimes chosen for this workspace and your script language order are not used until the file is fixed.");
+            }
         }
+
+        runner.ConfigureProxy();
+        if (runner.BlockedProxy is { } proxy)
+        {
+            Output.Warning($"The proxy in {workspace.SettingsPath} ({PostmanUrl.MaskCredentials(proxy.Trim())}) is not used, as a cloned repository could send " +
+                           "your requests through a proxy of its choosing; requests use the system's proxy settings. Allow it in the full-screen UI " +
+                           "(Tools > Settings > Save), or set HTTPS_PROXY.");
+        }
+
+        runner.ConfigureFiles();
+        runner.OutsideFilesAllowed |= parseResult.GetValue(AllowOutsideFiles);
 
         if (parseResult.GetValue(Environment) is { } environment)
         {
             if (File.Exists(environment))
             {
-                runner.EnvironmentOverride = PostmanEnvironment.Load(environment);
+                try
+                {
+                    runner.EnvironmentOverride = PostmanEnvironment.Load(environment);
+                }
+                catch (Exception ex) when (ex is System.Text.Json.JsonException or InvalidDataException or IOException or UnauthorizedAccessException)
+                {
+                    Output.Error($"Environment file '{environment}' could not be read: {ex.Message}");
+                    runner.Dispose();
+                    return null;
+                }
             }
-            else if (workspace.Environments.FirstOrDefault(e => string.Equals(e.Name, environment, StringComparison.OrdinalIgnoreCase)) is { } named)
+            else if (workspace.Environments.FindAll(e => string.Equals(e.Name, environment, StringComparison.OrdinalIgnoreCase)) is { Count: > 0 } named)
             {
-                runner.EnvironmentOverride = named;
+                if (named.Count > 1)
+                {
+                    Output.Error($"Environment '{environment}' is ambiguous: environments in these files have that name\n  " +
+                                 string.Join("\n  ", named.Select(e => e.FilePath)) + "\nPass the file of the one to use with -e instead.");
+                    runner.Dispose();
+                    return null;
+                }
+
+                runner.EnvironmentOverride = named[0];
             }
             else
             {
@@ -206,5 +252,47 @@ internal sealed class RequestOptions
         }
 
         return (workspace, collection, runner);
+
+        // A runtime's path is relative to the current folder, as the other paths of the command line are (the runner takes it
+        // as relative to the workspace, as it does the UI's choices); a command (node) stays a name, looked up on PATH.
+        string? Runtime(Option<string?> option)
+        {
+            var runtime = parseResult.GetValue(option);
+            var path = runtime?.Trim().Trim('"');
+            return path is not null && path.IndexOfAny(['/', '\\']) >= 0 && !Path.IsPathRooted(path) ? Path.GetFullPath(path) : runtime;
+        }
+    }
+
+    /// <summary>
+    /// Reports workspace settings that could not be read (their warning is printed when the workspace is opened): no
+    /// request is sent then, as they may set the proxy and TLS verification, turn the history off and name what
+    /// recordings and reports redact.
+    /// </summary>
+    public static bool ReportUnreadableSettings(ApiWorkspace workspace)
+    {
+        if (workspace.SettingsError is null)
+        {
+            return false;
+        }
+
+        Output.Error($"The workspace settings could not be read (see the warning above), so no request is sent: they may set the proxy, " +
+                     $"TLS verification, the history and what recordings redact. Fix or delete {workspace.SettingsPath}.");
+        return true;
+    }
+
+    /// <summary>
+    /// Reports when files of <paramref name="collection"/> could not be read (their warnings are printed when the
+    /// workspace is opened): a v3 request file that was left out, or a definition whose auth and scripts are missing.
+    /// The send or run fails then; the note about hidden non-HTTP requests is not such a problem.
+    /// </summary>
+    public static bool ReportUnreadableFiles(PostmanCollection collection)
+    {
+        if (!collection.HasUnreadableFiles)
+        {
+            return false;
+        }
+
+        Output.Error($"Files of '{collection.Name}' could not be read (see the warnings above): its requests may lack their auth, scripts and tests.");
+        return true;
     }
 }

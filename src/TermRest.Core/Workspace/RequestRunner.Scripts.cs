@@ -1,9 +1,13 @@
+using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization.Metadata;
 using TermRest.Core.Http;
 using TermRest.Core.Json;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Scripting;
+using TermRest.Core.Variables;
 
 namespace TermRest.Core.Workspace;
 
@@ -12,6 +16,10 @@ namespace TermRest.Core.Workspace;
 // per language; a request runs those of one language only (ScriptPlan), one at a time, in one runtime.
 public sealed partial class RequestRunner
 {
+    /// <summary>A response body as bytes (base64 for scripts): <see cref="ScriptWorker"/> writes it in parts, with no copy as text.</summary>
+    private static readonly JsonTypeInfo<byte[]> BodyBytes = JsonMetadataServices.CreateValueInfo<byte[]>(
+        new JsonSerializerOptions { TypeInfoResolver = JsonTypeInfoResolver.Combine() }, JsonMetadataServices.ByteArrayConverter);
+
     private readonly Lock _scriptLock = new();
     private readonly Dictionary<string, string> _runtimes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ScriptWorker> _workers = new(StringComparer.Ordinal);
@@ -29,6 +37,12 @@ public sealed partial class RequestRunner
     /// is sent.
     /// </summary>
     public bool RequireScriptRuntimes { get; set; } = true;
+
+    /// <summary>
+    /// Why the user's settings, which choose the runtimes and the language order, could not be read by
+    /// <see cref="ConfigureScripts"/>; null when they could (or there are none). Their defaults are used then.
+    /// </summary>
+    public string? UserSettingsError { get; private set; }
 
     /// <summary>The Python that runs Python scripts; null when none is chosen.</summary>
     public string? PythonInterpreter => GetRuntime(ScriptLanguage.Python);
@@ -87,13 +101,14 @@ public sealed partial class RequestRunner
     /// <paramref name="cSharp"/> and <paramref name="powerShell"/> (CLI <c>--python</c>, <c>--javascript</c>,
     /// <c>--csharp</c>, <c>--powershell</c>), else the ones chosen for this workspace in the user's settings (Tools ›
     /// Scripts in the full-screen UI); and the language order: <paramref name="scriptOrder"/> first (CLI
-    /// <c>--script-order</c>), then the user's.
+    /// <c>--script-order</c>), then the user's. When the user's settings cannot be read, see <see cref="UserSettingsError"/>.
     /// </summary>
     /// <param name="userSettingsDirectory">Overrides the user's configuration folder (tests, portable setups).</param>
     public void ConfigureScripts(string? python = null, string? javaScript = null, string? cSharp = null, string? powerShell = null,
         string? userSettingsDirectory = null, IEnumerable<string>? scriptOrder = null)
     {
         var settings = UserSettings.Load(userSettingsDirectory);
+        UserSettingsError = settings.LoadError;
         Choose(ScriptLanguage.Python, python);
         Choose(ScriptLanguage.JavaScript, javaScript);
         Choose(ScriptLanguage.CSharp, cSharp);
@@ -139,7 +154,10 @@ public sealed partial class RequestRunner
 
     public void SetPowerShellRuntime(string? pwsh) => SetRuntime(ScriptLanguage.PowerShell, pwsh);
 
-    /// <summary>A command name (<c>python3</c>, <c>node</c>, <c>dotnet</c>, <c>pwsh</c>) is looked up on PATH; a relative path is relative to the workspace folder.</summary>
+    /// <summary>
+    /// A command name (<c>python3</c>, <c>node</c>, <c>dotnet</c>, <c>pwsh</c>) stays as it is, to be looked up on PATH only
+    /// when it starts (<see cref="ScriptRuntimeLocator.Executable"/>); a relative path is relative to the workspace folder.
+    /// </summary>
     public string ResolveRuntime(string runtime)
     {
         runtime = runtime.Trim().Trim('"');
@@ -176,37 +194,43 @@ public sealed partial class RequestRunner
     /// request run first: they can set variables and change the request. A failed one stops the request: it is not sent.
     /// The request is then prepared (<paramref name="prepared"/> sees it before it goes out) and sent, and the test
     /// scripts run on the response, in the same order. Only then is it recorded in <see cref="History"/> and
-    /// <see cref="Recorder"/>, with what the scripts did in <see cref="HttpExchange.Scripts"/>.
+    /// <see cref="Recorder"/>, with what the scripts did in <see cref="HttpExchange.Scripts"/>; values they kept in
+    /// variables typed secret or named like secrets count among the request's secrets there (a token from a login).
     /// The scripts that run are those of one language (<see cref="PlanScripts"/>), so one runtime runs them, one after
     /// the other. When no language has all the scripts the request runs, it is not sent.
+    /// The request is <paramref name="spec"/> as it is, and runs in the <see cref="Environment"/> chosen, when this is
+    /// called: editing the request or switching the environment while it runs changes later requests only.
     /// Without scripts this is exactly <see cref="Prepare(PostmanCollection, RequestNode?, HttpRequestSpec)"/> and send.
     /// </summary>
     public async Task<HttpExchange> SendAsync(PostmanCollection collection, RequestNode? node, HttpRequestSpec spec,
         Action<PreparedRequest>? prepared, CancellationToken cancellationToken = default)
     {
         // No ConfigureAwait(false) here either: UI callers resume on their own thread.
+        var environment = Environment;
         var plan = ScriptsEnabled ? PlanScripts(collection, node, spec.Scripts, spec.ScriptSettings) : ScriptPlan.None;
         if (plan.IsEmpty && plan.Error is null && plan.Notes.Count == 0)
         {
-            var request = Prepare(collection, node, spec);
+            var request = Prepare(environment, collection, node, spec, spec, null);
             prepared?.Invoke(request);
-            return await SendAsync(request, cancellationToken).ConfigureAwait(true);
+            return await SendAsync(environment, request, cancellationToken).ConfigureAwait(true);
         }
 
+        // Copied before the scripts run: the caller's request may be edited meanwhile (the full-screen UI's editor stays open).
+        var source = spec.Clone();
         var results = new ScriptResults();
         results.Notes.AddRange(plan.Notes);
         var local = new Dictionary<string, string?>(StringComparer.Ordinal);
-        var working = spec;
+        var working = source;
         if (plan.Error is { } planError)
         {
-            results.Error = new ScriptError("", planError);
+            results.Error = new ScriptError("", planError) { NotRun = true };
         }
         else if (plan.PreRequest.Count > 0)
         {
-            working = spec.Clone();
+            working = source.Clone();
             var request = RequestToSend(working, node?.Name);
-            var reply = await RunScriptsAsync("prerequest", [.. plan.PreRequest], collection, local, request, null, node?.Name, results, cancellationToken)
-                .ConfigureAwait(true);
+            var reply = await RunScriptsAsync("prerequest", [.. plan.PreRequest], environment, collection, local, request, null, node?.Name, results,
+                cancellationToken).ConfigureAwait(true);
             if (reply?["request"] is JsonObject edited)
             {
                 ApplyRequestEdits(edited, request, working, results);
@@ -215,7 +239,7 @@ public sealed partial class RequestRunner
 
         if (results.Error is not null || cancellationToken.IsCancellationRequested)
         {
-            var request = Prepare(collection, node, spec);
+            var request = Prepare(environment, collection, node, source, source, null);
             prepared?.Invoke(request);
             var notSent = new HttpExchange(request) { Scripts = results };
             if (results.Error is { } error)
@@ -232,18 +256,24 @@ public sealed partial class RequestRunner
             return notSent; // nothing was sent: not kept in history or recordings
         }
 
-        var ready = Prepare(collection, node, working, spec, local);
+        var ready = Prepare(environment, collection, node, working, source, local);
         prepared?.Invoke(ready);
         var exchange = await Executor.SendAsync(ready, cancellationToken).ConfigureAwait(true);
         exchange.Scripts = results;
         if (plan.PostResponse.Count > 0 && exchange.Response is not null && !exchange.Cancelled)
         {
-            await RunScriptsAsync("test", [.. plan.PostResponse], collection, local, RequestSent(exchange, node?.Name), ResponseReceived(exchange), node?.Name,
-                results, cancellationToken).ConfigureAwait(true);
+            await RunScriptsAsync("test", [.. plan.PostResponse], environment, collection, local, RequestSent(exchange, node?.Name), ResponseReceived(exchange),
+                node?.Name, results, cancellationToken).ConfigureAwait(true);
+
+            // What they kept in secret variables or variables named like secrets (a token from a login response) is
+            // redacted in this very exchange too, not only in later ones.
+            var resolver = CreateResolver(environment, collection, local);
+            exchange.Request.AddSecretValues(SecretVariableValues(environment, collection, resolver));
+            exchange.Request.AddSensitiveValues(VariablesNamedLikeSecrets(environment, collection, resolver, local));
         }
 
-        Record(exchange);
-        Recorder?.Record(exchange, Environment?.Name);
+        Record(exchange, environment?.Name);
+        Recorder?.Record(exchange, environment?.Name);
         return exchange;
     }
 
@@ -265,7 +295,8 @@ public sealed partial class RequestRunner
     }
 
     /// <summary>Runs the scripts of one phase, all in one language, and takes in what they did; null when they did not run.</summary>
-    private async Task<JsonObject?> RunScriptsAsync(string phase, List<ScriptCode> scripts, PostmanCollection collection,
+    /// <param name="environment">The request's environment (see <see cref="Environment"/>): the scripts read and set its variables.</param>
+    private async Task<JsonObject?> RunScriptsAsync(string phase, List<ScriptCode> scripts, PostmanEnvironment? environment, PostmanCollection collection,
         Dictionary<string, string?> local, JsonObject request, JsonObject? response, string? requestName, ScriptResults results,
         CancellationToken cancellationToken)
     {
@@ -287,7 +318,7 @@ public sealed partial class RequestRunner
                     };
                     results.Error ??= new ScriptError("",
                         $"These scripts need {needed}, and none is chosen for this workspace: pass {ScriptLanguage.Option(language)} " +
-                        "(or --no-scripts), or choose one in the full-screen UI (Tools › Scripts…).");
+                        "(or --no-scripts), or choose one in the full-screen UI (Tools › Scripts…).") { NotRun = true };
                 }
                 else
                 {
@@ -313,14 +344,20 @@ public sealed partial class RequestRunner
             ["scripts"] = PostmanJson.ToJsonArray(scripts.Select(s => (JsonNode?)new JsonObject { ["name"] = s.Name, ["code"] = s.Code })),
             ["variables"] = new JsonObject
             {
-                ["environment"] = Values(Environment?.Values, Environment is { } environment ? Session.Find(environment) : null),
+                ["environment"] = Values(environment?.Values, environment is not null ? Session.Find(environment) : null),
                 ["collection"] = Values(collection.GetVariables(), Session.Find(collection)),
                 ["globals"] = Values(Workspace.Globals?.Values, Session.Globals),
                 ["local"] = Values(LocalVariables.Select(v => new KeyValueEntry { Key = v.Key, Value = v.Value }), local),
             },
-            ["request"] = request.DeepClone(),
-            ["response"] = response?.DeepClone(),
-            ["info"] = new JsonObject { ["request_name"] = requestName, ["collection"] = collection.Name, ["environment"] = Environment?.Name },
+            ["request"] = request,
+            ["response"] = response,
+            ["info"] = new JsonObject { ["request_name"] = requestName, ["collection"] = collection.Name, ["environment"] = environment?.Name },
+            ["dynamic"] = new JsonObject
+            {
+                ["firstNames"] = PostmanJson.ToJsonArray(VariableResolver.FirstNames.Select(n => (JsonNode?)n)),
+                ["lastNames"] = PostmanJson.ToJsonArray(VariableResolver.LastNames.Select(n => (JsonNode?)n)),
+                ["words"] = PostmanJson.ToJsonArray(VariableResolver.Words.Select(n => (JsonNode?)n)),
+            },
         };
 
         JsonObject reply;
@@ -349,7 +386,7 @@ public sealed partial class RequestRunner
         var error = reply["error"] as JsonObject;
         var failed = error is null ? -1 : scripts.FindIndex(s => s.Name == Text(error["script"]));
         results.Ran += failed < 0 ? scripts.Count : failed + 1;
-        ApplyVariableChanges(reply["changes"] as JsonObject, collection, local, results, language);
+        ApplyVariableChanges(reply["changes"] as JsonObject, environment, collection, local, results, language);
         foreach (var test in (reply["tests"] as JsonArray)?.OfType<JsonObject>() ?? [])
         {
             var passed = test["passed"] is JsonValue value && value.TryGetValue<bool>(out var ok) && ok;
@@ -384,7 +421,8 @@ public sealed partial class RequestRunner
     /// listed with the names the script's language uses (<c>collection_variables</c> in Python, <c>collectionVariables</c>
     /// in JavaScript, <c>CollectionVariables</c> in C# and PowerShell).
     /// </summary>
-    private void ApplyVariableChanges(JsonObject? changes, PostmanCollection collection, Dictionary<string, string?> local, ScriptResults results, string language)
+    private void ApplyVariableChanges(JsonObject? changes, PostmanEnvironment? environment, PostmanCollection collection, Dictionary<string, string?> local,
+        ScriptResults results, string language)
     {
         if (changes is null)
         {
@@ -392,7 +430,7 @@ public sealed partial class RequestRunner
         }
 
         var pascal = language is ScriptLanguage.CSharp or ScriptLanguage.PowerShell;
-        Apply("environment", pascal ? "Environment" : "environment", () => Environment is { } environment ? Session.For(environment) : null);
+        Apply("environment", pascal ? "Environment" : "environment", () => environment is not null ? Session.For(environment) : null);
         Apply("collection", language switch
         {
             ScriptLanguage.Python => "collection_variables",
@@ -465,7 +503,13 @@ public sealed partial class RequestRunner
         }
 
         var body = Text(edited["body"]);
-        if (body != Text(original["body"]))
+        if (edited["body"] is { } bodyNode && body is null)
+        {
+            // A raw body is text: anything else would be lost, not sent.
+            var what = bodyNode switch { JsonObject => "an object", JsonArray => "a list", _ => bodyNode.ToJsonString() };
+            results.Error ??= new ScriptError("", $"The pre-request scripts set the request body to {what}, not to text.");
+        }
+        else if (body != Text(original["body"]))
         {
             if (spec.Body.Mode is BodyMode.Raw or BodyMode.None)
             {
@@ -519,16 +563,43 @@ public sealed partial class RequestRunner
             ["time"] = Math.Round(exchange.Timing.Total?.TotalMilliseconds ?? 0, 3),
             ["size"] = response.Body.LongLength,
         };
-        if (BodyFormatter.LooksLikeText(response.Body, response.ContentType))
+        var text = BodyFormatter.LooksLikeText(response.Body, response.ContentType) ? BodyFormatter.Decode(response.Body, response.ContentType) : null;
+        if (text is not null)
         {
-            json["text"] = BodyFormatter.Decode(response.Body, response.ContentType);
+            json["text"] = text;
         }
-        else
+
+        // Scripts encode the text as UTF-8 for the bytes: they get the bytes as well when that would not give them back.
+        if (text is null || !IsUtf8Of(text, response.Body))
         {
-            json["base64"] = Convert.ToBase64String(response.Body);
+            json["base64"] = JsonValue.Create(response.Body, BodyBytes);
         }
 
         return json;
+    }
+
+    /// <summary>Whether <paramref name="bytes"/> are <paramref name="text"/> in UTF-8, compared a few KB at a time (no copy of a large body).</summary>
+    private static bool IsUtf8Of(string text, byte[] bytes)
+    {
+        var encoder = Encoding.UTF8.GetEncoder();
+        Span<byte> buffer = stackalloc byte[4096];
+        var chars = text.AsSpan();
+        var offset = 0;
+        while (true)
+        {
+            encoder.Convert(chars, buffer, flush: true, out var used, out var written, out var completed);
+            if (!bytes.AsSpan(offset).StartsWith(buffer[..written]))
+            {
+                return false;
+            }
+
+            offset += written;
+            chars = chars[used..];
+            if (completed)
+            {
+                return offset == bytes.Length;
+            }
+        }
     }
 
     /// <summary>The enabled values of a scope, with the values scripts set on top (null: unset).</summary>

@@ -1,6 +1,8 @@
 using TermRest.Core.Certificates;
+using TermRest.Core.Http;
 using TermRest.Core.Model;
 using TermRest.Core.Tests.Infrastructure;
+using TermRest.Core.Variables;
 using Xunit;
 
 namespace TermRest.Core.Tests;
@@ -70,6 +72,24 @@ public sealed class CertificateLoaderTests : IDisposable
     }
 
     [Fact]
+    public void Files_that_cannot_be_read_produce_certificate_errors()
+    {
+        // The file exists, but another program holds it locked (or the user may not read it).
+        static CertificateLoadException WhileLocked(string path, Action load)
+        {
+            using var locked = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            return Assert.Throws<CertificateLoadException>(load);
+        }
+
+        var pfx = WhileLocked(_pki.ClientPfxPath, () => CertificateLoader.LoadPfx(_pki.ClientPfxPath, TestPki.Passphrase)).Message;
+        Assert.Contains("client.pfx", pfx, StringComparison.Ordinal);
+        Assert.DoesNotContain("passphrase", pfx, StringComparison.Ordinal); // .NET reports the file error as a cryptographic one
+        Assert.Contains("client.key", WhileLocked(_pki.ClientKeyPemPath, () => CertificateLoader.LoadPem(_pki.ClientCertPemPath, _pki.ClientKeyPemPath, null)).Message, StringComparison.Ordinal);
+        Assert.Contains("client.pem", WhileLocked(_pki.ClientCertPemPath, () => CertificateLoader.LoadPem(_pki.ClientCertPemPath, _pki.ClientKeyPemPath, null)).Message, StringComparison.Ordinal);
+        Assert.Contains("ca.pem", WhileLocked(_pki.CaPemPath, () => CertificateLoader.LoadTrustBundle(_pki.CaPemPath)).Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Provider_prefers_pinned_request_certificate_then_registry_and_resolves_passphrase()
     {
         var registry = new CertificateRegistry(_pki.Directory)
@@ -120,11 +140,56 @@ public sealed class CertificateLoaderTests : IDisposable
     }
 
     [Fact]
+    public void Certificates_that_share_a_name_are_cached_by_their_source()
+    {
+        using var provider = new ClientCertificateProvider(new CertificateRegistry(_pki.Directory));
+        var warnings = new List<string>();
+        LoadedCertificate Select(CertificateSpec spec) => provider.Select(new Uri("https://localhost/"), spec, _pki.Directory, s => s, warnings)!.Certificate;
+        var pem = new CertificateSpec { Name = "Imported from cURL", CertSrc = "client.pem", KeySrc = "client.key" };
+        var pfx = new CertificateSpec { Name = "Imported from cURL", PfxSrc = "client.pfx", Passphrase = TestPki.Passphrase };
+
+        var first = Select(pem);
+        var other = Select(pfx);
+        Assert.Same(first, Select(pem));
+        Assert.Same(other, Select(pfx));
+
+        File.SetLastWriteTimeUtc(_pki.ClientCertPemPath, DateTime.UtcNow.AddMinutes(1));
+        var reloaded = Select(pem);
+        Assert.NotSame(first, reloaded);
+        Assert.Equal(reloaded.Certificate.Thumbprint, first.Certificate.Thumbprint); // replaced, but still usable by requests in flight
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
     public void Trust_bundle_loads_pem_certificates()
     {
         var bundle = CertificateLoader.LoadTrustBundle(_pki.CaPemPath);
 
         Assert.Equal(_pki.Ca.Thumbprint, Assert.Single(bundle).Thumbprint);
+    }
+
+    [Fact]
+    public void The_ca_bundle_is_parsed_once_until_its_file_changes()
+    {
+        var path = Path.Combine(_pki.Directory, "bundle.pem");
+        File.Copy(_pki.CaPemPath, path);
+        using var provider = new ClientCertificateProvider(new CertificateRegistry(_pki.Directory));
+        var defaults = new ExecutionDefaults { CaBundlePath = path };
+        PreparedRequest Prepare() => new RequestPreparer(VariableResolver.Empty, provider, defaults).Prepare(new HttpRequestSpec { Url = "https://localhost/" }, null, _pki.Directory);
+
+        var first = Prepare().ExtraTrustedCertificates!;
+        Assert.Same(first, Prepare().ExtraTrustedCertificates);
+
+        File.AppendAllText(path, "\n" + _pki.Server.ExportCertificatePem());
+        var changed = Prepare().ExtraTrustedCertificates!;
+        Assert.NotSame(first, changed);
+        Assert.Equal(2, changed.Count);
+        Assert.Equal(_pki.Ca.Thumbprint, first[0].Thumbprint); // replaced, but still usable by requests in flight
+
+        File.WriteAllText(path, "not a certificate");
+        var broken = Prepare();
+        Assert.StartsWith($"CA bundle '{path}' not loaded: ", Assert.Single(broken.Warnings), StringComparison.Ordinal);
+        Assert.Empty(broken.ExtraTrustedCertificates!);
     }
 
     public void Dispose() => _pki.Dispose();

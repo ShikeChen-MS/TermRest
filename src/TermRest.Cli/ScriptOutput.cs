@@ -36,7 +36,7 @@ internal static class ScriptOutput
             }
             else
             {
-                Output.Status($"{indent}{(failure.Script.Length == 0 ? "Scripts did not run" : $"Script error in {failure.Script}")}:", false);
+                Output.Status($"{indent}{failure.Heading}:", false);
                 foreach (var line in failure.Details.Split('\n'))
                 {
                     Output.Info($"{indent}  {line.TrimEnd()}");

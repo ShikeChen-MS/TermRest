@@ -75,33 +75,108 @@ public static class ScriptRuntimeLocator
         yield return "python";
     }
 
-    /// <summary>The first of the <see cref="Candidates"/> that runs, with its description; null when none does.</summary>
+    /// <summary>
+    /// The first of the <see cref="Candidates"/> that runs, with its description; null when none does. Those in the
+    /// workspace (its <c>.venv</c>'s Python) are not run, as they may have come with a repository: the first of them is
+    /// the answer, unchecked (<c>Checked</c> is false), for the user to check. The others run as <see cref="CheckAsync"/>
+    /// runs them: outside the workspace.
+    /// </summary>
     /// <param name="resolve">Turns a candidate into what to start (relative paths are relative to the workspace).</param>
-    public static async Task<(string Runtime, string Description)?> FindAsync(string language, string workspaceRoot, Func<string, string> resolve,
-        CancellationToken cancellationToken = default)
+    public static async Task<(string Runtime, string Description, bool Checked)?> FindAsync(string language, string workspaceRoot,
+        Func<string, string> resolve, CancellationToken cancellationToken = default)
     {
         foreach (var candidate in Candidates(language, workspaceRoot))
         {
-            var (ok, description) = await CheckAsync(language, resolve(candidate), workspaceRoot, cancellationToken).ConfigureAwait(false);
+            if (!Path.IsPathRooted(candidate) && candidate.IndexOfAny(['/', '\\']) >= 0)
+            {
+                return (candidate, "Found in this workspace, not run: Check runs it.", false);
+            }
+
+            var (ok, description) = await CheckAsync(language, resolve(candidate), cancellationToken).ConfigureAwait(false);
             if (ok)
             {
-                return (candidate, description);
+                return (candidate, description, true);
             }
         }
 
         return null;
     }
 
-    /// <summary>Runs the runtime once: its version and location, or why it cannot run scripts.</summary>
-    public static async Task<(bool Ok, string Message)> CheckAsync(string language, string runtime, string workingDirectory,
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// The program to start for <paramref name="runtime"/>: a path as it is, and a command (no folder: <c>python3</c>,
+    /// <c>node</c>) from the folders of PATH, on Windows with <c>.exe</c> unless it ends with an extension that Windows
+    /// runs (PATHEXT: <c>.exe</c>, <c>.cmd</c>…), so <c>python3.12</c> is <c>python3.12.exe</c>. Windows and .NET would
+    /// look in TermRest's own folder and in the current one first (the workspace, often), where a repository may put a
+    /// <c>node.exe</c> of its own. Null when the command is not on PATH.
+    /// </summary>
+    /// <param name="path">The folders to look in (PATH when null); relative ones, which are the current folder's, are not.</param>
+    public static string? Executable(string runtime, string? path = null)
     {
+        if (runtime.IndexOfAny(['/', '\\']) >= 0 || Path.IsPathRooted(runtime))
+        {
+            return runtime;
+        }
+
+        var name = OperatingSystem.IsWindows() && !IsProgramName(runtime) ? runtime + ".exe" : runtime;
+        foreach (var folder in (path ?? Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.TrimEntries))
+        {
+            var directory = folder.Trim('"');
+            if (Path.IsPathFullyQualified(directory) && IsProgram(Path.Combine(directory, name)))
+            {
+                return Path.Combine(directory, name);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>Whether a command's name ends with an extension of programs on Windows (PATHEXT), as shells take it.</summary>
+    private static bool IsProgramName(string name)
+    {
+        var extension = Path.GetExtension(name);
+        var programs = Environment.GetEnvironmentVariable("PATHEXT") is { Length: > 0 } list ? list : ".COM;.EXE;.BAT;.CMD";
+        return extension.Length > 1 && (extension.Equals(".exe", StringComparison.OrdinalIgnoreCase)
+            || programs.Split(';', StringSplitOptions.TrimEntries).Contains(extension, StringComparer.OrdinalIgnoreCase));
+    }
+
+    private static bool IsProgram(string file)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return File.Exists(file);
+        }
+
+        return File.Exists(file) && (File.GetUnixFileMode(file) & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0;
+    }
+
+    /// <summary>
+    /// Runs the runtime once: its version and location, or why it cannot run scripts. It runs in TermRest's cache folder,
+    /// not in the workspace, whose files it would obey before it is chosen: Bun runs the code that a bunfig.toml
+    /// preloads, and dotnet lists the SDKs that a global.json points to.
+    /// </summary>
+    public static async Task<(bool Ok, string Message)> CheckAsync(string language, string runtime, CancellationToken cancellationToken = default)
+    {
+        if (Executable(runtime) is not { } executable)
+        {
+            return (false, $"{runtime} could not be started: it is not on PATH.");
+        }
+
+        string folder;
+        try
+        {
+            folder = CSharpPrograms.CreateCacheDirectory();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return (false, $"{runtime} could not be checked: {ex.Message}");
+        }
+
         var python = language == ScriptLanguage.Python;
         var csharp = language == ScriptLanguage.CSharp;
         var powerShell = language == ScriptLanguage.PowerShell;
-        var info = new ProcessStartInfo(runtime)
+        var info = new ProcessStartInfo(executable)
         {
-            WorkingDirectory = workingDirectory,
+            WorkingDirectory = folder,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,

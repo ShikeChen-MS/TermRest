@@ -122,22 +122,27 @@ internal sealed class YamlSequenceNode : YamlNode
 /// <summary>A parsed YAML document: LF-normalized source text, its line table and the root node.</summary>
 internal sealed class YamlTree
 {
+    /// <summary>Collections nested deeper are refused, as in JSON input: reading them would overflow the stack.</summary>
+    private const int MaxDepth = 256;
+
     private readonly int[] _lineStarts;
 
     private YamlTree(string text, YamlNode? root)
     {
         Text = text;
         Root = root;
+        _lineStarts = LineStarts(text);
+    }
+
+    private static int[] LineStarts(string text)
+    {
         var starts = new List<int> { 0 };
-        for (var i = 0; i < text.Length; i++)
+        for (var i = text.IndexOf('\n'); i >= 0; i = text.IndexOf('\n', i + 1))
         {
-            if (text[i] == '\n')
-            {
-                starts.Add(i + 1);
-            }
+            starts.Add(i + 1);
         }
 
-        _lineStarts = [.. starts];
+        return [.. starts];
     }
 
     public string Text { get; }
@@ -180,31 +185,112 @@ internal sealed class YamlTree
     /// <summary>Parses one YAML document. The text must use LF line breaks.</summary>
     public static YamlTree Parse(string text)
     {
-        try
+        var parsed = text;
+        int[]? removed = null; // per line: the spaces left out of parsed (see BlankLeadingLines)
+        while (true)
         {
-            var parser = new Parser(new Scanner(new StringReader(text), skipComments: true));
-            Expect<StreamStart>(parser);
-            if (parser.Current is StreamEnd)
+            try
             {
-                return new YamlTree(text, null);
+                var parser = new Parser(new Scanner(new StringReader(parsed), skipComments: true));
+                Expect<StreamStart>(parser);
+                if (parser.Current is StreamEnd)
+                {
+                    return new YamlTree(text, null);
+                }
+
+                Expect<DocumentStart>(parser);
+                var root = ReadNode(parser, 0, removed is null ? m => (int)m.Index : PositionsIn(text, parsed, removed));
+                Expect<DocumentEnd>(parser);
+                if (parser.Current is not StreamEnd)
+                {
+                    throw new YamlFormatException("Only one YAML document per file is supported.");
+                }
+
+                var tree = new YamlTree(text, root);
+                tree.AssignLines(root);
+                return tree;
+            }
+            catch (YamlException ex)
+            {
+                if (ex is SemanticErrorException && ex.Message.Contains("extra spaces in first line", StringComparison.Ordinal)
+                    && BlankLeadingLines(ref parsed, ref removed, (int)ex.Start.Index))
+                {
+                    continue;
+                }
+
+                throw new YamlFormatException($"Invalid YAML at line {ex.Start.Line}, column {ex.Start.Column}: {ex.Message}", ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// YamlDotNet refuses a literal block scalar without an indentation indicator whose first line holds only spaces, as
+    /// Postman's YAML library writes a value that starts with an empty line (<c>code: |-</c>, then a line with just the
+    /// indentation). YAML allows it: the spaces of the empty lines before a block's first line of content are no part of
+    /// the value. So those lines are parsed without their spaces. <paramref name="stop"/> is where the scanner stopped:
+    /// the start of the block's first non-empty line; the lines above it, up to the block's header, hold spaces only.
+    /// Returns false when there is nothing to leave out.
+    /// </summary>
+    private static bool BlankLeadingLines(ref string parsed, ref int[]? removed, int stop)
+    {
+        if (stop <= 0 || stop > parsed.Length || parsed[stop - 1] != '\n')
+        {
+            return false;
+        }
+
+        var line = parsed.AsSpan(0, stop).Count('\n'); // the stop line's number
+        var blank = new List<(int Line, int Start, int Length)>();
+        for (var end = stop - 1; end > 0;)
+        {
+            var start = parsed.LastIndexOf('\n', end - 1) + 1;
+            line--;
+            if (parsed.AsSpan(start, end - start).ContainsAnyExcept(' '))
+            {
+                break; // the block's header
             }
 
-            Expect<DocumentStart>(parser);
-            var root = ReadNode(parser);
-            Expect<DocumentEnd>(parser);
-            if (parser.Current is not StreamEnd)
+            if (end > start)
             {
-                throw new YamlFormatException("Only one YAML document per file is supported.");
+                blank.Add((line, start, end - start));
             }
 
-            var tree = new YamlTree(text, root);
-            tree.AssignLines(root);
-            return tree;
+            end = start - 1;
         }
-        catch (YamlException ex)
+
+        if (blank.Count == 0)
         {
-            throw new YamlFormatException($"Invalid YAML at line {ex.Start.Line}, column {ex.Start.Column}: {ex.Message}", ex);
+            return false;
         }
+
+        removed ??= new int[parsed.AsSpan().Count('\n') + 1];
+        var builder = new System.Text.StringBuilder(parsed.Length);
+        var copied = 0;
+        foreach (var (number, start, length) in Enumerable.Reverse(blank))
+        {
+            builder.Append(parsed, copied, start - copied);
+            copied = start + length;
+            removed[number] += length;
+        }
+
+        parsed = builder.Append(parsed, copied, parsed.Length - copied).ToString();
+        return true;
+    }
+
+    /// <summary>
+    /// Where a position in <paramref name="parsed"/> is in <paramref name="text"/>: the same lines, but some started with
+    /// spaces parsed leaves out (<paramref name="removed"/>, per line).
+    /// </summary>
+    private static Func<Mark, int> PositionsIn(string text, string parsed, int[] removed)
+    {
+        var parsedStarts = LineStarts(parsed);
+        var textStarts = LineStarts(text);
+        return mark =>
+        {
+            var index = (int)mark.Index;
+            var line = Array.BinarySearch(parsedStarts, index);
+            line = line >= 0 ? line : ~line - 1;
+            return textStarts[line] + removed[line] + (index - parsedStarts[line]);
+        };
     }
 
     private static void Expect<T>(Parser parser)
@@ -223,7 +309,7 @@ internal sealed class YamlTree
         parser.MoveNext();
     }
 
-    private static YamlNode ReadNode(Parser parser)
+    private static YamlNode ReadNode(Parser parser, int depth, Func<Mark, int> at)
     {
         switch (parser.Current)
         {
@@ -242,30 +328,31 @@ internal sealed class YamlTree
                         _ => YamlScalarStyle.Plain,
                     },
                     Tag = scalar.Tag.IsEmpty || scalar.Tag.IsNonSpecific ? null : NormalizeTag(scalar.Tag.Value),
-                    Start = (int)scalar.Start.Index,
-                    End = (int)scalar.End.Index,
+                    Start = at(scalar.Start),
+                    End = at(scalar.End),
                 };
             }
 
             case MappingStart start:
             {
-                var mapping = new YamlMappingNode { IsFlow = start.Style == MappingStyle.Flow, Start = (int)start.Start.Index, End = (int)start.End.Index };
+                CheckDepth(depth, start);
+                var mapping = new YamlMappingNode { IsFlow = start.Style == MappingStyle.Flow, Start = at(start.Start), End = at(start.End) };
                 parser.MoveNext();
                 while (parser.Current is not MappingEnd)
                 {
-                    if (ReadNode(parser) is not YamlScalarNode key)
+                    if (ReadNode(parser, depth + 1, at) is not YamlScalarNode key)
                     {
                         throw new YamlFormatException("Only plain text mapping keys are supported.");
                     }
 
-                    var value = ReadNode(parser);
+                    var value = ReadNode(parser, depth + 1, at);
                     mapping.Entries.Add(new YamlEntry { Key = key, Value = value });
                     mapping.End = Math.Max(mapping.End, ContentEnd(key, value));
                 }
 
                 if (mapping.IsFlow)
                 {
-                    mapping.End = (int)parser.Current!.End.Index;
+                    mapping.End = at(parser.Current!.End);
                 }
 
                 parser.MoveNext();
@@ -274,18 +361,19 @@ internal sealed class YamlTree
 
             case SequenceStart start:
             {
-                var sequence = new YamlSequenceNode { IsFlow = start.Style == SequenceStyle.Flow, Start = (int)start.Start.Index, End = (int)start.End.Index };
+                CheckDepth(depth, start);
+                var sequence = new YamlSequenceNode { IsFlow = start.Style == SequenceStyle.Flow, Start = at(start.Start), End = at(start.End) };
                 parser.MoveNext();
                 while (parser.Current is not SequenceEnd)
                 {
-                    var value = ReadNode(parser);
+                    var value = ReadNode(parser, depth + 1, at);
                     sequence.Items.Add(new YamlItem { Value = value });
                     sequence.End = Math.Max(sequence.End, value.End);
                 }
 
                 if (sequence.IsFlow)
                 {
-                    sequence.End = (int)parser.Current!.End.Index;
+                    sequence.End = at(parser.Current!.End);
                 }
 
                 parser.MoveNext();
@@ -297,6 +385,14 @@ internal sealed class YamlTree
 
             default:
                 throw new YamlFormatException($"Unexpected YAML content at line {parser.Current?.Start.Line}.");
+        }
+    }
+
+    private static void CheckDepth(int depth, ParsingEvent start)
+    {
+        if (depth >= MaxDepth)
+        {
+            throw new YamlFormatException($"YAML nested more than {MaxDepth} levels deep is not supported (line {start.Start.Line}).");
         }
     }
 
@@ -382,7 +478,7 @@ internal static class YamlScalars
         {
             return long.TryParse(plain, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var number)
                 ? JsonValue.Create(number)
-                : JsonValue.Create(double.Parse(plain, CultureInfo.InvariantCulture));
+                : ExactInteger(plain);
         }
 
         if (plain.Length > 2 && plain[0] == '0' && plain[1] is 'x' or 'o')
@@ -423,14 +519,45 @@ internal static class YamlScalars
             return true;
         }
 
-        // YAML 1.2 floats that JSON cannot hold (kept as text by Resolve).
-        return text is ".inf" or "-.inf" or "+.inf" or ".Inf" or "-.Inf" or "+.Inf" or ".INF" or "-.INF" or "+.INF" or ".nan" or ".NaN" or ".NAN";
+        // Kept as text by Resolve, but numbers to YAML 1.2 (and to Postman's library): .inf and .nan, which JSON cannot hold,
+        // and numbers too big for a long or a double (an Ethereum address, 0x and 40 hex digits; 1e400).
+        return text is ".inf" or "-.inf" or "+.inf" or ".Inf" or "-.Inf" or "+.Inf" or ".INF" or "-.INF" or "+.INF" or ".nan" or ".NaN" or ".NAN"
+            || IsFloat(text) || IsPrefixedInteger(text);
+    }
+
+    /// <summary>0x[0-9a-fA-F]+ or 0o[0-7]+, of any size.</summary>
+    private static bool IsPrefixedInteger(string s)
+    {
+        if (s.Length <= 2 || s[0] != '0' || s[1] is not ('x' or 'o'))
+        {
+            return false;
+        }
+
+        foreach (var c in s.AsSpan(2))
+        {
+            if (s[1] == 'x' ? !char.IsAsciiHexDigit(c) : c is < '0' or > '7')
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool IsDecimalInteger(string s)
     {
         var start = s.Length > 0 && s[0] is '-' or '+' ? 1 : 0;
         return s.Length > start && s.AsSpan(start).IndexOfAnyExceptInRange('0', '9') < 0;
+    }
+
+    /// <summary>
+    /// An integer too big for a long, as a JSON number with exactly its digits (as JSON files keep them): a double would
+    /// round it, or be infinite, which JSON cannot hold.
+    /// </summary>
+    private static JsonNode ExactInteger(string plain)
+    {
+        var digits = plain.AsSpan(plain[0] is '-' or '+' ? 1 : 0).TrimStart('0');
+        return JsonNode.Parse((plain[0] == '-' ? "-" : "") + (digits.IsEmpty ? "0" : digits.ToString()))!;
     }
 
     /// <summary>[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?</summary>

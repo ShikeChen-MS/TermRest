@@ -8,12 +8,16 @@ namespace TermRest.Core.History;
 /// <summary>
 /// Request history for one workspace, stored per user outside the workspace folder (so it is never committed with
 /// the collections): <c>history.jsonl</c> (one entry per line, append-only, compacted to <see cref="MaxEntries"/>) plus
-/// <c>bodies/&lt;id&gt;.bin</c> with the raw response bodies. Files are private to the user on Unix (0600/0700).
+/// <c>bodies/&lt;id&gt;.bin</c> with the raw response bodies; <c>history.lock</c> keeps processes from changing them at
+/// the same time. Files are private to the user on Unix (0600/0700).
 /// </summary>
 public sealed class HistoryStore
 {
     public const string FileName = "history.jsonl";
     public const string StateDirectoryVariable = "TERMREST_STATE_DIR";
+
+    /// <summary>Held by a process while it changes the history (see <see cref="LockFiles"/>).</summary>
+    internal const string LockFileName = "history.lock";
 
     private const UnixFileMode PrivateFile = UnixFileMode.UserRead | UnixFileMode.UserWrite;
     private const UnixFileMode PrivateDirectory = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
@@ -97,6 +101,7 @@ public sealed class HistoryStore
         lock (_gate)
         {
             EnsureFolder();
+            using var locked = LockFiles();
             if (body is not null && entry.BodySaved)
             {
                 WritePrivateFile(BodyPath(entry.Id), body);
@@ -109,8 +114,8 @@ public sealed class HistoryStore
                 stream.Write(line);
             });
 
-            _lineCount = _lineCount is { } count ? count + 1 : ReadLines().Count;
-            if (_lineCount > MaxEntries + Math.Max(10, MaxEntries / 5))
+            _lineCount = _lineCount is { } count ? count + 1 : CountLines();
+            if (_lineCount > (long)MaxEntries + Math.Max(10, MaxEntries / 5))
             {
                 Compact();
             }
@@ -148,6 +153,12 @@ public sealed class HistoryStore
     {
         lock (_gate)
         {
+            if (!Directory.Exists(Folder))
+            {
+                return false;
+            }
+
+            using var locked = LockFiles();
             var lines = ReadLines();
             var kept = lines.Where(line => HistoryEntry.ReadId(line) != id).ToList();
             if (kept.Count == lines.Count)
@@ -161,23 +172,56 @@ public sealed class HistoryStore
         }
     }
 
-    public void Clear()
+    /// <summary>
+    /// Deletes all entries, then their bodies. Throws when the entries can't be deleted (another program has the history
+    /// file open), leaving everything as it was. Once they are gone, a body that can't be deleted (an antivirus scan has it
+    /// open) is left for the next Clear or compaction, and the reason returned; null when everything was deleted.
+    /// </summary>
+    public Exception? Clear()
     {
         lock (_gate)
         {
-            DeleteFile(FilePath);
-            if (Directory.Exists(BodiesFolder))
+            Exception? bodiesLeft = null;
+            if (Directory.Exists(Folder))
             {
-                Directory.Delete(BodiesFolder, recursive: true);
+                using var locked = LockFiles();
+                Retry(() => File.Delete(FilePath));
+                try
+                {
+                    Retry(() =>
+                    {
+                        if (Directory.Exists(BodiesFolder))
+                        {
+                            Directory.Delete(BodiesFolder, recursive: true);
+                        }
+                    });
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    bodiesLeft = e;
+                }
             }
 
             _lineCount = 0;
+            return bodiesLeft;
         }
     }
 
     // ----- files ---------------------------------------------------------------------------------
 
     private string BodyPath(string id) => Path.Combine(BodiesFolder, id + ".bin");
+
+    /// <summary>
+    /// Locks the history against changes by other TermRest processes (the UI and <c>termrest send</c> write the same
+    /// history) until disposed, so that compacting or deleting never drops an entry, or deletes a body, that another
+    /// process has just added. Reading needs no lock: the file is only appended to or replaced as a whole.
+    /// </summary>
+    private FileStream LockFiles()
+    {
+        FileStream? stream = null;
+        Retry(() => stream = new FileStream(Path.Combine(Folder, LockFileName), CreateOptions(FileMode.OpenOrCreate, FileAccess.Write)), attempts: 200);
+        return stream!;
+    }
 
     private void Compact()
     {
@@ -237,6 +281,31 @@ public sealed class HistoryStore
             lines = read;
         });
         return lines;
+    }
+
+    /// <summary>Lines in the history file, counted in pieces (not read into memory).</summary>
+    private int CountLines()
+    {
+        if (!File.Exists(FilePath))
+        {
+            return 0;
+        }
+
+        var count = 0;
+        Retry(() =>
+        {
+            using var stream = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var buffer = new byte[64 * 1024];
+            var lines = 0;
+            int read;
+            while ((read = stream.Read(buffer)) > 0)
+            {
+                lines += buffer.AsSpan(0, read).Count((byte)'\n');
+            }
+
+            count = lines;
+        });
+        return count;
     }
 
     private void EnsureFolder()
@@ -303,7 +372,7 @@ public sealed class HistoryStore
         }
     }
 
-    private static void Retry(Action action)
+    private static void Retry(Action action, int attempts = 20)
     {
         for (var attempt = 0; ; attempt++)
         {
@@ -312,7 +381,7 @@ public sealed class HistoryStore
                 action();
                 return;
             }
-            catch (IOException) when (attempt < 20)
+            catch (IOException) when (attempt < attempts)
             {
                 Thread.Sleep(25); // another TermRest process is writing the same history
             }

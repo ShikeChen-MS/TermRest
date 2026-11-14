@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Builds termrest.dll next to the tests, which run it as a separate process: exit codes, stdout bytes, files. -->
+    <ProjectReference Include="..\..\src\TermRest.Cli\TermRest.Cli.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\samples\**\*.json" Link="samples\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Shared temp files, and the JavaScript runtime that runs collection scripts. -->
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestFiles.cs" Link="Infrastructure\Shared\TestFiles.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\TempDirectoryCleanup.cs" Link="Infrastructure\Shared\TempDirectoryCleanup.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestJavaScript.cs" Link="Infrastructure\Shared\TestJavaScript.cs" />
+  </ItemGroup>
+
+</Project>

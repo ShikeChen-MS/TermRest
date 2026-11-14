@@ -228,6 +228,32 @@ public class PostmanRequestMapperTests
     }
 
     [Fact]
+    public void Untouched_values_keep_their_json_type_when_another_value_changes()
+    {
+        var directory = TestFiles.NewTempDirectory();
+        var json = Path.Combine(directory, "typed.postman_environment.json");
+        File.WriteAllText(json, """
+            {"name": "Typed", "values": [
+              {"key": "retries", "value": 5, "type": "any", "enabled": true},
+              {"key": "verbose", "value": true, "type": "any", "enabled": true},
+              {"key": "user", "value": {"id": 1}, "type": "any", "enabled": true},
+              {"key": "token", "value": "a", "type": "default", "enabled": true}
+            ]}
+            """);
+        var environment = PostmanEnvironment.Load(json);
+        environment.SetValue("token", "b");
+        environment.Save();
+        Assert.Equal(["5", "true", "{\"id\":1}", "\"b\""], PostmanJson.Parse(File.ReadAllText(json))["values"]!.AsArray().Select(v => v!["value"]!.ToJsonString()));
+
+        var yaml = Path.Combine(directory, "Typed.environment.yaml");
+        File.WriteAllText(yaml, "name: Typed\nvalues:\n  - key: retries\n    value: 5\n    enabled: true\n  - key: token\n    value: a\n    enabled: true\n");
+        environment = PostmanEnvironment.Load(yaml);
+        environment.SetValue("token", "b");
+        environment.Save();
+        Assert.Equal("name: Typed\nvalues:\n  - key: retries\n    value: 5\n    enabled: true\n  - key: token\n    value: b\n    enabled: true\n", File.ReadAllText(yaml));
+    }
+
+    [Fact]
     public void Legacy_v20_auth_is_read_and_written_in_v20_shape()
     {
         var (collection, node, _) = Load(Data("legacy-v20.postman_collection.json"), "Basic v2.0");

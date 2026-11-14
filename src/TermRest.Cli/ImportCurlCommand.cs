@@ -24,7 +24,7 @@ internal static class ImportCurlCommand
         command.Options.Add(dryRun);
         command.SetAction(parseResult =>
         {
-            var text = parseResult.GetValue(curl) is { } given && given != "-" ? given : Console.In.ReadToEnd();
+            var text = parseResult.GetValue(curl) is { } given && given != "-" ? given : ConsoleText.ReadInput();
             CurlImportResult imported;
             try
             {
@@ -67,7 +67,17 @@ internal static class ImportCurlCommand
             }
 
             var node = target.AddRequest(parent, parseResult.GetValue(name) ?? imported.SuggestedName, spec);
-            target.Save();
+            try
+            {
+                target.Save();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Changed on disk since it was read a moment ago, read-only, or (v3) holding files that could not be read.
+                Output.Error($"Saving {target.Name} failed: {ex.Message}");
+                return 1;
+            }
+
             Output.Status($"✓ Added '{node.PathInCollection}' to {target.Name} ({target.FormatName})", true);
             return 0;
         });
@@ -79,7 +89,7 @@ internal static class ImportCurlCommand
         ApiWorkspace workspace;
         try
         {
-            workspace = ApiWorkspace.Open(path);
+            workspace = ApiWorkspace.Open(path, CollectionLoading.Requested);
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
         {
@@ -87,18 +97,26 @@ internal static class ImportCurlCommand
             return null;
         }
 
+        foreach (var error in workspace.LoadErrors)
+        {
+            Output.Warning(error);
+        }
+
         if (workspace.FindCollection(path) is { } exact)
         {
             return exact;
         }
 
-        if (workspace.Collections.Count == 1)
+        // A workspace folder may stand for its only collection; a collection that did not load never stands for another.
+        var isWorkspace = Directory.Exists(path)
+                          && string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)), workspace.RootPath, StringComparison.OrdinalIgnoreCase);
+        if (isWorkspace && workspace.Collections.Count == 1)
         {
             return workspace.Collections[0];
         }
 
-        Output.Error(workspace.Collections.Count == 0
-            ? $"No collection found in '{path}'."
+        Output.Error(!isWorkspace ? $"'{path}' is not a Postman collection."
+            : workspace.Collections.Count == 0 ? $"No collection found in '{path}'."
             : $"'{path}' has {workspace.Collections.Count} collections; pass one of them: {string.Join(", ", workspace.Collections.Select(c => c.FilePath))}");
         return null;
     }

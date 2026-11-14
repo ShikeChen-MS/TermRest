@@ -1,3 +1,4 @@
+using System.Text.Json.Nodes;
 using TermRest.Core.Http;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
@@ -24,6 +25,23 @@ public class CSharpScriptingTests
 
     /// <summary>A comment that makes a program no test has built yet (built programs are kept in the cache).</summary>
     private static string Fresh() => "// " + Guid.NewGuid().ToString("N");
+
+    /// <summary>A dotnet that runs <paramref name="dotnet"/> and writes each command line it gets to the returned file.</summary>
+    private static (string Dotnet, string Commands) LoggingDotnet(string dotnet)
+    {
+        var folder = TestFiles.NewTempDirectory();
+        var real = ScriptRuntimeLocator.Executable(dotnet)!;
+        var wrapper = Path.Combine(folder, OperatingSystem.IsWindows() ? "dotnet.cmd" : "dotnet");
+        File.WriteAllText(wrapper, OperatingSystem.IsWindows()
+            ? $"@echo %*>>\"%~dp0commands.txt\"\r\n@\"{real}\" %*\r\n"
+            : $"#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/commands.txt\"\nexec \"{real}\" \"$@\"\n");
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(wrapper, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        return (wrapper, Path.Combine(folder, "commands.txt"));
+    }
 
     [Fact]
     public async Task CSharp_scripts_run_around_a_request_with_the_tr_object()
@@ -197,7 +215,7 @@ public class CSharpScriptingTests
         runner.SetCSharpRuntime(dotnet);
 
         // Their output does not get mixed into the answers, and reading input they get nothing (not a request).
-        var exchange = await runner.SendAsync(collection, null, CSharp(server.Url("echo"), preRequest: "using System.Diagnostics;\n" + Fresh() + """
+        var exchange = await runner.SendAsync(collection, null, CSharp(server.Url("echo"), preRequest: "#:property AllowUnsafeBlocks=true\nusing System.Diagnostics;\nusing System.Runtime.InteropServices;\n" + Fresh() + """
 
             var echo = OperatingSystem.IsWindows() ? new ProcessStartInfo("cmd.exe", ["/c", "echo from a child process"]) : new ProcessStartInfo("/bin/sh", ["-c", "echo from a child process"]);
             Process.Start(echo).WaitForExit();
@@ -208,11 +226,94 @@ public class CSharpScriptingTests
             child.WaitForExit();
             Console.WriteLine($"a child reads [{read.Trim()}]");
             Console.WriteLine("captured ünïcödé ✓");
+            if (!OperatingSystem.IsWindows())
+            {
+                unsafe
+                {
+                    var getsid = (delegate* unmanaged<int, int>)NativeLibrary.GetExport(NativeLibrary.GetMainProgramHandle(), "getsid");
+                    tr.Globals["session"] = getsid(0) == Environment.ProcessId ? "its own" : "TermRest's";
+                }
+            }
             """, test: "tr.Test(\"still answers\", () => { });"), _ct);
 
         Assert.Equal(200, exchange.Response!.StatusCode);
         Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
         Assert.Equal(["a child reads []", "captured ünïcödé ✓"], exchange.Scripts.Logs.Select(l => l.Text));
+
+        // Nor can they open TermRest's terminal (/dev/tty) to ask for a password over its screen: the program is in a session
+        // of its own, which has none (this test may run without a terminal, so trying to open it would tell nothing).
+        Assert.Equal(OperatingSystem.IsWindows() ? null : "its own", runner.Session.Globals.GetValueOrDefault("session"));
+    }
+
+    [Fact]
+    public async Task Halves_of_emoji_do_not_break_the_answer()
+    {
+        var dotnet = TestCSharp.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetCSharpRuntime(dotnet);
+
+        // A line cut at 4,000 characters, not inside an emoji, and a script's own substring of one (not text: it becomes U+FFFD).
+        var exchange = await runner.SendAsync(collection, null, CSharp(server.Url("echo"), test: Fresh() + """
+
+            Console.WriteLine(new string('a', 3999) + "😀");
+            var half = "😀"[..1];
+            Console.WriteLine("half " + half + " and a whole 😀");
+            tr.Test("test " + half, () => { });
+            tr.Globals.Set("name " + half, half);
+            """), _ct);
+
+        Assert.Equal(200, exchange.Response!.StatusCode);
+        Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
+        Assert.Equal([new string('a', 3999), "half \uFFFD and a whole 😀"], exchange.Scripts.Logs.Select(l => l.Text));
+        Assert.Equal(["test \uFFFD"], exchange.Scripts.Tests.Select(t => t.Name));
+        Assert.Equal("\uFFFD", runner.Session.Globals["name \uFFFD"]);
+    }
+
+    [Fact]
+    public async Task A_global_using_applies_to_the_whole_program()
+    {
+        var dotnet = TestCSharp.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetCSharpRuntime(dotnet);
+
+        // C# allows global usings only before the namespaces each script gets.
+        var exchange = await runner.SendAsync(collection, null, CSharp(server.Url("echo"),
+            preRequest: "global using System.Net;\nglobal using System.Net;\n" + Fresh(),
+            test: "global using System.Net;\n" + Fresh() + "\ntr.Test(\"status\", () => tr.Assert(HttpStatusCode.OK == (HttpStatusCode)tr.Response.Code));"), _ct);
+
+        Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
+        Assert.Equal(["status"], exchange.Scripts.Tests.Where(t => t.Passed).Select(t => t.Name));
+    }
+
+    [Fact]
+    public async Task Dates_uris_and_json_strings_set_in_scripts_are_their_text()
+    {
+        var dotnet = TestCSharp.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        using var runner = new RequestRunner(workspace);
+        runner.SetCSharpRuntime(dotnet);
+
+        var exchange = await runner.SendAsync(collection, null, CSharp(server.Url("echo"), test: Fresh() + """
+
+            tr.CollectionVariables.Set("site", new Uri("https://example.org/a%20b"));
+            tr.CollectionVariables.Set("name", System.Text.Json.JsonSerializer.SerializeToElement("Ada"));
+            tr.CollectionVariables.Set("flags", new { on = true });
+            tr.CollectionVariables.Set("day", new DateOnly(2024, 1, 2));
+            tr.CollectionVariables.Set("at", new TimeOnly(3, 4, 5));
+            var order = new JsonObject { ["id"] = Guid.Parse("3f2504e0-4f89-11d3-9a0c-0305e82c3301") };
+            tr.CollectionVariables.Set("id", order["id"]);
+            tr.Test("a GUID held by JSON is its text", () => tr.AssertEqual("3f2504e0-4f89-11d3-9a0c-0305e82c3301", order["id"]));
+            """), _ct);
+
+        Assert.True(exchange.Scripts!.Succeeded, exchange.Scripts.Describe());
+        var stored = runner.Session.For(collection);
+        Assert.Equal(("https://example.org/a%20b", "Ada", """{"on":true}"""), (stored["site"], stored["name"], stored["flags"]));
+        Assert.Equal(("2024-01-02", "03:04:05.0000000", "3f2504e0-4f89-11d3-9a0c-0305e82c3301"), (stored["day"], stored["at"], stored["id"]));
     }
 
     [Fact]
@@ -240,13 +341,295 @@ public class CSharpScriptingTests
     }
 
     [Fact]
+    public async Task Stopping_scripts_while_they_are_built_leaves_no_program_running()
+    {
+        var dotnet = TestCSharp.Require();
+        using var worker = ScriptWorker.For(ScriptLanguage.CSharp, dotnet, TestFiles.NewTempDirectory());
+        var message = new JsonObject
+        {
+            ["phase"] = "test",
+            ["scripts"] = new JsonArray(new JsonObject { ["name"] = "request", ["code"] = Fresh() + "\nConsole.WriteLine(1);" }),
+        };
+
+        // Tools › Scripts › Stop scripts while the scripts are built: the program does not start once they are.
+        var run = worker.RunAsync(message, TimeSpan.FromSeconds(30), cancellationToken: _ct);
+        await Task.Delay(300, _ct);
+        Assert.False(run.IsCompleted);
+        worker.Dispose();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => run);
+        Assert.False(worker.IsRunning);
+    }
+
+    [Fact]
+    public async Task A_program_that_runs_stays_whole_when_it_is_built_again()
+    {
+        var dotnet = TestCSharp.Require();
+        var workspace = TestFiles.NewTempDirectory();
+        var code = Fresh() + "\ntr.Test(\"ran\", () => { });";
+        JsonObject Message() => new() { ["phase"] = "test", ["scripts"] = new JsonArray(new JsonObject { ["name"] = "request", ["code"] = code }) };
+
+        // A TermRest runs the program while another forgets it (its own run of it ended before it answered) and builds it again.
+        using var running = ScriptWorker.For(ScriptLanguage.CSharp, dotnet, workspace);
+        await running.RunAsync(Message(), TimeSpan.FromSeconds(30), cancellationToken: _ct);
+        Assert.True(running.IsRunning);
+        var programs = new CSharpPrograms(dotnet, workspace);
+        var (program, _) = await programs.PrepareAsync(Message(), [], _ct);
+        var folder = Path.GetDirectoryName(program)!;
+        var files = Directory.GetFiles(folder, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal).ToList();
+        CSharpPrograms.Forget(program);
+
+        var (again, _) = await programs.PrepareAsync(Message(), [], _ct);
+
+        Assert.Equal(program, again);
+        Assert.Equal(files, Directory.GetFiles(folder, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal));
+        using var next = ScriptWorker.For(ScriptLanguage.CSharp, dotnet, workspace);
+        var reply = await next.RunAsync(Message(), TimeSpan.FromSeconds(30), cancellationToken: _ct);
+        Assert.Equal("ran", reply["tests"]![0]!["name"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task A_script_of_the_collection_that_does_not_build_is_left_out_at_once_the_next_time()
+    {
+        var (dotnet, commands) = LoggingDotnet(TestCSharp.Require());
+        var programs = new CSharpPrograms(dotnet, TestFiles.NewTempDirectory());
+        var mine = Fresh() + "\ntr.Test(\"ran\", () => { });";
+        var theirs = "#:project no-such-project\n" + Fresh(); // another request's script, whose project is not there
+        ScriptCode[] collection = [new("", mine, ScriptLanguage.CSharp), new("", theirs, ScriptLanguage.CSharp)];
+        JsonObject Message(string code) => new() { ["phase"] = "test", ["scripts"] = new JsonArray(new JsonObject { ["name"] = "request", ["code"] = code }) };
+        int Builds() => File.Exists(commands) ? File.ReadLines(commands).Count(l => l.StartsWith("run ", StringComparison.Ordinal)) : 0;
+        var (alone, _) = await programs.PrepareAsync(Message(mine), [], _ct);
+
+        // The collection's program does not build: the script runs in its own program, built before, so nothing was built.
+        var (program, note) = await programs.PrepareAsync(Message(mine), collection, _ct);
+        var builds = Builds();
+        var (again, noteAgain) = await programs.PrepareAsync(Message(mine), collection, _ct);
+
+        Assert.Equal(alone, program);
+        Assert.Null(note);
+        Assert.Equal(alone, again); // without building the collection's program again
+        Assert.Null(noteAgain);
+        Assert.Equal(builds, Builds());
+
+        // The script that does not build fails with its own error, built again each time it runs (it may have been fixed).
+        var first = Message(theirs);
+        var (_, firstNote) = await programs.PrepareAsync(first, collection, _ct);
+        builds = Builds();
+        var second = Message(theirs);
+        await programs.PrepareAsync(second, collection, _ct);
+        Assert.Contains("no-such-project", first["scripts"]![0]!["error"]!["message"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Contains("no-such-project", second["scripts"]![0]!["error"]!["message"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.True(Builds() > builds);
+        Assert.DoesNotContain("start at once next time", firstNote ?? "", StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Directives_of_another_script_of_the_collection_do_not_break_the_scripts_that_run()
+    {
+        var (dotnet, commands) = LoggingDotnet(TestCSharp.Require());
+        using var worker = ScriptWorker.For(ScriptLanguage.CSharp, dotnet, TestFiles.NewTempDirectory());
+        var mine = Fresh() + "\nvar unused = 1;\ntr.Test(\"ok\", () => { });";
+        var theirs = "#:property TreatWarningsAsErrors=true\n" + Fresh(); // another request's: it makes the warning in mine (CS0219) an error
+        ScriptCode[] collection = [new("", mine, ScriptLanguage.CSharp), new("", theirs, ScriptLanguage.CSharp)];
+        JsonObject Message() => new() { ["phase"] = "test", ["scripts"] = new JsonArray(new JsonObject { ["name"] = "request", ["code"] = mine }) };
+        int Builds() => File.ReadLines(commands).Count(l => l.StartsWith("run ", StringComparison.Ordinal));
+
+        var reply = await worker.RunAsync(Message(), TimeSpan.FromSeconds(30), collection, _ct);
+        var builds = Builds();
+        var again = await worker.RunAsync(Message(), TimeSpan.FromSeconds(30), collection, _ct);
+
+        Assert.Null(reply["error"]);
+        Assert.Equal("ok", reply["tests"]![0]!["name"]!.GetValue<string>());
+        Assert.Null(again["error"]);
+        Assert.Equal(builds, Builds()); // the program with the other script is not built again to fail
+    }
+
+    [Fact]
+    public async Task The_compiler_server_is_stopped_where_the_scripts_are_built()
+    {
+        var dotnet = TestCSharp.Require();
+        var message = new JsonObject { ["phase"] = "test", ["scripts"] = new JsonArray(new JsonObject { ["name"] = "request", ["code"] = Fresh() }) };
+        await new CSharpPrograms(dotnet, TestFiles.NewTempDirectory()).PrepareAsync(message, [], _ct); // this TermRest built scripts
+
+        // Not in TermRest's current folder, whose global.json would choose the SDK: this dotnet tells where it runs.
+        var folder = TestFiles.NewTempDirectory();
+        var fake = Path.Combine(folder, OperatingSystem.IsWindows() ? "dotnet.cmd" : "dotnet");
+        await File.WriteAllTextAsync(fake, OperatingSystem.IsWindows()
+            ? "@cd > \"%~dp0where.tmp\"\r\n@move /y \"%~dp0where.tmp\" \"%~dp0where.txt\" > nul\r\n"
+            : "#!/bin/sh\nhere=$(dirname \"$0\")\npwd > \"$here/where.tmp\" && mv \"$here/where.tmp\" \"$here/where.txt\"\n", _ct);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(fake, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        CSharpPrograms.StopCompilerServer(fake);
+
+        var where = Path.Combine(folder, "where.txt");
+        for (var i = 0; i < 200 && !File.Exists(where); i++)
+        {
+            await Task.Delay(50, _ct);
+        }
+
+        Assert.EndsWith(Path.Combine("csharp", "source"), (await File.ReadAllTextAsync(where, _ct)).Trim(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Changes_to_included_files_build_the_scripts_again()
+    {
+        var dotnet = TestCSharp.Require();
+        var (_, sdk) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.CSharp, dotnet, _ct);
+        if (!Version.TryParse(sdk.Split(' ')[2].Split('-')[0], out var version) || version < new Version(10, 0, 300))
+        {
+            Assert.Skip($"#:include needs the .NET SDK 10.0.300 or later ({sdk}).");
+        }
+
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        var helpers = Path.Combine(workspace.RootPath, "helpers.cs");
+        using var runner = new RequestRunner(workspace);
+        runner.SetCSharpRuntime(dotnet);
+        var spec = CSharp(server.Url("echo"), test: "#:include helpers.cs\n" + Fresh() + "\ntr.Test(Helpers.Name, () => { });");
+        async Task<ScriptResults> Run(string name)
+        {
+            await File.WriteAllTextAsync(helpers, $"static class Helpers {{ public static string Name => {name}; }}", _ct);
+            return (await runner.SendAsync(collection, null, spec, _ct)).Scripts!;
+        }
+
+        Assert.Equal(["one"], (await Run("\"one\"")).Tests.Select(t => t.Name));
+        Assert.Equal(["two!"], (await Run("\"two!\"")).Tests.Select(t => t.Name));
+
+        // A compile error in the file names the file and its position, and is not reported again once it is fixed.
+        Assert.Equal("CS0103: The name 'three' does not exist in the current context (helpers.cs, line 1, column 53)", (await Run("three")).Error!.Message);
+        Assert.Equal(["three"], (await Run("\"three\"")).Tests.Select(t => t.Name));
+    }
+
+    [Fact]
+    public async Task Changes_to_a_referenced_project_build_the_scripts_again()
+    {
+        var dotnet = TestCSharp.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        var project = Path.Combine(workspace.RootPath, "lib");
+        Directory.CreateDirectory(project);
+        await File.WriteAllTextAsync(Path.Combine(project, "Lib.csproj"),
+            """<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>""", _ct);
+        using var runner = new RequestRunner(workspace);
+        runner.SetCSharpRuntime(dotnet);
+        var spec = CSharp(server.Url("echo"), test: "#:project lib/Lib.csproj\n" + Fresh() + "\ntr.Test(Names.Name, () => { });");
+        async Task<ScriptResults> Run(string name)
+        {
+            await File.WriteAllTextAsync(Path.Combine(project, "Names.cs"), $"public static class Names {{ public static string Name => \"{name}\"; }}", _ct);
+            return (await runner.SendAsync(collection, null, spec, _ct)).Scripts!;
+        }
+
+        Assert.Equal(["one"], (await Run("one")).Tests.Select(t => t.Name));
+        Assert.Equal(["two!"], (await Run("two!")).Tests.Select(t => t.Name));
+
+        // What builds write in the project's folder (bin, obj) is no change: the program is not built again; nor is what the
+        // program of the project writes there when it runs (a database, logs).
+        await File.WriteAllTextAsync(Path.Combine(project, "app.db"), "rows", _ct);
+        Directory.CreateDirectory(Path.Combine(project, "logs"));
+        await File.WriteAllTextAsync(Path.Combine(project, "logs", "today.txt"), "GET /users 200", _ct);
+        var again = (await runner.SendAsync(collection, null, spec, _ct)).Scripts!;
+        Assert.Equal(["two!"], again.Tests.Select(t => t.Name));
+        Assert.DoesNotContain(again.Notes, n => n.StartsWith("The C# scripts were built", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Changes_to_the_projects_and_settings_that_a_referenced_project_uses_build_the_scripts_again()
+    {
+        var dotnet = TestCSharp.Require();
+        await using var server = await EchoServer.StartAsync();
+        var (workspace, collection) = NewWorkspace();
+        var api = Path.Combine(workspace.RootPath, "src", "Api");
+        var contracts = Path.Combine(workspace.RootPath, "src", "Contracts");
+        Directory.CreateDirectory(api);
+        Directory.CreateDirectory(contracts);
+        await File.WriteAllTextAsync(Path.Combine(api, "Api.csproj"), """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><ProjectReference Include="..\Contracts\Contracts.csproj" /></ItemGroup>
+            </Project>
+            """, _ct);
+        await File.WriteAllTextAsync(Path.Combine(contracts, "Contracts.csproj"),
+            """<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>""", _ct);
+        using var runner = new RequestRunner(workspace);
+        runner.SetCSharpRuntime(dotnet);
+        var spec = CSharp(server.Url("echo"), test: "#:project src/Api/Api.csproj\n" + Fresh() + "\ntr.Test(Names.Name, () => { });");
+        async Task<ScriptResults> Run(string name)
+        {
+            await File.WriteAllTextAsync(Path.Combine(contracts, "Names.cs"),
+                $"public static class Names\n{{\n#if LOUD\n    public static string Name => \"{name.ToUpperInvariant()}\";\n#else\n    public static string Name => \"{name}\";\n#endif\n}}\n", _ct);
+            return (await runner.SendAsync(collection, null, spec, _ct)).Scripts!;
+        }
+
+        Assert.Equal(["one"], (await Run("one")).Tests.Select(t => t.Name));
+
+        // The code of a project that the referenced one references (src/Contracts, beside it).
+        Assert.Equal(["two!"], (await Run("two!")).Tests.Select(t => t.Name));
+
+        // MSBuild's settings in a folder above the projects (the workspace's).
+        await File.WriteAllTextAsync(Path.Combine(workspace.RootPath, "Directory.Build.props"),
+            "<Project><PropertyGroup><DefineConstants>$(DefineConstants);LOUD</DefineConstants></PropertyGroup></Project>", _ct);
+        var settings = (await runner.SendAsync(collection, null, spec, _ct)).Scripts!;
+        Assert.Equal(["TWO!"], settings.Tests.Select(t => t.Name));
+
+        // The other files of the folders above are no change.
+        await File.WriteAllTextAsync(Path.Combine(workspace.RootPath, "app.db"), "rows", _ct);
+        var again = (await runner.SendAsync(collection, null, spec, _ct)).Scripts!;
+        Assert.Equal(["TWO!"], again.Tests.Select(t => t.Name));
+        Assert.DoesNotContain(again.Notes, n => n.StartsWith("The C# scripts were built", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_project_reached_through_a_symbolic_link_builds_with_the_projects_it_references()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "Creating symbolic links needs Developer Mode or an administrator on Windows.");
+        var dotnet = TestCSharp.Require();
+        await using var server = await EchoServer.StartAsync();
+        var real = TestFiles.NewTempDirectory();
+        var contracts = Path.Combine(real, "src", "Contracts");
+        Directory.CreateDirectory(Path.Combine(real, "src", "Api"));
+        Directory.CreateDirectory(contracts);
+        await File.WriteAllTextAsync(Path.Combine(real, "src", "Api", "Api.csproj"), """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><ProjectReference Include="..\Contracts\Contracts.csproj" /></ItemGroup>
+            </Project>
+            """, _ct);
+        await File.WriteAllTextAsync(Path.Combine(contracts, "Contracts.csproj"),
+            """<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>""", _ct);
+        var link = Path.Combine(TestFiles.NewTempDirectory(), "workspace");
+        Directory.CreateSymbolicLink(link, real);
+        var workspace = ApiWorkspace.Open(link);
+        var collection = workspace.CreateCollection("API");
+        using var runner = new RequestRunner(workspace);
+        runner.SetCSharpRuntime(dotnet);
+        async Task<ScriptResults> Run(string name)
+        {
+            await File.WriteAllTextAsync(Path.Combine(contracts, "Names.cs"), $"public static class Names {{ public static string Name => {name}; }}", _ct);
+            var spec = CSharp(server.Url("echo"), test: "#:project src/Api/Api.csproj\n" + Fresh() + "\ntr.Test(Names.Name, () => { });");
+            return (await runner.SendAsync(collection, null, spec, _ct)).Scripts!;
+        }
+
+        // On Linux and macOS (where /var and /tmp are links), NuGet leaves out what a project references when the path to it
+        // goes through a link: the scripts would not know Names, from src/Contracts.
+        var built = await Run("\"one\"");
+        Assert.True(built.Succeeded, built.Describe());
+        Assert.Equal(["one"], built.Tests.Select(t => t.Name));
+
+        // An error in those projects names the file in the workspace, as without the link.
+        Assert.Contains("(src/Contracts/Names.cs, line 1, column ", (await Run("one")).Error!.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task The_dotnet_sdk_is_found_and_must_be_dotnet_10_or_later()
     {
         var dotnet = TestCSharp.Require();
-        var (ok, message) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.CSharp, dotnet, Path.GetTempPath(), _ct);
+        var (ok, message) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.CSharp, dotnet, _ct);
         Assert.True(ok, message);
         Assert.Matches(@"^\.NET SDK \d+\.\d+\.\d+\S* · ", message);
-        var (missing, why) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.CSharp, "no-such-dotnet-here", Path.GetTempPath(), _ct);
+        var (missing, why) = await ScriptRuntimeLocator.CheckAsync(ScriptLanguage.CSharp, "no-such-dotnet-here", _ct);
         Assert.False(missing);
         Assert.Contains("could not be started", why, StringComparison.Ordinal);
         Assert.NotNull(await ScriptRuntimeLocator.FindAsync(ScriptLanguage.CSharp, TestFiles.NewTempDirectory(), r => r, _ct));
@@ -280,5 +663,17 @@ public class CSharpScriptingTests
         Assert.Contains($"#line 1 \"termrest-script-{id}\"\n\n\n\n// a comment\nusing var stream = new MemoryStream();\nConsole.WriteLine(1);\n#line default", program, StringComparison.Ordinal);
         Assert.Equal(id, CSharpWorkerCode.ScriptIdOf($"C:\\cache\\source\\termrest-script-{id}"));
         Assert.Null(CSharpWorkerCode.ScriptIdOf("C:\\cache\\source\\termrest-scripts.cs"));
+
+        // Global usings go before the namespaces, once each, mapped to the first script's line.
+        var withGlobals = CSharpWorkerCode.Generate(new Dictionary<string, string>
+        {
+            ["a"] = "using System.Text;\nglobal using System.Net;\nglobal using static System.Math;",
+            ["b"] = "global using System.Net;",
+        }, workspace);
+        var first = withGlobals.IndexOf("\nnamespace ", StringComparison.Ordinal);
+        var globals = "\n#line 2 \"termrest-script-a\"\nglobal using System.Net;\n#line 3 \"termrest-script-a\"\nglobal using static System.Math;\n#line default\n";
+        Assert.InRange(withGlobals.IndexOf(globals, StringComparison.Ordinal), 0, first);
+        Assert.Equal(1, withGlobals.Split("global using System.Net;").Length - 1);
+        Assert.Contains("#line 1 \"termrest-script-a\"\n    using System.Text;\n", withGlobals, StringComparison.Ordinal);
     }
 }

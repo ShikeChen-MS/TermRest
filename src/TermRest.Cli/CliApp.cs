@@ -1,4 +1,6 @@
 using System.CommandLine;
+using System.CommandLine.Invocation;
+using System.Runtime.InteropServices;
 using TermRest.Tui;
 
 namespace TermRest.Cli;
@@ -6,6 +8,9 @@ namespace TermRest.Cli;
 /// <summary>Command-line surface: the TUI by default, plus headless commands for scripts and CI.</summary>
 internal static class CliApp
 {
+    /// <summary>Cancelled by the first Ctrl+C or SIGTERM while <c>send</c> or <c>run</c> works (see <see cref="Stop"/>).</summary>
+    private static readonly CancellationTokenSource Stopping = new();
+
     public static async Task<int> RunAsync(string[] args)
     {
         var insecure = new Option<bool>("--insecure", "-k") { Description = "Do not verify server TLS certificates", Recursive = true };
@@ -47,7 +52,31 @@ internal static class CliApp
         root.Subcommands.Add(ThemesCommand.Create());
         root.Subcommands.Add(CreateSnapshotCommand());
 
-        return await root.Parse(args).InvokeAsync();
+        var parseResult = root.Parse(args);
+        if (parseResult.Action != root.Action)
+        {
+            ConsoleText.UseUnicode(); // a command (the full-screen UI drives the console itself)
+        }
+
+        if (parseResult.Action is not AsynchronousCommandLineAction)
+        {
+            return await parseResult.InvokeAsync();
+        }
+
+        using var interrupt = PosixSignalRegistration.Create(PosixSignal.SIGINT, Stop);
+        using var terminate = PosixSignalRegistration.Create(PosixSignal.SIGTERM, Stop);
+        return await parseResult.InvokeAsync(new InvocationConfiguration { ProcessTerminationTimeout = null }, Stopping.Token);
+    }
+
+    /// <summary>
+    /// The first Ctrl+C (or SIGTERM: a cancelled CI job) stops <c>send</c> and <c>run</c>, which still save their recording
+    /// and write their report, however long that takes (System.CommandLine would end the process 2 seconds after the
+    /// signal); another one ends TermRest at once.
+    /// </summary>
+    private static void Stop(PosixSignalContext context)
+    {
+        context.Cancel = !Stopping.IsCancellationRequested;
+        Stopping.Cancel();
     }
 
     private static Command CreateSnapshotCommand()

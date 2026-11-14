@@ -11,7 +11,8 @@ internal interface ICollectionStorage
     /// <summary>Directory that relative file paths (body files, certificates) are resolved against.</summary>
     string BaseDirectory { get; }
 
-    void Save(PostmanCollection collection);
+    /// <param name="overwriteChanged">Also write files that changed on disk since they were read (see <see cref="FileChangedException"/>).</param>
+    void Save(PostmanCollection collection, bool overwriteChanged);
 }
 
 /// <summary>
@@ -20,16 +21,23 @@ internal interface ICollectionStorage
 /// model TermRest edits everywhere; saving writes back only what changed: edited requests (only the edited YAML
 /// entries), renamed or moved items (their files and <c>.resources</c> move along), new and deleted items, and the
 /// <c>order</c> of reordered siblings. Files TermRest does not show (GraphQL, gRPC … requests, unreadable files) are
-/// never touched.
+/// never touched, and files another program changed since they were read are only saved over when that is allowed.
 /// </summary>
 internal sealed class V3CollectionStorage : ICollectionStorage
 {
+    private const string StagingPrefix = ".termrest-saving-";
+
     private static readonly TextFileInfo NewFile = new(false, true, false);
+
+    /// <summary>The keys of an example file, in Postman's order.</summary>
+    private static readonly string[] ExampleOrder = ["$kind", "name", "request", "response", "order"];
 
     private readonly Dictionary<JsonObject, Origin> _origins = new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<JsonObject, List<JsonObject>> _loadedChildren = new(ReferenceEqualityComparer.Instance);
-    private readonly HashSet<string> _unreadable = new(StringComparer.OrdinalIgnoreCase);
     private YamlStyle _style = YamlStyle.Default;
+
+    /// <summary>On Unix, the permissions of the files a conversion creates (see <see cref="ConvertFrom"/>); null: the default.</summary>
+    private UnixFileMode? _newFileMode;
 
     private V3CollectionStorage(string directory)
     {
@@ -57,7 +65,14 @@ internal sealed class V3CollectionStorage : ICollectionStorage
 
         public JsonObject? Parent { get; set; }
 
+        /// <summary>The file as last read or written; null when there is none, or it could not be read (it is then never overwritten).</summary>
         public YamlFile? File { get; set; }
+
+        /// <summary>What the file held when last read or written, to tell whether another program changed it since (with <see cref="File"/>).</summary>
+        public FileStamp? Stamp { get; set; }
+
+        /// <summary>Why the file could not be read when the collection was loaded; null when it could, or there was none.</summary>
+        public string? ReadError { get; set; }
 
         public TextFileInfo FileInfo { get; set; } = NewFile;
 
@@ -68,6 +83,9 @@ internal sealed class V3CollectionStorage : ICollectionStorage
         public required JsonObject Baseline { get; set; }
 
         public JsonNode? Order { get; set; }
+
+        /// <summary>For requests: the file name (without suffix) <see cref="V3"/> was read or written under; its <c>examples</c> path refers to it.</summary>
+        public string? Stem { get; set; }
     }
 
     // ----- loading ---------------------------------------------------------------------------------
@@ -80,6 +98,13 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             throw new DirectoryNotFoundException($"'{directory}' does not exist.");
         }
 
+        // As the workspace takes them: any other folder (a workspace, a source folder) would be read as one whole collection.
+        if (!V3Names.IsCollectionDirectory(directory))
+        {
+            throw new IOException($"'{directory}' is not a Postman v3 collection folder: one with a {V3Names.ResourcesDirectory}/{V3Names.DefinitionFile} " +
+                                  $"or *{V3Names.RequestSuffix} files (in its folders too, in a postman/collections folder).");
+        }
+
         var storage = new V3CollectionStorage(directory);
         var warnings = new List<string>();
         var trees = new List<YamlTree>();
@@ -90,23 +115,38 @@ internal sealed class V3CollectionStorage : ICollectionStorage
         };
 
         var definitionPath = V3Names.DefinitionPath(directory);
-        var (definition, info) = storage.Read(definitionPath, warnings, trees);
-        V3Convert.DefinitionToV21(definition?.Json, root, isRoot: true);
-        if (definition?.Json["name"].GetString() is { Length: > 0 } name)
+        var definition = storage.Read(definitionPath, warnings, trees);
+        V3Convert.DefinitionToV21(definition.File?.Json, root, isRoot: true);
+        if (definition.File?.Json["name"].GetString() is { Length: > 0 } name)
         {
             root["info"]!["name"] = name;
         }
 
-        storage._origins[root] = new Origin { Path = directory, File = definition, FileInfo = info, V3 = definition?.Json, Baseline = Snapshot(root) };
+        storage._origins[root] = new Origin
+        {
+            Path = directory, File = definition.File, Stamp = definition.Stamp, ReadError = definition.Error, FileInfo = definition.Info,
+            V3 = definition.File?.Json, Baseline = Snapshot(root),
+        };
         var hidden = storage.LoadChildren(directory, root, warnings, trees);
+        var unreadable = warnings.Count > 0;
         if (hidden > 0)
         {
             warnings.Add($"{hidden} non-HTTP request(s) (GraphQL, gRPC, WebSocket …) are not shown; their files are left untouched.");
         }
 
+        foreach (var leftover in System.IO.Directory.EnumerateDirectories(directory, StagingPrefix + "*"))
+        {
+            if (System.IO.Directory.EnumerateFileSystemEntries(leftover).Any())
+            {
+                warnings.Add($"{Path.GetFileName(leftover)}: a save that did not finish left files here; move them back into the collection.");
+                unreadable = true;
+            }
+        }
+
         storage._style = YamlStyle.Detect(trees);
         var collection = PostmanCollection.FromStorage(root, directory, storage);
         collection.LoadWarnings.AddRange(warnings);
+        collection.HasUnreadableFiles = unreadable;
         return collection;
     }
 
@@ -114,13 +154,20 @@ internal sealed class V3CollectionStorage : ICollectionStorage
     public static PostmanCollection Create(string directory, string name, int? lineWidth = null)
     {
         directory = Path.GetFullPath(directory);
+        if (System.IO.Directory.Exists(directory) && System.IO.Directory.EnumerateFileSystemEntries(directory).Any())
+        {
+            throw new IOException($"'{directory}' already exists and is not empty.");
+        }
+
         var definition = new JsonObject { ["$kind"] = V3Convert.CollectionKind };
         if (Path.GetFileName(Path.TrimEndingDirectorySeparator(directory)) != name)
         {
             definition["name"] = name;
         }
 
-        TextFile.WriteAtomic(V3Names.DefinitionPath(directory), YamlFile.Write(definition, YamlStyle.Default.WithLineWidth(lineWidth)).TrimEnd('\n'), NewFile);
+        var definitionPath = V3Names.DefinitionPath(directory);
+        var (text, info) = YamlFile.WriteChecked(null, definition, YamlStyle.Default.WithLineWidth(lineWidth), definitionPath, NewFile, out _);
+        TextFile.WriteAtomic(definitionPath, text, info);
         var collection = Load(directory);
         collection.YamlLineWidth = lineWidth;
         return collection;
@@ -129,7 +176,9 @@ internal sealed class V3CollectionStorage : ICollectionStorage
     /// <summary>
     /// Writes <paramref name="source"/> (any format) as a new v3 collection folder, including saved responses as
     /// <c>.example.yaml</c> files, and returns the loaded result. Long values are wrapped at
-    /// <paramref name="lineWidth"/> (null or 0: not wrapped, like current Postman versions).
+    /// <paramref name="lineWidth"/> (null or 0: not wrapped, like current Postman versions). On Unix the folder and its
+    /// files get the permissions of the source's file (see <see cref="TextFile.CopyMode"/>) from the start. When writing
+    /// fails, nothing is left behind: a collection that is only partly written would look complete.
     /// </summary>
     public static PostmanCollection ConvertFrom(PostmanCollection source, string directory, int? lineWidth = null)
     {
@@ -139,14 +188,38 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             throw new IOException($"'{directory}' already exists and is not empty.");
         }
 
-        System.IO.Directory.CreateDirectory(directory);
-        var root = (JsonObject)source.Root.DeepClone();
-        var storage = new V3CollectionStorage(directory) { LineWidth = lineWidth };
-        var collection = PostmanCollection.FromStorage(root, directory, storage);
-        storage.Save(collection);
-        foreach (var request in collection.AllRequests())
+        // The outermost folder created here (null when the target folder exists): removed again when writing fails.
+        string? created = null;
+        for (var missing = directory; missing is not null && !System.IO.Directory.Exists(missing); missing = Path.GetDirectoryName(missing))
         {
-            storage.WriteExamples(request.Json);
+            created = missing;
+        }
+
+        var fileMode = source.FilePath is { } sourcePath ? TextFile.CopyMode(sourcePath) : null;
+        try
+        {
+            if (fileMode is { } mode && !OperatingSystem.IsWindows())
+            {
+                // Private from the start for a private source: others never get to read what is being written.
+                var folderMode = TextFile.FolderMode(mode);
+                System.IO.Directory.CreateDirectory(Path.GetDirectoryName(directory) ?? directory);
+                System.IO.Directory.CreateDirectory(directory, folderMode);
+                File.SetUnixFileMode(directory, folderMode); // the create mode is subject to the umask
+            }
+            else
+            {
+                System.IO.Directory.CreateDirectory(directory);
+            }
+
+            var root = (JsonObject)source.Root.DeepClone();
+            var storage = new V3CollectionStorage(directory) { LineWidth = lineWidth, _newFileMode = fileMode };
+            var collection = PostmanCollection.FromStorage(root, directory, storage);
+            storage.Save(collection, overwriteChanged: false); // new requests are written with their examples
+        }
+        catch
+        {
+            RemoveWritten(directory, created);
+            throw;
         }
 
         var converted = Load(directory);
@@ -154,54 +227,91 @@ internal sealed class V3CollectionStorage : ICollectionStorage
         return converted;
     }
 
-    /// <summary>Saved responses (v2.1 <c>response</c>) as v3 example files next to the request.</summary>
-    private void WriteExamples(JsonObject item)
+    /// <summary>Removes what a failed conversion wrote: <paramref name="created"/> with everything in it, else what is in <paramref name="directory"/>.</summary>
+    private static void RemoveWritten(string directory, string? created)
     {
-        if (item["response"] is not JsonArray { Count: > 0 } responses || !_origins.TryGetValue(item, out var origin))
+        try
         {
-            return;
+            if (created is not null)
+            {
+                System.IO.Directory.Delete(created, recursive: true);
+                return;
+            }
+
+            foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
+            {
+                if (entry is DirectoryInfo folder)
+                {
+                    folder.Delete(recursive: true);
+                }
+                else
+                {
+                    entry.Delete();
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Best effort: the error that stopped the conversion is the one to report.
+        }
+    }
+
+    /// <summary>
+    /// Writes the saved responses (v2.1 <c>response</c>) of a request that is new to the folder as v3 example files next to
+    /// <paramref name="requestFile"/>; returns the request's <c>examples</c> reference to them, or null when it has none.
+    /// </summary>
+    private string? WriteExamples(JsonObject item, string requestFile)
+    {
+        if (item["response"] is not JsonArray { Count: > 0 } responses)
+        {
+            return null;
         }
 
-        var folder = Path.Combine(V3Names.ResourcesPath(origin.Path), "examples");
+        var folder = Path.Combine(V3Names.ResourcesPath(requestFile), "examples");
+        CreateFolder(folder);
         var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var order = 0;
         foreach (var response in responses.OfType<JsonObject>())
         {
-            var name = V3Names.Unique(V3Names.Safe(response["name"].GetString() ?? "Example"), taken);
+            var responseName = response["name"].GetString() is { Length: > 0 } given ? given : "Example";
+            var name = V3Names.Unique(V3Names.Safe(responseName), taken);
             taken.Add(name);
             var example = V3Convert.ExampleToV3(response);
+
+            // A name its file can't have (cut, made safe or unique) is kept in the file, as Postman keeps it.
+            if (name != responseName)
+            {
+                example.SetOrdered("name", responseName, ExampleOrder);
+            }
+
             order += 1000;
             example["order"] = order;
-            TextFile.WriteAtomic(Path.Combine(folder, name + ".example.yaml"), YamlFile.Write(example, Style).TrimEnd('\n'), NewFile);
+            var path = Path.Combine(folder, name + ".example.yaml");
+            var (text, info) = YamlFile.WriteChecked(null, example, Style, path, NewFile, out _);
+            TextFile.WriteAtomic(path, text, info, _newFileMode);
         }
 
-        var v3 = (JsonObject)origin.V3!.DeepClone();
-        v3.SetOrdered("examples", $"./{V3Names.ResourcesDirectory}/{V3Names.RequestStem(origin.Path)}.resources/examples", V3Convert.RequestOrder);
-        var text = origin.File!.Render(v3, Style);
-        TextFile.WriteAtomic(origin.Path, text[..^1], origin.FileInfo);
-        origin.File = YamlFile.Parse(text);
-        origin.V3 = v3;
+        return order == 0 ? null : $"./{V3Names.ResourcesDirectory}/{V3Names.RequestStem(requestFile)}.resources/examples";
     }
 
-    private (YamlFile? File, TextFileInfo Info) Read(string path, List<string> warnings, List<YamlTree> trees)
+    private (YamlFile? File, TextFileInfo Info, FileStamp? Stamp, string? Error) Read(string path, List<string> warnings, List<YamlTree> trees)
     {
         if (!File.Exists(path))
         {
-            return (null, NewFile);
+            return (null, NewFile, null, null);
         }
 
         try
         {
-            var (text, info) = TextFile.Read(path);
+            var (text, info) = TextFile.Read(path, out var stamp);
             var file = YamlFile.Parse(text);
             trees.Add(file.Tree);
-            return (file, info);
+            return (file, info, stamp, null);
         }
         catch (Exception ex) when (ex is FormatException or IOException or UnauthorizedAccessException)
         {
-            _unreadable.Add(path);
             warnings.Add($"{Path.GetRelativePath(Directory, path)}: {ex.Message}");
-            return (null, NewFile);
+            return (null, NewFile, null, ex.Message);
         }
     }
 
@@ -212,7 +322,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
         var children = new List<(double? Order, string Name, JsonObject Item)>();
         foreach (var file in System.IO.Directory.EnumerateFiles(directory).Where(V3Names.IsRequestFile))
         {
-            var (yaml, info) = Read(file, warnings, trees);
+            var (yaml, info, stamp, _) = Read(file, warnings, trees);
             if (yaml is null)
             {
                 continue;
@@ -228,7 +338,8 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             var item = V3Convert.RequestToV21(yaml.Json, name);
             _origins[item] = new Origin
             {
-                Path = file, Parent = parent, File = yaml, FileInfo = info, V3 = yaml.Json, Baseline = Snapshot(item), Order = yaml.Json["order"]?.DeepClone(),
+                Path = file, Parent = parent, File = yaml, Stamp = stamp, FileInfo = info, V3 = yaml.Json, Baseline = Snapshot(item),
+                Order = yaml.Json["order"]?.DeepClone(), Stem = V3Names.RequestStem(file),
             };
             children.Add((OrderValue(yaml.Json["order"]), name, item));
         }
@@ -241,14 +352,14 @@ internal sealed class V3CollectionStorage : ICollectionStorage
                 continue;
             }
 
-            var (definition, info) = Read(V3Names.DefinitionPath(sub), warnings, trees);
+            var (definition, info, stamp, error) = Read(V3Names.DefinitionPath(sub), warnings, trees);
             var name = definition?.Json["name"].GetString() is { Length: > 0 } explicitName ? explicitName : dirName;
             var folder = new JsonObject { ["name"] = name, ["item"] = new JsonArray() };
             V3Convert.DefinitionToV21(definition?.Json, folder, isRoot: false);
             _origins[folder] = new Origin
             {
-                Path = sub, Parent = parent, File = definition, FileInfo = info, V3 = definition?.Json, Baseline = Snapshot(folder),
-                Order = definition?.Json["order"]?.DeepClone(),
+                Path = sub, Parent = parent, File = definition, Stamp = stamp, ReadError = error, FileInfo = info, V3 = definition?.Json,
+                Baseline = Snapshot(folder), Order = definition?.Json["order"]?.DeepClone(),
             };
             hidden += LoadChildren(sub, folder, warnings, trees);
             children.Add((OrderValue(definition?.Json["order"]), name, folder));
@@ -268,12 +379,25 @@ internal sealed class V3CollectionStorage : ICollectionStorage
 
     // ----- saving ----------------------------------------------------------------------------------
 
-    public void Save(PostmanCollection collection)
+    public void Save(PostmanCollection collection, bool overwriteChanged)
     {
         var root = collection.Root;
         var parents = new Dictionary<JsonObject, JsonObject>(ReferenceEqualityComparer.Instance);
         var desired = new Dictionary<JsonObject, string>(ReferenceEqualityComparer.Instance) { [root] = Directory };
-        AssignPaths(root, Directory, desired, parents);
+
+        // Requests to move or rename whose file another program changed since it was read stay where they are, unwritten,
+        // unless overwriting is allowed: moved without being written, what they say would no longer match where they are
+        // (their examples path, say). Their names stay taken.
+        var pinned = overwriteChanged ? new HashSet<JsonObject>(ReferenceEqualityComparer.Instance) : ChangedRequestsToMove(root);
+        var managed = new HashSet<string>(_origins.Where(o => !pinned.Contains(o.Key)).Select(o => o.Value.Path), StringComparer.OrdinalIgnoreCase);
+        AssignPaths(root, Directory, desired, parents, managed);
+
+        // New orders depend on where items were loaded from: computed before the moves below update that.
+        var orders = new Dictionary<JsonObject, JsonNode>(ReferenceEqualityComparer.Instance);
+        foreach (var folder in PreOrder(root).Where(IsFolder))
+        {
+            AssignOrders(folder, orders);
+        }
 
         var current = new Dictionary<JsonObject, string>(ReferenceEqualityComparer.Instance);
         foreach (var (item, origin) in _origins)
@@ -281,126 +405,311 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             current[item] = origin.Path;
         }
 
-        var staging = Path.Combine(Directory, $".termrest-saving-{Guid.NewGuid():N}");
+        var inTree = new HashSet<JsonObject>(PreOrder(root), ReferenceEqualityComparer.Instance);
+        var removed = _origins.Keys.Where(i => !inTree.Contains(i)).ToList();
+        var staging = Path.Combine(Directory, $"{StagingPrefix}{Guid.NewGuid():N}");
         var staged = new Dictionary<JsonObject, string>(ReferenceEqualityComparer.Instance);
         var stagedResources = new Dictionary<JsonObject, string>(ReferenceEqualityComparer.Instance);
-        var oldStems = new Dictionary<JsonObject, string>(ReferenceEqualityComparer.Instance);
 
-        // 1. Take out everything that moves or is renamed (a moving folder takes its content along).
-        foreach (var item in PreOrder(root).Where(i => i != root && _origins.ContainsKey(i)))
+        // Folders whose folder disappeared and that are written anew (see WriteAnew), and the folders in them: created anew,
+        // as new ones are.
+        var writtenAnew = new HashSet<JsonObject>(ReferenceEqualityComparer.Instance);
+
+        bool Moved(JsonObject item) =>
+            _origins[item].Parent != parents.GetValueOrDefault(item) || Path.GetFileName(current[item]) != Path.GetFileName(desired[item]);
+
+        // Gone meanwhile (a git checkout, say): written anew where it belongs, with everything a folder held. Examples it had
+        // stay where they are.
+        void WriteAnew(JsonObject item)
         {
-            var origin = _origins[item];
-            var moved = origin.Parent != parents[item] || Path.GetFileName(current[item]) != Path.GetFileName(desired[item]);
-            if (!moved)
+            var inside = current[item] + Path.DirectorySeparatorChar;
+            foreach (var (gone, goneOrigin) in _origins)
+            {
+                if (current[gone] == current[item] || current[gone].StartsWith(inside, StringComparison.Ordinal))
+                {
+                    goneOrigin.File = null;
+                    goneOrigin.Stamp = null;
+                    goneOrigin.ReadError = null;
+                    goneOrigin.Stem = null;
+                    if (IsFolder(gone))
+                    {
+                        writtenAnew.Add(gone);
+                    }
+                }
+            }
+        }
+
+        // Whether this save writes the item or puts it in place: it is new, moved, reordered or edited. A folder without an order
+        // gets one whenever its siblings change: while it is gone (see below), that alone is no change (see step 4).
+        var changes = new Dictionary<JsonObject, bool>(ReferenceEqualityComparer.Instance);
+        bool Changes(JsonObject item)
+        {
+            if (!changes.TryGetValue(item, out var changed))
+            {
+                changed = !pinned.Contains(item)
+                          && (!_origins.TryGetValue(item, out var origin) || Moved(item) || !JsonNode.DeepEquals(Snapshot(item), origin.Baseline)
+                              || (orders.ContainsKey(item) && (!IsFolder(item) || OrderValue(origin.Order) is not null || System.IO.Directory.Exists(current[item]))));
+                changes[item] = changed;
+            }
+
+            return changed;
+        }
+
+        // A folder that disappeared where it is (the collection's own too) stays gone, unless something is written into it or
+        // it is written itself: then it is written anew, so that what is written there keeps the folder's definition (its
+        // auth, scripts …) and the folder on disk holds what TermRest shows. Moved ones are written anew in step 1.
+        foreach (var folder in PreOrder(root).Where(f => IsFolder(f) && _origins.ContainsKey(f)))
+        {
+            if (!writtenAnew.Contains(folder) && !Moved(folder) && !System.IO.Directory.Exists(current[folder]) && PreOrder(folder).Any(Changes))
+            {
+                WriteAnew(folder);
+            }
+        }
+
+        // Every move and created folder, so that a failure moves everything back (To is null for a created folder).
+        var journal = new List<(string From, string? To)>();
+        try
+        {
+            // 1. Take out everything that moves or is renamed (a moving folder takes its content along).
+            foreach (var item in PreOrder(root).Where(i => i != root && _origins.ContainsKey(i) && !pinned.Contains(i)))
+            {
+                if (!Moved(item))
+                {
+                    continue;
+                }
+
+                if (IsFolder(item) ? !System.IO.Directory.Exists(current[item]) : !File.Exists(current[item]))
+                {
+                    WriteAnew(item);
+                    continue;
+                }
+
+                CreateDirectory(staging, journal);
+                var target = Path.Combine(staging, staged.Count.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                if (IsFolder(item))
+                {
+                    Move(current[item], target, isDirectory: true, journal);
+                    Rebase(current, current[item], target);
+                }
+                else
+                {
+                    var resources = V3Names.ResourcesPath(current[item]);
+                    Move(current[item], target, isDirectory: false, journal);
+                    current[item] = target;
+                    if (System.IO.Directory.Exists(resources))
+                    {
+                        Move(resources, target + ".resources", isDirectory: true, journal);
+                        stagedResources[item] = target + ".resources";
+                    }
+                }
+
+                staged[item] = target;
+            }
+
+            // 2. Delete what was removed (moved-out content is already safe in staging). Folders are only removed once
+            //    empty: files TermRest does not show (GraphQL, gRPC … requests) are never deleted.
+            foreach (var item in removed.Where(i => !IsFolder(i)))
+            {
+                DeleteRequestFiles(current[item]);
+            }
+
+            foreach (var item in removed.Where(IsFolder).OrderByDescending(i => current[i].Length))
+            {
+                DeleteFolderIfEmpty(current[item]);
+            }
+
+            // 3. Put moved items in place, parents first. No item takes over the place of a deleted folder that is still there (it
+            //    holds files TermRest does not show, or a request held back from moving out) or of anything else TermRest does
+            //    not show: it gets a free name, and what belongs in it follows. New folders, and folders written anew, are checked
+            //    here too, once their parent is in place: such a deleted folder may only have arrived with it.
+            foreach (var item in PreOrder(root).Where(i => i != root && (staged.ContainsKey(i) || writtenAnew.Contains(i) || (IsFolder(i) && !_origins.ContainsKey(i)))))
+            {
+                var target = desired[item];
+                if (Path.Exists(target) || (stagedResources.ContainsKey(item) && Path.Exists(V3Names.ResourcesPath(target))))
+                {
+                    var free = FreePath(target, IsFolder(item), desired.Where(d => d.Key != item).Select(d => d.Value));
+                    Rebase(desired, target, free);
+                    target = free;
+                }
+
+                if (!staged.ContainsKey(item))
+                {
+                    continue; // created when its content is written
+                }
+
+                CreateDirectory(Path.GetDirectoryName(target)!, journal);
+                if (IsFolder(item))
+                {
+                    Move(current[item], target, isDirectory: true, journal);
+                    Rebase(current, current[item], target);
+                }
+                else
+                {
+                    Move(current[item], target, isDirectory: false, journal);
+                    current[item] = target;
+                    if (stagedResources.TryGetValue(item, out var resources))
+                    {
+                        var resourcesTarget = V3Names.ResourcesPath(target);
+                        CreateDirectory(Path.GetDirectoryName(resourcesTarget)!, journal);
+                        Move(resources, resourcesTarget, isDirectory: true, journal);
+                    }
+                }
+            }
+
+            if (System.IO.Directory.Exists(staging))
+            {
+                System.IO.Directory.Delete(staging, recursive: false);
+            }
+        }
+        catch
+        {
+            Undo(journal, current);
+            foreach (var (item, origin) in _origins)
+            {
+                origin.Path = current[item];
+            }
+
+            throw;
+        }
+
+        // Everything is in place: remembered now, so that the next save starts from there even if writing fails. A deleted
+        // folder that still holds a request held back from moving out stays known: a later save deletes it once that request
+        // has left (else it would come back as an empty folder).
+        var heldBack = pinned.Select(p => current[p]).ToList();
+        foreach (var item in removed)
+        {
+            if (IsFolder(item) && heldBack.Any(p => p.StartsWith(current[item] + Path.DirectorySeparatorChar, StringComparison.Ordinal)))
             {
                 continue;
             }
 
-            System.IO.Directory.CreateDirectory(staging);
-            var target = Path.Combine(staging, staged.Count.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            if (IsFolder(item))
-            {
-                System.IO.Directory.Move(current[item], target);
-                Rebase(current, current[item], target);
-            }
-            else
-            {
-                oldStems[item] = V3Names.RequestStem(current[item]);
-                var resources = V3Names.ResourcesPath(current[item]);
-                File.Move(current[item], target);
-                if (System.IO.Directory.Exists(resources))
-                {
-                    System.IO.Directory.Move(resources, target + ".resources");
-                    stagedResources[item] = target + ".resources";
-                }
-
-                current[item] = target;
-            }
-
-            staged[item] = target;
-        }
-
-        // 2. Delete what was removed (moved-out content is already safe in staging). Folders are only removed once
-        //    empty: files TermRest does not show (GraphQL, gRPC … requests) are never deleted.
-        var inTree = new HashSet<JsonObject>(PreOrder(root), ReferenceEqualityComparer.Instance);
-        var removed = _origins.Keys.Where(i => !inTree.Contains(i)).ToList();
-        foreach (var item in removed.Where(i => !IsFolder(i)))
-        {
-            DeleteRequestFiles(current[item]);
-        }
-
-        foreach (var item in removed.Where(IsFolder).OrderByDescending(i => current[i].Length))
-        {
-            DeleteFolderIfEmpty(current[item]);
-        }
-
-        foreach (var item in removed)
-        {
             _origins.Remove(item);
             _loadedChildren.Remove(item);
         }
 
-        // 3. Put moved items in place, parents first.
-        foreach (var item in PreOrder(root).Where(staged.ContainsKey))
+        foreach (var (item, origin) in _origins)
         {
-            var target = desired[item];
-            System.IO.Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            if (IsFolder(item))
+            origin.Path = current[item];
+            if (!pinned.Contains(item))
             {
-                System.IO.Directory.Move(current[item], target);
-                Rebase(current, current[item], target);
-            }
-            else
-            {
-                File.Move(current[item], target);
-                current[item] = target;
-                if (stagedResources.TryGetValue(item, out var resources))
-                {
-                    var resourcesTarget = V3Names.ResourcesPath(target);
-                    System.IO.Directory.CreateDirectory(Path.GetDirectoryName(resourcesTarget)!);
-                    System.IO.Directory.Move(resources, resourcesTarget);
-                }
+                origin.Parent = parents.GetValueOrDefault(item);
             }
         }
 
-        if (System.IO.Directory.Exists(staging))
+        // 4. Write content: new items, edited items, renamed items and reordered siblings. Files that could not be read when
+        //    loading, and ones another program changed since, are left alone and reported once everything else is written.
+        var leftAlone = new LeftAlone(overwriteChanged);
+        foreach (var item in pinned)
         {
-            System.IO.Directory.Delete(staging, recursive: false);
-        }
-
-        // 4. Write content: new items, edited items, renamed items and reordered siblings.
-        var orders = new Dictionary<JsonObject, JsonNode>(ReferenceEqualityComparer.Instance);
-        foreach (var folder in PreOrder(root).Where(IsFolder))
-        {
-            AssignOrders(folder, orders);
+            leftAlone.Changed.Add(current[item]);
+            leftAlone.Items.Add(item);
         }
 
         foreach (var item in PreOrder(root))
         {
-            if (IsFolder(item))
+            // Other folders are in place already, or stay gone (see above). One that stays gone does not keep the order it got as
+            // it had none (writing that would bring it back): left alone, it gets one again with each save, until it is back.
+            if (IsFolder(item) && (writtenAnew.Contains(item) || !_origins.ContainsKey(item)))
             {
-                System.IO.Directory.CreateDirectory(desired[item]);
+                CreateFolder(desired[item]);
+            }
+            else if (IsFolder(item) && orders.ContainsKey(item) && !System.IO.Directory.Exists(desired[item]))
+            {
+                orders.Remove(item);
+                leftAlone.Items.Add(item);
             }
 
-            WriteItem(item, item == root, desired[item], parents.GetValueOrDefault(item), orders, oldStems.GetValueOrDefault(item));
+            if (!pinned.Contains(item))
+            {
+                WriteItem(item, item == root, desired[item], parents.GetValueOrDefault(item), orders, leftAlone);
+            }
         }
 
         foreach (var folder in PreOrder(root).Where(IsFolder))
         {
-            _loadedChildren[folder] = Children(folder).ToList();
+            // Where a child was left alone, its new order is assigned again next time, also when the children are then as they
+            // were before: the new orders of the others are written.
+            var children = Children(folder).ToList();
+            if (children.Any(leftAlone.Items.Contains))
+            {
+                _loadedChildren.Remove(folder);
+            }
+            else
+            {
+                _loadedChildren[folder] = children;
+            }
+        }
+
+        leftAlone.ThrowIfAny();
+    }
+
+    /// <summary>Requests whose parent or name changed while another program changed their file since it was read.</summary>
+    private HashSet<JsonObject> ChangedRequestsToMove(JsonObject root)
+    {
+        var changed = new HashSet<JsonObject>(ReferenceEqualityComparer.Instance);
+        foreach (var folder in PreOrder(root).Where(IsFolder))
+        {
+            foreach (var request in Children(folder).Where(c => !IsFolder(c)))
+            {
+                if (_origins.TryGetValue(request, out var origin) && origin.Stamp is { } stamp
+                    && (origin.Parent != folder || origin.Baseline["name"].GetString() != request["name"].GetString())
+                    && File.Exists(origin.Path) && stamp.HasChanged(origin.Path))
+                {
+                    changed.Add(request);
+                }
+            }
+        }
+
+        return changed;
+    }
+
+    /// <summary>What a save did not write: files that could not be read when loading, and ones another program changed since.</summary>
+    private sealed class LeftAlone(bool overwriteChanged)
+    {
+        /// <summary>Write files another program changed since they were read anyway.</summary>
+        public bool OverwriteChanged { get; } = overwriteChanged;
+
+        /// <summary>The items not written (also folders that stay gone with a new order): their siblings' orders are assigned again next time.</summary>
+        public HashSet<JsonObject> Items { get; } = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>Files that could not be read, with the reason.</summary>
+        public List<string> Unreadable { get; } = [];
+
+        public List<string> Changed { get; } = [];
+
+        /// <summary>
+        /// Reports what was left alone: an <see cref="IOException"/> when files could not be read (overwriting cannot help
+        /// there; changed files are named too), else a <see cref="FileChangedException"/>.
+        /// </summary>
+        public void ThrowIfAny()
+        {
+            if (Unreadable.Count > 0)
+            {
+                var (files, it, holds) = Unreadable.Count == 1 ? ("this file", "it", "it holds") : ("these files", "them", "they hold");
+                var message = $"{string.Join("\n", Unreadable)}\nTermRest could not read {files} when it loaded the collection, so it did not save over {it} " +
+                              $"(that would lose what {holds}), and the changes that belong in {it} are not saved. Fix {it} and reload the collection, " +
+                              $"or delete {it} and save again.";
+                if (Changed.Count > 0)
+                {
+                    var (they, them) = Changed.Count == 1 ? ("it", "it") : ("they", "them");
+                    message += $"\nNot saved either, as {they} changed on disk since TermRest read {them}: {string.Join(", ", Changed)}.";
+                }
+
+                throw new IOException(message);
+            }
+
+            if (Changed.Count > 0)
+            {
+                throw new FileChangedException(Changed);
+            }
         }
     }
 
-    private void WriteItem(JsonObject item, bool isRoot, string path, JsonObject? parent, Dictionary<JsonObject, JsonNode> orders, string? oldStem)
+    private void WriteItem(JsonObject item, bool isRoot, string path, JsonObject? parent, Dictionary<JsonObject, JsonNode> orders, LeftAlone leftAlone)
     {
         _origins.TryGetValue(item, out var origin);
         var isFolder = IsFolder(item);
         var file = isFolder ? V3Names.DefinitionPath(path) : path;
-        if (_unreadable.Contains(file))
-        {
-            return; // never overwrite a file that could not be read
-        }
-
         var snapshot = Snapshot(item);
         JsonObject v3;
         if (origin is not null && JsonNode.DeepEquals(snapshot, origin.Baseline))
@@ -429,65 +738,107 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             v3.SetOrdered("order", newOrder.DeepClone(), order);
         }
 
-        if (oldStem is not null && v3["examples"].GetString() is { } examples)
+        if (origin?.Stem is { } oldStem && oldStem != fileName && v3["examples"].GetString() is { } examples)
         {
-            // Examples moved with the request's resources folder.
-            var oldPrefix = $"./{V3Names.ResourcesDirectory}/{oldStem}.resources";
-            if (examples.StartsWith(oldPrefix, StringComparison.Ordinal))
+            // Examples moved with the request's resources folder: the path follows it, written as the file writes it (Postman
+            // writes both "./.resources/…" and ".resources/…").
+            var dot = examples.StartsWith("./", StringComparison.Ordinal) ? "./" : "";
+            var oldFolder = $"{dot}{V3Names.ResourcesDirectory}/{oldStem}.resources";
+            if (examples.StartsWith(oldFolder, StringComparison.Ordinal) && (examples.Length == oldFolder.Length || examples[oldFolder.Length] == '/'))
             {
-                v3["examples"] = $"./{V3Names.ResourcesDirectory}/{fileName}.resources{examples[oldPrefix.Length..]}";
+                v3["examples"] = $"{dot}{V3Names.ResourcesDirectory}/{fileName}.resources{examples[oldFolder.Length..]}";
             }
         }
 
-        var existing = origin?.File is not null && File.Exists(file);
-
-        // Folders get a definition file when they are new or have something to store; requests always have a file.
-        var needsFile = !isFolder || existing || origin is null || v3.Count > 1;
-        if (needsFile && !(existing && JsonNode.DeepEquals(v3, origin!.V3)))
+        if (!isFolder && origin is null && WriteExamples(item, path) is { } examplesFolder)
         {
-            var text = existing ? origin!.File!.Render(v3, Style) : YamlFile.Write(v3, Style);
-            var info = origin?.FileInfo ?? NewFile;
-            TextFile.WriteAtomic(file, text.EndsWith('\n') && info.HasTrailingNewline ? text[..^1] : text, info);
-            origin = Remember(item, origin, path, parent, YamlFile.Parse(text), info, v3, snapshot);
+            v3.SetOrdered("examples", examplesFolder, order);
+        }
+
+        // Folders get a definition file when they are new, have something to store or had one (also when it is gone: see
+        // WriteAnew); requests always have a file.
+        var hadFile = origin?.File is not null;
+        var needsFile = !isFolder || origin is null || origin.V3 is not null || v3.Count > 1;
+        if (needsFile && !(hadFile && JsonNode.DeepEquals(v3, origin!.V3)))
+        {
+            var existing = File.Exists(file);
+            if (existing && origin?.ReadError is { } error)
+            {
+                // Never overwritten, as it could not be read: it moves along with its folder unchanged. What it would have to
+                // hold besides its position is not saved, and is reported.
+                if (v3.Any(p => p.Key is not ("$kind" or "order")))
+                {
+                    leftAlone.Unreadable.Add($"{file}: {error}");
+                    leftAlone.Items.Add(item);
+                    return;
+                }
+
+                Remember(item, origin, path, parent, null, null, origin.FileInfo, null, snapshot);
+                return;
+            }
+
+            // Changed by another program since it was read, or created where there was none: not saved over unless allowed.
+            if (existing && (!hadFile || origin!.Stamp?.HasChanged(file) == true))
+            {
+                if (origin is null)
+                {
+                    throw new IOException($"'{file}' already exists.");
+                }
+
+                if (!leftAlone.OverwriteChanged)
+                {
+                    leftAlone.Changed.Add(file);
+                    leftAlone.Items.Add(item);
+                    return;
+                }
+            }
+
+            var (text, info) = YamlFile.WriteChecked(existing && hadFile ? origin!.File : null, v3, Style, file, origin?.FileInfo ?? NewFile, out var written);
+            CreateFolder(Path.GetDirectoryName(file)!); // a folder's .resources
+            TextFile.WriteAtomic(file, text, info, out var stamp, _newFileMode);
+            Remember(item, origin, path, parent, written, stamp, info, v3, snapshot);
             return;
         }
 
-        Remember(item, origin, path, parent, origin?.File, origin?.FileInfo ?? NewFile, origin?.V3 ?? (needsFile ? v3 : null), snapshot);
+        Remember(item, origin, path, parent, origin?.File, origin?.Stamp, origin?.FileInfo ?? NewFile, origin?.V3 ?? (needsFile ? v3 : null), snapshot);
     }
 
-    private Origin Remember(JsonObject item, Origin? origin, string path, JsonObject? parent, YamlFile? file, TextFileInfo info, JsonObject? v3, JsonObject snapshot)
+    private void Remember(JsonObject item, Origin? origin, string path, JsonObject? parent, YamlFile? file, FileStamp? stamp, TextFileInfo info, JsonObject? v3, JsonObject snapshot)
     {
         origin ??= new Origin { Path = path, Baseline = snapshot };
         origin.Path = path;
         origin.Parent = parent;
         origin.File = file;
+        origin.Stamp = stamp;
+        origin.ReadError = file is null ? origin.ReadError : null;
         origin.FileInfo = info;
         origin.V3 = v3;
         origin.Baseline = snapshot;
         origin.Order = v3?["order"]?.DeepClone();
+        origin.Stem = IsFolder(item) ? null : V3Names.RequestStem(path);
         _origins[item] = origin;
-        return origin;
     }
 
     /// <summary>Desired paths for the current tree. Items keep their current file name while their name is unchanged.</summary>
-    private void AssignPaths(JsonObject folder, string directory, Dictionary<JsonObject, string> desired, Dictionary<JsonObject, JsonObject> parents)
+    private void AssignPaths(JsonObject folder, string directory, Dictionary<JsonObject, string> desired, Dictionary<JsonObject, JsonObject> parents, HashSet<string> managed)
     {
         var children = Children(folder).ToList();
         var takenFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var takenFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        // Files and folders on disk that TermRest does not manage keep their names.
-        var managed = new HashSet<string>(_origins.Values.Select(o => o.Path), StringComparer.OrdinalIgnoreCase);
-        if (System.IO.Directory.Exists(directory))
+        // Files and folders on disk that TermRest does not manage keep their names. They are where the folder is now (they
+        // move along with it), or for a new folder where it will be.
+        var location = _origins.TryGetValue(folder, out var self) ? self.Path : directory;
+        if (System.IO.Directory.Exists(location))
         {
-            foreach (var file in System.IO.Directory.EnumerateFiles(directory).Where(V3Names.IsRequestFile).Where(f => !managed.Contains(f)))
+            foreach (var entry in System.IO.Directory.EnumerateFileSystemEntries(location).Where(e => !managed.Contains(e)))
             {
-                takenFiles.Add(V3Names.RequestStem(file));
-            }
-
-            foreach (var sub in System.IO.Directory.EnumerateDirectories(directory).Where(d => !managed.Contains(d)))
-            {
-                takenFolders.Add(Path.GetFileName(sub));
+                var entryName = Path.GetFileName(entry);
+                takenFolders.Add(entryName);
+                if (V3Names.IsRequestFile(entryName))
+                {
+                    takenFiles.Add(V3Names.RequestStem(entryName));
+                }
             }
         }
 
@@ -519,7 +870,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
 
         foreach (var child in children.Where(IsFolder))
         {
-            AssignPaths(child, desired[child], desired, parents);
+            AssignPaths(child, desired[child], desired, parents, managed);
         }
     }
 
@@ -567,6 +918,11 @@ internal sealed class V3CollectionStorage : ICollectionStorage
                 else
                 {
                     var step = (high.Value - low) / (count + 1);
+                    if (double.IsInfinity(step))
+                    {
+                        step = (high.Value / (count + 1)) - (low / (count + 1)); // orders near the limits of a double
+                    }
+
                     value = low + (step * k);
                     if (step >= 1)
                     {
@@ -650,6 +1006,119 @@ internal sealed class V3CollectionStorage : ICollectionStorage
         }
     }
 
+    /// <summary>Creates a folder and its missing parents, noting each in <paramref name="journal"/> so a failed save removes them.</summary>
+    private static void CreateDirectory(string directory, List<(string From, string? To)> journal)
+    {
+        var missing = new Stack<string>();
+        for (var d = directory; d is not null && !System.IO.Directory.Exists(d); d = Path.GetDirectoryName(d))
+        {
+            missing.Push(d);
+        }
+
+        System.IO.Directory.CreateDirectory(directory);
+        while (missing.TryPop(out var created))
+        {
+            journal.Add((created, null));
+        }
+    }
+
+    /// <summary>Creates a folder and its missing parents; in a conversion as private as the converted folder (see <see cref="ConvertFrom"/>).</summary>
+    private void CreateFolder(string directory)
+    {
+        if (_newFileMode is not { } mode || OperatingSystem.IsWindows())
+        {
+            System.IO.Directory.CreateDirectory(directory);
+            return;
+        }
+
+        // One by one: Directory.CreateDirectory gives the missing parents the default permissions.
+        var missing = new Stack<string>();
+        for (var d = directory; d is not null && !System.IO.Directory.Exists(d); d = Path.GetDirectoryName(d))
+        {
+            missing.Push(d);
+        }
+
+        var folderMode = TextFile.FolderMode(mode);
+        while (missing.TryPop(out var created))
+        {
+            System.IO.Directory.CreateDirectory(created, folderMode);
+            File.SetUnixFileMode(created, folderMode); // the create mode is subject to the umask
+        }
+    }
+
+    /// <summary>Moves a file or folder, noting it in <paramref name="journal"/> so a failed save moves it back.</summary>
+    private static void Move(string from, string to, bool isDirectory, List<(string From, string? To)> journal)
+    {
+        if (isDirectory)
+        {
+            System.IO.Directory.Move(from, to);
+        }
+        else
+        {
+            File.Move(from, to);
+        }
+
+        journal.Add((from, to));
+    }
+
+    /// <summary>
+    /// Undoes the moves and created folders of a failed save, last first. What cannot be moved back stays where it is
+    /// (<paramref name="current"/> says where): the next save moves it from there, and loading reports a staging folder
+    /// that is left with files.
+    /// </summary>
+    private static void Undo(List<(string From, string? To)> journal, Dictionary<JsonObject, string> current)
+    {
+        for (var i = journal.Count - 1; i >= 0; i--)
+        {
+            var (from, to) = journal[i];
+            try
+            {
+                if (to is null)
+                {
+                    if (System.IO.Directory.Exists(from) && !System.IO.Directory.EnumerateFileSystemEntries(from).Any())
+                    {
+                        System.IO.Directory.Delete(from);
+                    }
+
+                    continue;
+                }
+
+                System.IO.Directory.CreateDirectory(Path.GetDirectoryName(from)!);
+                if (System.IO.Directory.Exists(to))
+                {
+                    System.IO.Directory.Move(to, from);
+                }
+                else
+                {
+                    File.Move(to, from);
+                }
+
+                Rebase(current, to, from);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Left where it is; see above.
+            }
+        }
+    }
+
+    /// <summary>The first "name-1", "name-2" … next to <paramref name="taken"/> that is free on disk and not <paramref name="claimed"/> by another item.</summary>
+    private static string FreePath(string taken, bool isFolder, IEnumerable<string> claimed)
+    {
+        var others = new HashSet<string>(claimed, StringComparer.OrdinalIgnoreCase);
+        var directory = Path.GetDirectoryName(taken)!;
+        var fileName = Path.GetFileName(taken);
+        var name = isFolder ? fileName : V3Names.RequestStem(taken);
+        for (var i = 1; ; i++)
+        {
+            var candidate = Path.Combine(directory, $"{name}-{i}{fileName[name.Length..]}");
+            if (!Path.Exists(candidate) && !others.Contains(candidate) && (isFolder || !Path.Exists(V3Names.ResourcesPath(candidate))))
+            {
+                return candidate;
+            }
+        }
+    }
+
     private static void Rebase(Dictionary<JsonObject, string> current, string from, string to)
     {
         var prefix = from + Path.DirectorySeparatorChar;
@@ -707,6 +1176,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
 
     private static double? OrderValue(JsonNode? node) =>
         node is JsonValue value && double.TryParse(value.GetString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var number)
+        && double.IsFinite(number)
             ? number
             : null;
 
