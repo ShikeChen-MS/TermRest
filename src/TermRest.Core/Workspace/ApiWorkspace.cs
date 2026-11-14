@@ -205,7 +205,7 @@ public sealed class ApiWorkspace
         {
             CollectionLoading.None => [],
             CollectionLoading.Requested when opened is not null => [opened],
-            _ => EnumerateCollections(root, opened),
+            _ => EnumerateCollections(root, opened, workspace.LoadErrors),
         };
 
         foreach (var source in collectionSources.OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
@@ -224,8 +224,8 @@ public sealed class ApiWorkspace
 
         var environmentsFolder = Path.Combine(root, PostmanFolder, "environments");
         var environmentFiles = Directory.EnumerateFiles(root, "*" + PostmanEnvironment.EnvironmentSuffix)
-            .Concat(EnumerateFiles(environmentsFolder, "*" + PostmanEnvironment.EnvironmentSuffix))
-            .Concat(EnumerateFiles(environmentsFolder, "*.y*ml").Where(PostmanEnvironment.IsYamlPath));
+            .Concat(Listing(root, environmentsFolder, workspace.LoadErrors, () => EnumerateFiles(environmentsFolder, "*" + PostmanEnvironment.EnvironmentSuffix)
+                .Concat(EnumerateFiles(environmentsFolder, "*.y*ml").Where(PostmanEnvironment.IsYamlPath))));
         foreach (var file in environmentFiles.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
         {
             try
@@ -238,7 +238,17 @@ public sealed class ApiWorkspace
             }
         }
 
-        var globalsFile = FindGlobalsFile(root);
+        string? globalsFile = null;
+        try
+        {
+            LinksToNothing(root, Path.Combine(root, PostmanFolder, "globals"), workspace.LoadErrors);
+            globalsFile = FindGlobalsFile(root);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            workspace.LoadErrors.Add($"{Path.Combine(PostmanFolder, "globals")}: {ex.Message}");
+        }
+
         if (globalsFile is not null)
         {
             try
@@ -340,18 +350,105 @@ public sealed class ApiWorkspace
     private static IEnumerable<string> EnumerateDirectories(string directory) =>
         Directory.Exists(directory) ? Directory.EnumerateDirectories(directory).Where(d => !Path.GetFileName(d).StartsWith('.')) : [];
 
-    /// <summary>The collection files and v3 collection folders of the workspace in <paramref name="root"/>, and the one that was opened.</summary>
-    private static IEnumerable<string> EnumerateCollections(string root, string? opened)
+    /// <summary>
+    /// The collection files and v3 collection folders of the workspace in <paramref name="root"/>, and the one that was opened.
+    /// A folder of <c>postman/collections</c> that cannot be listed (a link to a folder that is gone, another user's folder) is
+    /// kept: loading it fails and says why, as for a file that cannot be read. When <c>postman/collections</c> itself cannot be
+    /// listed, that is a load error in <paramref name="errors"/>; neither ends the whole workspace.
+    /// </summary>
+    private static IEnumerable<string> EnumerateCollections(string root, string? opened, List<string> errors)
     {
         var collectionsFolder = Path.Combine(root, PostmanFolder, "collections");
-        var collectionFiles = Directory.EnumerateFiles(root, "*" + PostmanCollection.FileSuffix)
-            .Concat(EnumerateFiles(collectionsFolder, "*" + PostmanCollection.FileSuffix));
+        var collectionFiles = Directory.EnumerateFiles(root, "*" + PostmanCollection.FileSuffix);
 
         // v3 collection folders: postman/collections/*, plus collection folders kept directly in the workspace.
-        var collectionFolders = EnumerateDirectories(collectionsFolder).Where(V3Names.IsCollectionDirectory)
-            .Concat(EnumerateDirectories(root).Where(d => !Path.GetFileName(d).Equals(PostmanFolder, StringComparison.OrdinalIgnoreCase)
-                                                         && File.Exists(V3Names.DefinitionPath(d))));
-        return collectionFiles.Concat(collectionFolders).Concat(opened is null ? [] : [opened]).Distinct(StringComparer.OrdinalIgnoreCase);
+        var inCollectionsFolder = Listing(root, collectionsFolder, errors, () =>
+        {
+            var gone = ReportLinksToNothing(collectionsFolder, errors);
+            return EnumerateFiles(collectionsFolder, "*" + PostmanCollection.FileSuffix)
+                .Concat(EnumerateDirectories(collectionsFolder).Where(d => !gone.Contains(d)).Where(MayBeCollection));
+        });
+        var collectionFolders = EnumerateDirectories(root).Where(d => !Path.GetFileName(d).Equals(PostmanFolder, StringComparison.OrdinalIgnoreCase)
+                                                                      && File.Exists(V3Names.DefinitionPath(d)));
+        return collectionFiles.Concat(inCollectionsFolder).Concat(collectionFolders).Concat(opened is null ? [] : [opened]).Distinct(StringComparer.OrdinalIgnoreCase);
+
+        static bool MayBeCollection(string directory)
+        {
+            try
+            {
+                return V3Names.IsCollectionDirectory(directory);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// What <paramref name="list"/> finds in <paramref name="folder"/>, a folder of the workspace; when the folder cannot be
+    /// listed, or is a link to a folder that is not there, nothing, and a load error in <paramref name="errors"/>.
+    /// </summary>
+    private static List<string> Listing(string root, string folder, List<string> errors, Func<IEnumerable<string>> list)
+    {
+        try
+        {
+            return LinksToNothing(root, folder, errors) ? [] : [.. list()];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            errors.Add($"{Path.GetRelativePath(root, folder)}: {ex.Message}");
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> is a link to something that is not there, which a load error in
+    /// <paramref name="errors"/> then names (on Linux and macOS such a link is not listed as a folder: it would be left out
+    /// without a word).
+    /// </summary>
+    private static bool LinksToNothing(string root, string path, List<string> errors)
+    {
+        try
+        {
+            // Where it finally leads: on Linux and macOS, File.Exists and Path.Exists are true for the link itself.
+            var link = new FileInfo(path);
+            if (link.LinkTarget is { } target && link.ResolveLinkTarget(returnFinalTarget: true) is { Exists: false })
+            {
+                errors.Add($"{Path.GetRelativePath(root, path)}: it links to {target}, which is not there.");
+                return true;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // listing it says what is wrong
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Load errors for the links of <paramref name="folder"/> (<c>postman/collections</c>) to collection folders that are not
+    /// there, a repository that was moved, say; returns them. Links to collection files are files, which fail to load.
+    /// </summary>
+    private static HashSet<string> ReportLinksToNothing(string folder, List<string> errors)
+    {
+        var gone = new HashSet<string>(StringComparer.Ordinal);
+        if (!Directory.Exists(folder))
+        {
+            return gone;
+        }
+
+        foreach (var entry in Directory.EnumerateFileSystemEntries(folder))
+        {
+            var name = Path.GetFileName(entry);
+            if (!name.StartsWith('.') && !name.EndsWith(PostmanCollection.FileSuffix, StringComparison.OrdinalIgnoreCase) && LinksToNothing(folder, entry, errors))
+            {
+                gone.Add(entry);
+            }
+        }
+
+        return gone;
     }
 
     /// <summary>Creates a collection: a v2.1 JSON file, or a v3 folder under <c>postman/collections</c> (see <see cref="UsesV3Layout"/>).</summary>

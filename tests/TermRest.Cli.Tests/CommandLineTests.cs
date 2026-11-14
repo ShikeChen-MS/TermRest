@@ -668,6 +668,33 @@ public sealed class CommandLineTests
     }
 
     [Fact]
+    public async Task History_shows_a_response_without_a_body_as_such_and_a_body_whose_copy_is_gone_as_not_kept()
+    {
+        await using var server = await TestServer.StartAsync();
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Probe", "HEAD", server.BaseUrl + "/echo/probe"), ("Ping", "GET", server.BaseUrl + "/echo/ping")]);
+        var workspace = Path.GetDirectoryName(collection)!;
+        var stateDirectory = TestFiles.NewTempDirectory();
+        var state = new Dictionary<string, string> { ["TERMREST_STATE_DIR"] = stateDirectory };
+        foreach (var name in (string[])["Probe", "Ping"])
+        {
+            var sent = await Termrest.RunAsync(["send", collection, name], state);
+            Assert.True(sent.ExitCode == 0, sent.ToString());
+        }
+
+        var entries = JsonNode.Parse((await Termrest.RunAsync(["history", workspace, "--json"], state)).Text)!.AsArray();
+        string Id(string method) => entries.Single(e => e!["method"]!.GetValue<string>() == method)!["id"]!.GetValue<string>();
+        File.Delete(Assert.Single(Directory.GetFiles(stateDirectory, "*.bin", SearchOption.AllDirectories))); // the GET's, as by hand
+
+        var probe = await Termrest.RunAsync(["history", workspace, "--show", Id("HEAD")], state);
+        var ping = await Termrest.RunAsync(["history", workspace, "--show", Id("GET")], state);
+
+        Assert.True(probe.ExitCode == 0, probe.ToString());
+        Assert.DoesNotContain("not kept", probe.Text, StringComparison.Ordinal); // there was none to keep
+        Assert.True(ping.ExitCode == 0, ping.ToString());
+        Assert.EndsWith("(response body not kept)", ping.Text.TrimEnd(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task History_reports_files_another_program_has_open()
     {
         if (!OperatingSystem.IsWindows())
@@ -1007,5 +1034,29 @@ public sealed class CommandLineTests
         Assert.True(allowed.ExitCode == 1, allowed.ToString()); // the proxy refused the connection
         Assert.DoesNotContain("is not used", allowed.Error, StringComparison.Ordinal);
         Assert.Equal(2, server.Requests);
+    }
+
+    [Fact]
+    public async Task Files_from_outside_the_workspace_are_sent_only_with_allow_outside_files()
+    {
+        // A collection someone else wrote, whose body is a file of the user's.
+        await using var server = await TestServer.StartAsync();
+        var directory = TestFiles.NewTempDirectory();
+        var secret = Path.Combine(TestFiles.NewTempDirectory(), "credentials");
+        File.WriteAllText(secret, "s3cret");
+        var collection = Path.Combine(directory, "Api.postman_collection.json");
+        File.WriteAllText(collection, $$"""
+            { "info": { "name": "Api", "schema": "{{Schema}}" }, "item": [
+              { "name": "Upload", "request": { "method": "PUT", "url": "{{server.BaseUrl}}/upload", "body": { "mode": "file",
+                "file": { "src": {{JsonValue.Create(secret).ToJsonString()}} } } } } ] }
+            """);
+
+        var refused = await Termrest.RunAsync(["send", collection, "Upload"]);
+        var allowed = await Termrest.RunAsync(["send", collection, "Upload", "--allow-outside-files"]);
+
+        Assert.True(refused.ExitCode == 1, refused.ToString());
+        Assert.Contains($"Body file '{secret}' is outside the workspace folder, so it is not sent", refused.Error, StringComparison.Ordinal);
+        Assert.True(allowed.ExitCode == 0, allowed.ToString());
+        Assert.Equal(1, server.Requests);
     }
 }

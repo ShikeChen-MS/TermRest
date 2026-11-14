@@ -15,7 +15,8 @@ internal static class SettingsDialog
     /// Edits the settings; true when they changed, which applies them for this session. <paramref name="saved"/> says
     /// whether they were saved to the file too (when not, an error said why). A proxy URL saved here is the user's own
     /// choice: it is allowed for this workspace folder (see <see cref="RequestRunner.AllowedProxy"/>), in the user's
-    /// settings in <paramref name="userDirectory"/> (default: <see cref="UserSettings.DefaultDirectory"/>).
+    /// settings in <paramref name="userDirectory"/> (default: <see cref="UserSettings.DefaultDirectory"/>), as is whether
+    /// requests may send files from outside the folder (<see cref="RequestRunner.OutsideFilesAllowed"/>).
     /// </summary>
     public static bool Show(IApplication app, ApiWorkspace workspace, RequestRunner runner, out bool saved, string? userDirectory = null)
     {
@@ -103,6 +104,15 @@ internal static class SettingsDialog
         var redact = Ui.AddRow(dialog, "Recordings redact", new TextField { Text = string.Join(", ", settings.RecordingRedact ?? []) }, y, 22);
         y += 1;
         dialog.Add(Ui.Hint("Extra header, parameter and field names, comma-separated (credentials, cookies and tokens always are).", 24, y));
+        y += 2;
+        var outsideFiles = Ui.AddRow(dialog, "Outside files", new CheckBox
+        {
+            Text = "Allow files from outside this folder",
+            Value = runner.OutsideFilesAllowed ? CheckState.Checked : CheckState.UnChecked,
+            Width = 40,
+        }, y, 22);
+        y += 1;
+        dialog.Add(Ui.Hint("Body files, and certificates on network shares.", 24, y));
 
         dialog.AddButton(new Button { Text = "Cancel" });
         dialog.AddButton(new Button { Text = "Save" });
@@ -161,7 +171,7 @@ internal static class SettingsDialog
             var names = redact.Text.Split([',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             settings.RecordingRedact = names.Count == 0 ? null : names;
             saved = Ui.TrySave(app, workspace.SaveSettings); // applied for this session either way
-            saved &= AllowProxy(app, workspace, runner, userDirectory);
+            saved &= SaveApprovals(app, workspace, runner, outsideFiles.Value == CheckState.Checked, userDirectory);
             return true;
         }
     }
@@ -185,14 +195,17 @@ internal static class SettingsDialog
     }
 
     /// <summary>
-    /// Allows the proxy URL the settings now name, if any, for this workspace folder, in place of the one allowed before:
-    /// for this session, and in the user's settings. False when those could not be saved (an error said why).
+    /// Allows the proxy URL the settings now name, if any, for this workspace folder, in place of the one allowed before,
+    /// and files from outside the folder or not: for this session, and in the user's settings. False when those could not
+    /// be saved (an error said why).
     /// </summary>
-    private static bool AllowProxy(IApplication app, ApiWorkspace workspace, RequestRunner runner, string? userDirectory)
+    private static bool SaveApprovals(IApplication app, ApiWorkspace workspace, RequestRunner runner, bool outsideFiles, string? userDirectory)
     {
         var proxy = workspace.Settings.Proxy;
         runner.AllowedProxy = WorkspaceSettings.IsProxyUrl(proxy) ? proxy : null;
+        runner.OutsideFilesAllowed = outsideFiles;
         var user = UserSettings.Load(userDirectory);
-        return !user.AllowProxy(workspace.RootPath, runner.AllowedProxy) || Ui.TrySave(app, () => user.Save(userDirectory));
+        var changed = user.AllowProxy(workspace.RootPath, runner.AllowedProxy) | user.AllowOutsideFiles(workspace.RootPath, outsideFiles);
+        return !changed || Ui.TrySave(app, () => user.Save(userDirectory));
     }
 }

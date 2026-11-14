@@ -155,7 +155,12 @@ internal static class CertsCommand
 
         var list = new Command("list", "List the workspace certificate registry and test that each certificate loads.");
         var workspaceArg = new Argument<string?>("workspace") { Description = "Workspace folder (default: current directory)", Arity = ArgumentArity.ZeroOrOne };
+        var allowOutsideFiles = new Option<bool>("--allow-outside-files")
+        {
+            Description = "Also open certificate files on network shares outside the workspace folder (default: only where allowed for the workspace in the full-screen UI, Tools › Settings…)",
+        };
         list.Arguments.Add(workspaceArg);
+        list.Options.Add(allowOutsideFiles);
         list.SetAction(parseResult =>
         {
             if (OpenWorkspace(parseResult.GetValue(workspaceArg)) is not { } workspace)
@@ -176,6 +181,8 @@ internal static class CertsCommand
 
             using var provider = new ClientCertificateProvider(workspace.Certificates);
             using var runner = new RequestRunner(workspace);
+            runner.ConfigureFiles();
+            runner.OutsideFilesAllowed |= parseResult.GetValue(allowOutsideFiles);
             var resolver = runner.CreateResolver(null);
             var failures = 0;
             foreach (var entry in workspace.Certificates.Entries)
@@ -186,7 +193,8 @@ internal static class CertsCommand
                 try
                 {
                     var loaded = provider.Load(entry, workspace.RootPath, value =>
-                        value is not null && value.StartsWith("env:", StringComparison.OrdinalIgnoreCase) ? Environment.GetEnvironmentVariable(value[4..]) : resolver.Resolve(value));
+                        value is not null && value.StartsWith("env:", StringComparison.OrdinalIgnoreCase) ? Environment.GetEnvironmentVariable(value[4..]) : resolver.Resolve(value),
+                        runner.FilesFolder);
                     var s = loaded.Summary;
                     Output.Status($"  ✓ {s.Subject} · issuer {s.IssuerCommonName} · expires {s.NotAfter:yyyy-MM-dd}{(s.IsExpired ? " (EXPIRED)" : "")} · key {(s.HasPrivateKey ? "ok" : "MISSING")}", !s.IsExpired && s.HasPrivateKey);
                 }

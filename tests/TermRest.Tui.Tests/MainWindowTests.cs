@@ -1094,6 +1094,32 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
+    public void Files_from_outside_the_workspace_are_sent_once_allowed_in_the_settings()
+    {
+        var userDirectory = TestFiles.NewTempDirectory();
+        using var ui = new Harness(_directory, runner => runner.ConfigureFiles(userDirectory));
+        var only = ui.Runner.CreateDefaults().FilesFolder;
+        var saved = false;
+
+        var screens = Drive(ui, () =>
+            {
+                SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out saved, userDirectory);
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () =>
+            {
+                ui.Click("Allow files from outside this folder");
+                ui.Click("► Save ◄");
+            }));
+
+        Assert.Single(screens);
+        Assert.Equal(ui.Workspace.RootPath, only);
+        Assert.True(saved);
+        Assert.Null(ui.Runner.CreateDefaults().FilesFolder);
+        Assert.True(UserSettings.Load(userDirectory).AreOutsideFilesAllowed(ui.Workspace.RootPath));
+    }
+
+    [Fact]
     public void Settings_written_by_hand_as_requests_read_them_can_be_saved()
     {
         // No redirects followed (0) and a proxy keyword in another case: valid settings that the dialog must not refuse.
@@ -3365,6 +3391,50 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
+    public async Task A_curl_command_pasted_into_a_request_from_history_on_its_way_leaves_that_request_to_arrive_on_its_own()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        var state = Path.Combine(_directory, ".state");
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo";
+            runner.ConfigureHistory(state);
+        });
+        var collection = Assert.Single(ui.Workspace.Collections);
+        var request = collection.FindRequest("Basics/GET with query")!;
+        await ui.Runner.SendAsync(collection, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+        ui.Runner.LocalVariables["baseUrl"] = server.BaseUrl + "/hold"; // sent again, it waits
+        var sending = true;
+        string arrived = "", pane = "";
+
+        var screens = Drive(ui, () =>
+            {
+                ui.App.InjectKey(Key.F9);
+                ui.Click("/echo/get");
+                ui.App.InjectKey(Key.F5);
+            },
+            ("Sending GET", () =>
+            {
+                ui.Click("{{baseUrl}}/get?foo=bar&source=termrest");
+                ui.App.RaisePasteEvent($"curl '{server.BaseUrl}/echo/pasted'");
+                sending = ui.Window.IsSending; // F5 would cancel that request, not send this one
+                pane = ui.Window.ResponsePane.StatusText;
+                server.Release();
+            }),
+            ("History (2)", () =>
+            {
+                arrived = ui.Window.StatusMessage;
+                ui.App.RequestStop();
+            }),
+            ("Unsaved request", () => ui.Click("Discard")));
+
+        Assert.Equal(3, screens.Count);
+        Assert.False(sending);
+        Assert.StartsWith("No response yet", pane, StringComparison.Ordinal); // not "Sending…" for a request it no longer shows
+        Assert.StartsWith("Earlier request: GET 127.0.0.1 → 200", arrived, StringComparison.Ordinal); // not under the pasted one
+    }
+
+    [Fact]
     public void A_collection_that_no_longer_loads_is_not_reloaded_and_the_editor_goes_on_editing_its_request()
     {
         var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
@@ -4262,6 +4332,29 @@ public sealed class MainWindowTests : IDisposable
         Assert.Equal($"Looking for {path}…", typing);
         Assert.Equal("order.json · 11 B · sent as it is", found);
         Assert.Equal($"✗ {path}x does not exist.", missing);
+    }
+
+    [Fact]
+    public void A_body_file_outside_the_workspace_is_not_looked_at_until_files_from_outside_are_allowed()
+    {
+        // As Send has it: on Windows, looking at \\server\share\x signs in to that server with the user's credentials.
+        var secret = Path.Combine(TestFiles.NewTempDirectory(), "credentials");
+        File.WriteAllText(secret, "s3cret");
+        using var ui = new Harness(_directory);
+        string Shown(BodyMode mode)
+        {
+            ui.Window.Editor.Load(new HttpRequestSpec { Url = "https://api.example.com/upload", Body = new RequestBody { Mode = mode, Raw = "{}", FileSrc = secret } });
+            return ui.Window.BodyFileStatus;
+        }
+
+        var raw = Shown(BodyMode.Raw); // a raw body keeps a file path it doesn't send
+        var file = Shown(BodyMode.File);
+        ui.Runner.OutsideFilesAllowed = true;
+        ui.Window.Editor.RefreshBodyFile();
+
+        Assert.Equal("", raw);
+        Assert.Equal($"✗ {secret} is outside the workspace folder: it is not sent unless you allow files from outside it (Tools › Settings…).", file);
+        Assert.Equal("credentials · 6 B · sent as it is", ui.Window.BodyFileStatus);
     }
 
     /// <summary>A plain-text response, as if it had just arrived.</summary>

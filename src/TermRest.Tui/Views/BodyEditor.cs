@@ -1,6 +1,7 @@
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using TermRest.Core.Http;
+using TermRest.Core.IO;
 using TermRest.Core.Json;
 using TermRest.Core.Model;
 using TermRest.Tui.Dialogs;
@@ -66,6 +67,12 @@ internal sealed class BodyEditor : View
                 }
 
                 ShowMode();
+                if (_body.Mode == BodyMode.File)
+                {
+                    _fileCheck++;
+                    DescribeFile();
+                }
+
                 RaiseChanged();
             }
         };
@@ -120,8 +127,10 @@ internal sealed class BodyEditor : View
         var browse = new Button { Text = "Browse…", X = Pos.AnchorEnd(12), Y = 0 };
         browse.Accepted += (_, _) =>
         {
+            // Not in the folder of a path the request won't send: listing it would reach that folder (a network share).
             var current = string.IsNullOrWhiteSpace(_body.FileSrc) || _body.FileSrc.Contains("{{", StringComparison.Ordinal) ? null : ResolveFile(_body.FileSrc.Trim());
-            if (App is not null && Ui.PickFile(App, "Choose the file to send as the body", Path.GetDirectoryName(current) ?? BaseDirectory?.Invoke()) is { } path)
+            var start = current is null || (FilesFolder?.Invoke() is { } folder && !RealPath.IsWithin(current, folder)) ? null : Path.GetDirectoryName(current);
+            if (App is not null && Ui.PickFile(App, "Choose the file to send as the body", start ?? BaseDirectory?.Invoke()) is { } path)
             {
                 ChooseFile(path);
             }
@@ -174,6 +183,12 @@ internal sealed class BodyEditor : View
     /// <summary>Folder that relative file paths start from: the collection's folder, as when the request is sent.</summary>
     public Func<string>? BaseDirectory { get; set; }
 
+    /// <summary>
+    /// The folder whose files the request may send (<see cref="ExecutionDefaults.FilesFolder"/>), or null for any: a file
+    /// outside it is not looked at, as sending doesn't (on Windows, looking at \\server\share signs in to that server).
+    /// </summary>
+    public Func<string?>? FilesFolder { get; set; }
+
     /// <summary>Whether requests are being recorded: the file panel then says that recordings keep the path, not the content.</summary>
     public bool Recording
     {
@@ -200,7 +215,7 @@ internal sealed class BodyEditor : View
             _filePath.Text = body.FileSrc ?? "";
             _graphQLQuery.SetText(body.GraphQLQuery);
             _graphQLVariables.SetText(body.GraphQLVariables);
-            DescribeFile();
+            DescribeFile(); // in file mode: another mode's body keeps a file path it doesn't send
             ShowMode();
         }
         finally
@@ -209,7 +224,10 @@ internal sealed class BodyEditor : View
         }
     }
 
-    /// <summary>Looks the body file up again: a relative path starts at the collection's folder, which may have changed.</summary>
+    /// <summary>
+    /// Looks the body file up again: a relative path starts at the collection's folder, which may have changed, and files
+    /// from outside the workspace folder may have been allowed.
+    /// </summary>
     internal void RefreshFile()
     {
         _fileCheck++;
@@ -218,17 +236,19 @@ internal sealed class BodyEditor : View
 
     /// <summary>
     /// Uses <paramref name="path"/> as the body file. With a type, the file must fit it first: a JSON body takes only
-    /// a valid JSON file. Anything else is turned down and the current file stays.
+    /// a valid JSON file. Anything else is turned down and the current file stays. A file the request won't send (outside the
+    /// workspace folder) is not read: it is used, and the Body tab says why it is not sent.
     /// </summary>
     internal void ChooseFile(string path)
     {
-        if (_body.FileLanguage is not { } language)
+        var folder = FilesFolder?.Invoke();
+        if (_body.FileLanguage is not { } language || (folder is not null && !RealPath.IsWithin(path, folder)))
         {
             _filePath.Text = path;
             return;
         }
 
-        CheckFile(path, language, problem =>
+        CheckFile(path, language, folder, problem =>
         {
             if (problem is null)
             {
@@ -265,7 +285,7 @@ internal sealed class BodyEditor : View
     {
         try
         {
-            return Path.IsPathRooted(path) ? path : Path.GetFullPath(Path.Combine(BaseDirectory?.Invoke() ?? Environment.CurrentDirectory, path));
+            return Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(BaseDirectory?.Invoke() ?? Environment.CurrentDirectory, path));
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
         {
@@ -276,10 +296,17 @@ internal sealed class BodyEditor : View
     /// <summary>
     /// What is known about the file: whether it is there, and its size; with <paramref name="checkContent"/>, also whether
     /// it fits its type. It is looked up in the background, after <paramref name="delay"/> (the file can be large, or on a
-    /// slow or disconnected network drive), and only the latest lookup is shown.
+    /// slow or disconnected network drive), and only the latest lookup is shown. Only in file mode: a body of another mode
+    /// keeps a path it doesn't send. A file the request won't send is not looked at.
     /// </summary>
     private void DescribeFile(TimeSpan delay = default, bool checkContent = false)
     {
+        if (_body.Mode != BodyMode.File)
+        {
+            ShowFileStatus("");
+            return;
+        }
+
         var src = _body.FileSrc?.Trim() ?? "";
         if (src.Length == 0)
         {
@@ -294,10 +321,17 @@ internal sealed class BodyEditor : View
         }
 
         var path = ResolveFile(src);
+        var folder = FilesFolder?.Invoke();
+        if (folder is not null && !RealPath.IsWithin(path, folder))
+        {
+            ShowFileStatus($"✗ {path} is outside the workspace folder: {NotSent}", "Error");
+            return;
+        }
+
         var language = _body.FileLanguage;
         if (App is not { } app)
         {
-            ShowFileStatus(LookUp(path, language, checkContent)); // not shown yet: there is no main loop to come back to
+            ShowFileStatus(LookUp(path, language, checkContent, folder)); // not shown yet: there is no main loop to come back to
             return;
         }
 
@@ -307,7 +341,7 @@ internal sealed class BodyEditor : View
         {
             if (check == _fileCheck)
             {
-                _ = Task.Run(() => LookUp(path, language, checkContent)).ContinueWith(
+                _ = Task.Run(() => LookUp(path, language, checkContent, folder)).ContinueWith(
                     task => app.AddTimeout(TimeSpan.Zero, () =>
                     {
                         if (check == _fileCheck)
@@ -326,26 +360,40 @@ internal sealed class BodyEditor : View
 
     /// <summary>
     /// The file's status, read from the disk: whether it is there and its size, and with <paramref name="checkContent"/>
-    /// whether it fits its type.
+    /// whether it fits its type. A file that leads out of <paramref name="folder"/> through a link is not looked at.
     /// </summary>
-    private static (string Text, string? Scheme) LookUp(string path, string? language, bool checkContent)
+    private static (string Text, string? Scheme) LookUp(string path, string? language, bool checkContent, string? folder)
     {
-        var file = new FileInfo(path);
-        if (!file.Exists)
+        try
         {
-            return ($"✗ {file.FullName} does not exist.", "Error");
-        }
+            if (folder is not null && !RealPath.IsInside(path, folder))
+            {
+                return ($"✗ {path} leads outside the workspace folder through a link: {NotSent}", "Error");
+            }
 
-        if (checkContent && language is not null)
+            var file = new FileInfo(path);
+            if (!file.Exists)
+            {
+                return ($"✗ {file.FullName} does not exist.", "Error");
+            }
+
+            if (checkContent && language is not null)
+            {
+                return BodyFile.Check(path, language) is { } problem
+                    ? ($"✗ {problem} It is not sent until it is fixed, or the type is Binary.", "Error")
+                    : (Checked(file, language), ThemeCatalog.SuccessScheme);
+            }
+
+            var type = TypeLabel(language);
+            return ($"{file.Name} · {HttpExchange.FormatSize(file.Length)} · {(type is null ? "sent as it is" : $"checked as {type} when sent")}", null);
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException or NotSupportedException)
         {
-            return BodyFile.Check(path, language) is { } problem
-                ? ($"✗ {problem} It is not sent until it is fixed, or the type is Binary.", "Error")
-                : (Checked(file, language), ThemeCatalog.SuccessScheme);
+            return ($"✗ {ex.Message}", "Error"); // a path no file can have (a NUL in it)
         }
-
-        var type = TypeLabel(language);
-        return ($"{file.Name} · {HttpExchange.FormatSize(file.Length)} · {(type is null ? "sent as it is" : $"checked as {type} when sent")}", null);
     }
+
+    private const string NotSent = "it is not sent unless you allow files from outside it (Tools › Settings…).";
 
     /// <summary>After the type changed: checks the chosen file right away, so that a mismatch shows before sending.</summary>
     private void CheckChosenFile()
@@ -354,21 +402,31 @@ internal sealed class BodyEditor : View
         DescribeFile(checkContent: true);
     }
 
-    /// <summary>Checks a file in the background (it can be large); <paramref name="done"/> gets the problem, or null.</summary>
-    private void CheckFile(string path, string language, Action<string?> done)
+    /// <summary>
+    /// Checks a file in the background (it can be large); <paramref name="done"/> gets the problem, or null. A file that leads
+    /// out of <paramref name="folder"/> through a link is not read: it is used, and the Body tab says why it is not sent.
+    /// </summary>
+    private void CheckFile(string path, string language, string? folder, Action<string?> done)
     {
         var check = ++_fileCheck;
         var app = App;
         ShowFileStatus($"Checking {Path.GetFileName(path)}…");
-        _ = Task.Run(() => BodyFile.Check(path, language)).ContinueWith(
+        _ = Task.Run(() => folder is not null && !RealPath.IsInside(path, folder) ? (Outside: true, Problem: null) : (Outside: false, Problem: BodyFile.Check(path, language))).ContinueWith(
             task =>
             {
-                var problem = task.IsCompletedSuccessfully ? task.Result : task.Exception?.GetBaseException().Message ?? "The check was cancelled.";
+                var (outside, problem) = task.IsCompletedSuccessfully ? task.Result : (false, task.Exception?.GetBaseException().Message ?? "The check was cancelled.");
                 app?.AddTimeout(TimeSpan.Zero, () =>
                 {
                     if (check == _fileCheck)
                     {
-                        done(problem);
+                        if (outside)
+                        {
+                            _filePath.Text = path;
+                        }
+                        else
+                        {
+                            done(problem);
+                        }
                     }
 
                     return false;

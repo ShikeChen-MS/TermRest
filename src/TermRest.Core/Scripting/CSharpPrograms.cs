@@ -726,11 +726,22 @@ internal sealed partial class CSharpPrograms(string dotnet, string workspaceRoot
         return errors;
     }
 
-    /// <summary><paramref name="file"/> relative to the workspace when it is inside it, else as it is.</summary>
+    /// <summary>
+    /// <paramref name="file"/> relative to the workspace when it is inside it, else as it is. The files of a #:project come
+    /// by their project's path (<see cref="CSharpWorkerCode.ProjectPath"/>), which may be the workspace's real one.
+    /// </summary>
     private static string Shown(string file, string workspaceRoot)
     {
-        var relative = Path.GetRelativePath(workspaceRoot, file);
-        return relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative) ? file : relative;
+        foreach (var root in (string[])[workspaceRoot, CSharpWorkerCode.ProjectPath(workspaceRoot)])
+        {
+            var relative = Path.GetRelativePath(root, file);
+            if (!relative.StartsWith("..", StringComparison.Ordinal) && !Path.IsPathRooted(relative))
+            {
+                return relative;
+            }
+        }
+
+        return file;
     }
 
     /// <summary>A script's compiler errors, as Python shows a syntax error: the first in the message, all in the traceback.</summary>

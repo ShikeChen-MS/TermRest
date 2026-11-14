@@ -197,7 +197,7 @@ internal static class CertificatesDialog
             var loaded = runner.Certificates.Load(entry, workspace.RootPath, value =>
                 value is not null && value.StartsWith("env:", StringComparison.OrdinalIgnoreCase)
                     ? Environment.GetEnvironmentVariable(value[4..])
-                    : resolver.Resolve(value));
+                    : resolver.Resolve(value), runner.FilesFolder);
             var summary = loaded.Summary;
             var builder = new StringBuilder();
             builder.Append(CultureInfo.InvariantCulture, $"✓ {summary.Subject}  issued by {summary.IssuerCommonName}\n");

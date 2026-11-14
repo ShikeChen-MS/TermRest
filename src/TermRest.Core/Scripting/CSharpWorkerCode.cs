@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using TermRest.Core.IO;
 
 namespace TermRest.Core.Scripting;
 
@@ -176,10 +177,28 @@ internal static partial class CSharpWorkerCode
         }
 
         var path = match.Groups[2].Value.Trim();
-        return Path.IsPathRooted(path) || path.StartsWith('$')
-            ? directive
-            : $"#:{match.Groups[1].Value} {Path.GetFullPath(Path.Combine(workspaceRoot, path))}";
+        if (path.StartsWith('$'))
+        {
+            return directive;
+        }
+
+        var full = Path.IsPathRooted(path) ? path : Path.GetFullPath(Path.Combine(workspaceRoot, path));
+
+        if (match.Groups[1].Value == "project")
+        {
+            full = ProjectPath(full);
+        }
+
+        return full == path ? directive : $"#:{match.Groups[1].Value} {full}";
     }
+
+    /// <summary>
+    /// A project's path as the build should see it: on Linux and macOS without symbolic links (<see cref="RealPath.Of"/>),
+    /// as NuGet leaves out the projects that a project references when the path to it goes through a link (on macOS, /var
+    /// and /tmp are links), and the program then builds without them.
+    /// </summary>
+    internal static string ProjectPath(string path) => OperatingSystem.IsWindows() ? path : RealPath.Of(path) ?? path;
+
 
     /// <summary>The #:include and #:project directives of a program from <see cref="Generate"/>: which one, and its path.</summary>
     public static IEnumerable<(string Directive, string Path)> PathsOf(string program) =>

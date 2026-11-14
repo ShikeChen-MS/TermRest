@@ -62,7 +62,7 @@ public sealed class RecordingTests : IDisposable
         await using var server = await EchoServer.StartAsync();
         var upload = Path.Combine(_root, "upload.txt");
         await File.WriteAllTextAsync(upload, "file-content", _ct);
-        using var runner = new RequestRunner(ApiWorkspace.Open(TestFiles.NewTempDirectory()));
+        using var runner = new RequestRunner(ApiWorkspace.Open(_root)); // the workspace's file
         runner.LocalVariables["base"] = server.BaseUri.ToString().TrimEnd('/');
         runner.LocalVariables["apiToken"] = "tok-1234567890"; // named like a secret, not typed "secret"
         var collection = PostmanCollection.Create("Recorded");
@@ -170,7 +170,7 @@ public sealed class RecordingTests : IDisposable
         await using var server = await EchoServer.StartAsync();
         var payload = Path.Combine(_root, "order.json");
         await File.WriteAllTextAsync(payload, "{\"item\":\"book\",\"note\":\"Only-In-The-File\"}", _ct);
-        using var runner = new RequestRunner(ApiWorkspace.Open(TestFiles.NewTempDirectory()));
+        using var runner = new RequestRunner(ApiWorkspace.Open(_root)); // the workspace's file
         using var recorder = Start();
         runner.Recorder = recorder;
         var exchange = await runner.SendAsync(runner.Prepare(PostmanCollection.Create("Recorded"), null, new HttpRequestSpec

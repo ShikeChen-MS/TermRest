@@ -657,7 +657,12 @@ internal sealed class YamlWriter(YamlStyle style, YamlTree? source, bool rewrite
         return builder.Append('"').ToString();
     }
 
-    private static string FormatKey(string key) => IsPlainSafe(key) ? key : DoubleQuoted(key);
+    /// <summary>
+    /// A mapping key as YAML writes it: quoted where a plain one would not read back, also where it holds <c>" *"</c>, as
+    /// YamlDotNet then reads the key, its colon and its value as one string (<c>Accept *: v</c>).
+    /// </summary>
+    private static string FormatKey(string key) =>
+        IsPlainSafe(key) && !key.Contains(" *", StringComparison.Ordinal) ? key : DoubleQuoted(key);
 
     // ----- detecting how a document was wrapped -------------------------------------------------------
 

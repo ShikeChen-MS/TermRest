@@ -582,6 +582,47 @@ public class CSharpScriptingTests
     }
 
     [Fact]
+    public async Task A_project_reached_through_a_symbolic_link_builds_with_the_projects_it_references()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "Creating symbolic links needs Developer Mode or an administrator on Windows.");
+        var dotnet = TestCSharp.Require();
+        await using var server = await EchoServer.StartAsync();
+        var real = TestFiles.NewTempDirectory();
+        var contracts = Path.Combine(real, "src", "Contracts");
+        Directory.CreateDirectory(Path.Combine(real, "src", "Api"));
+        Directory.CreateDirectory(contracts);
+        await File.WriteAllTextAsync(Path.Combine(real, "src", "Api", "Api.csproj"), """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><ProjectReference Include="..\Contracts\Contracts.csproj" /></ItemGroup>
+            </Project>
+            """, _ct);
+        await File.WriteAllTextAsync(Path.Combine(contracts, "Contracts.csproj"),
+            """<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>""", _ct);
+        var link = Path.Combine(TestFiles.NewTempDirectory(), "workspace");
+        Directory.CreateSymbolicLink(link, real);
+        var workspace = ApiWorkspace.Open(link);
+        var collection = workspace.CreateCollection("API");
+        using var runner = new RequestRunner(workspace);
+        runner.SetCSharpRuntime(dotnet);
+        async Task<ScriptResults> Run(string name)
+        {
+            await File.WriteAllTextAsync(Path.Combine(contracts, "Names.cs"), $"public static class Names {{ public static string Name => {name}; }}", _ct);
+            var spec = CSharp(server.Url("echo"), test: "#:project src/Api/Api.csproj\n" + Fresh() + "\ntr.Test(Names.Name, () => { });");
+            return (await runner.SendAsync(collection, null, spec, _ct)).Scripts!;
+        }
+
+        // On Linux and macOS (where /var and /tmp are links), NuGet leaves out what a project references when the path to it
+        // goes through a link: the scripts would not know Names, from src/Contracts.
+        var built = await Run("\"one\"");
+        Assert.True(built.Succeeded, built.Describe());
+        Assert.Equal(["one"], built.Tests.Select(t => t.Name));
+
+        // An error in those projects names the file in the workspace, as without the link.
+        Assert.Contains("(src/Contracts/Names.cs, line 1, column ", (await Run("one")).Error!.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task The_dotnet_sdk_is_found_and_must_be_dotnet_10_or_later()
     {
         var dotnet = TestCSharp.Require();

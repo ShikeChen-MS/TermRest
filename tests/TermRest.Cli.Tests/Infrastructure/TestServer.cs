@@ -84,7 +84,25 @@ internal sealed class TestServer : IAsyncDisposable
                 var stream = client.GetStream();
                 var received = new MemoryStream();
                 var buffer = new byte[4096];
-                while (!received.GetBuffer().AsSpan(0, (int)received.Length).EndsWith("\r\n\r\n"u8))
+                int end;
+                while ((end = received.GetBuffer().AsSpan(0, (int)received.Length).IndexOf("\r\n\r\n"u8)) < 0)
+                {
+                    var count = await stream.ReadAsync(buffer, _stop.Token);
+                    if (count == 0)
+                    {
+                        return;
+                    }
+
+                    received.Write(buffer, 0, count);
+                }
+
+                // The body too, which may come with the headers, so that the connection closes cleanly.
+                var length = Encoding.ASCII.GetString(received.GetBuffer(), 0, end).Split("\r\n")
+                    .Select(line => line.Split(':', 2))
+                    .Where(parts => parts.Length == 2 && parts[0].Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                    .Select(parts => long.Parse(parts[1].Trim(), System.Globalization.CultureInfo.InvariantCulture))
+                    .FirstOrDefault();
+                while (received.Length < end + 4 + length)
                 {
                     var count = await stream.ReadAsync(buffer, _stop.Token);
                     if (count == 0)

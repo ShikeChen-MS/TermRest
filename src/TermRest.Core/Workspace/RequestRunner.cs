@@ -57,6 +57,20 @@ public sealed partial class RequestRunner : IDisposable
             ? proxy
             : null;
 
+    /// <summary>
+    /// Whether requests may send body and form-data files from outside the workspace folder, and open client certificates and
+    /// a CA bundle on network shares outside it: allowed for this workspace folder in the user's settings (read by
+    /// <see cref="ConfigureFiles"/>; saved in Tools › Settings of the full-screen UI), or by <c>--allow-outside-files</c>.
+    /// Otherwise see <see cref="FilesFolder"/>.
+    /// </summary>
+    public bool OutsideFilesAllowed { get; set; }
+
+    /// <summary>
+    /// The workspace folder while <see cref="OutsideFilesAllowed"/> is not set: requests send only its files, and open no
+    /// file on a network share outside it (<see cref="ExecutionDefaults.FilesFolder"/>); null when they may.
+    /// </summary>
+    public string? FilesFolder => OutsideFilesAllowed ? null : Workspace.RootPath;
+
     /// <summary>Where sent requests are recorded; null turns recording off (see <see cref="ConfigureHistory"/>).</summary>
     public HistoryStore? History { get; set; }
 
@@ -94,6 +108,11 @@ public sealed partial class RequestRunner : IDisposable
         var proxy = Workspace.Settings.Proxy;
         AllowedProxy = WorkspaceSettings.IsProxyUrl(proxy) && UserSettings.Load(userSettingsDirectory).IsProxyAllowed(Workspace.RootPath, proxy) ? proxy : null;
     }
+
+    /// <summary>Sets <see cref="OutsideFilesAllowed"/> as the user's settings say for this workspace folder.</summary>
+    /// <param name="userSettingsDirectory">Overrides the user's configuration folder (tests, portable setups).</param>
+    public void ConfigureFiles(string? userSettingsDirectory = null) =>
+        OutsideFilesAllowed = UserSettings.Load(userSettingsDirectory).AreOutsideFilesAllowed(Workspace.RootPath);
 
     /// <summary>The variables of <paramref name="collection"/> as a request sent now sees them (with the current <see cref="Environment"/>).</summary>
     /// <param name="requestVariables">Variables scripts set for this request only (<c>tr.variables</c>); null unsets.</param>
@@ -144,6 +163,7 @@ public sealed partial class RequestRunner : IDisposable
             Proxy = BlockedProxy is null ? settings.Proxy?.Trim() : null,
             MaxResponseBytes = Math.Max(1, settings.MaxResponseSizeMb) * 1024L * 1024L,
             HttpVersion = settings.HttpVersion,
+            FilesFolder = FilesFolder,
         };
     }
 

@@ -166,8 +166,10 @@ internal static class HistoryCommand
         }
 
         Console.Out.WriteLine();
-        Console.Out.WriteLine(entry.BodySaved
-            ? BodyFormatter.Format(response.Body, response.ContentType) + (entry.BodyTruncated ? "\n… (truncated)" : "")
-            : "(response body not kept)");
+
+        // As the UI says it: the history has no copy of a body that was not empty (it keeps none, or the copy's file is gone).
+        Console.Out.WriteLine(response.Body.Length == 0 && entry.Size > 0
+            ? "(response body not kept)"
+            : BodyFormatter.Format(response.Body, response.ContentType) + (entry.BodyTruncated ? "\n… (truncated)" : ""));
     }
 }

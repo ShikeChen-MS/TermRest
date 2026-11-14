@@ -359,7 +359,9 @@ public class PowerShellScriptingTests
         Assert.Equal(1000, exchange.Scripts.Logs.Count);
         Assert.Equal(("first", "line 999 " + new string('x', 100)), (exchange.Scripts.Logs[0].Text, exchange.Scripts.Logs[^1].Text));
         Assert.Contains("249001 more lines the test scripts printed are not shown.", exchange.Scripts.Notes);
-        Assert.True(long.Parse(runner.Session.Globals["kept"]!, CultureInfo.InvariantCulture) < 12_000_000, runner.Session.Globals["kept"]);
+        // About 8 MB on Windows and Linux (the console's 4 million characters, until the script's output takes them), 14 MB on
+        // macOS; all the lines would take 60 MB.
+        Assert.True(long.Parse(runner.Session.Globals["kept"]!, CultureInfo.InvariantCulture) < 25_000_000, runner.Session.Globals["kept"]);
     }
 
     [Fact]

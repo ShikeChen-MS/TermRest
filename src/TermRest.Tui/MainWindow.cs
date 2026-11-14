@@ -117,6 +117,9 @@ internal sealed class MainWindow : Runnable
             // Where a relative body file is looked for when sending: the folder of the collection sending it.
             BaseDirectory = () => (_collection ?? _scratch)?.BaseDirectory ?? Environment.CurrentDirectory,
 
+            // Body files from outside the workspace folder are not sent, nor looked at, unless allowed (Tools › Settings).
+            FilesFolder = () => _runner.FilesFolder,
+
             // The request's scripts run with those of its collection and folders, in one language (a request typed into the
             // editor a delete emptied is a scratch request, as Send has it).
             ScriptPlanner = (scripts, settings) => _runner.PlanScripts(_collection ?? (_scratch ??= PostmanCollection.Create("Scratch")), SendContext, scripts, settings),
@@ -948,6 +951,7 @@ internal sealed class MainWindow : Runnable
         if (SettingsDialog.Show(App!, _workspace, _runner, out var saved))
         {
             _runner.ConfigureHistory();
+            _editor.RefreshBodyFile(); // files from outside the workspace folder may be allowed now, or no longer
             if (_historyLoaded)
             {
                 LoadHistory();
@@ -1870,8 +1874,10 @@ internal sealed class MainWindow : Runnable
             // request the entry was sent from, whose auth and scripts (its own and its folders') are not meant for the host it
             // names.
             var detach = _node is null && _historyEntry is not null;
+            var sending = _sending is not null;
             if (detach)
             {
+                DetachSending(); // the entry's request, still on its way, goes on as it would for a menu import
                 _historyEntry = null;
                 _historyOrigin = null;
                 _collection = _scratch ??= PostmanCollection.Create("Scratch");
@@ -1888,6 +1894,10 @@ internal sealed class MainWindow : Runnable
             if (detach)
             {
                 _editor.RefreshContext();
+                if (sending)
+                {
+                    ClearResponse(); // not "Sending…" for the entry's request, which now arrives on its own
+                }
             }
         }
         else

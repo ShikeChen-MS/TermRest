@@ -188,6 +188,152 @@ public class WorkspaceAndCollectionTests
     }
 
     [Fact]
+    public void Requests_send_only_the_files_of_their_workspace_until_others_are_allowed_for_it()
+    {
+        // A collection from a repository someone else wrote could send any file of the user's to a server of its choosing.
+        var root = TestFiles.NewTempDirectory();
+        var config = TestFiles.NewTempDirectory();
+        File.WriteAllText(Path.Combine(root, "order.json"), "{}");
+        var secret = Path.Combine(TestFiles.NewTempDirectory(), "credentials");
+        File.WriteAllText(secret, "s3cret");
+        var workspace = ApiWorkspace.Open(root);
+        var collection = workspace.CreateCollection("API");
+        using var runner = new RequestRunner(workspace);
+        runner.ConfigureFiles(config);
+        List<string> Errors(BodyMode mode, params string[] files) => runner.Prepare(collection, null, new HttpRequestSpec
+        {
+            Method = "POST",
+            Url = "https://api.example/upload",
+            Body = new RequestBody
+            {
+                Mode = mode,
+                FileSrc = files[0],
+                FormData = [.. files.Select(f => new KeyValueEntry { Key = "file", Type = "file", Src = f })],
+            },
+        }).Errors;
+
+        Assert.Empty(Errors(BodyMode.FormData, "order.json", Path.Combine(root, "order.json")));
+        var escaping = Path.Combine("..", Path.GetFileName(Path.GetDirectoryName(secret))!, "credentials"); // from the collection's folder
+        foreach (var outside in (string[])[secret, escaping])
+        {
+            Assert.Equal($"Form-data file '{secret}' is outside the workspace folder, so it is not sent (a collection could otherwise send any of " +
+                         "your files): allow files from outside it for this workspace in the full-screen UI (Tools › Settings…), or with --allow-outside-files.",
+                Assert.Single(Errors(BodyMode.FormData, outside)));
+        }
+
+        Assert.StartsWith($"Body file '{secret}' is outside the workspace folder, so it is not sent", Assert.Single(Errors(BodyMode.File, escaping)), StringComparison.Ordinal);
+
+        // Nor through a link in the workspace (a repository can hold one), where links can be made.
+        var link = Path.Combine(root, "avatar.png");
+        try
+        {
+            File.CreateSymbolicLink(link, secret);
+            Assert.StartsWith($"Form-data file '{link}' leads outside the workspace folder through a link, so it is not sent",
+                Assert.Single(Errors(BodyMode.FormData, "avatar.png")), StringComparison.Ordinal);
+        }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException)
+        {
+            // Windows needs Developer Mode or elevation for symbolic links
+        }
+
+        // Allowed for this workspace folder in the user's settings (Tools › Settings…): any file is sent, there only.
+        var user = UserSettings.Load(config);
+        Assert.True(user.AllowOutsideFiles(root, true));
+        Assert.False(user.AllowOutsideFiles(root + Path.DirectorySeparatorChar, true)); // nothing to save
+        user.Save(config);
+        runner.ConfigureFiles(config);
+        Assert.Empty(Errors(BodyMode.FormData, secret, escaping));
+        using var other = new RequestRunner(ApiWorkspace.Open(TestFiles.NewTempDirectory()));
+        other.ConfigureFiles(config);
+        Assert.False(other.OutsideFilesAllowed);
+        Assert.True(user.AllowOutsideFiles(root, false));
+        Assert.Null(user.OutsideFilesAllowed);
+    }
+
+    [Fact]
+    public void A_link_that_climbs_out_of_the_workspace_through_another_link_is_not_sent()
+    {
+        // The OS takes a .. after a link from where the link leads, not from the path as written: repo/d/../id_rsa, written in
+        // full in a link, looks like the repository's own decoy, but is the file next to where d leads.
+        var top = TestFiles.NewTempDirectory();
+        var root = Directory.CreateDirectory(Path.Combine(top, "repo")).FullName;
+        Directory.CreateDirectory(Path.Combine(top, "keys"));
+        Directory.CreateDirectory(Path.Combine(root, "sub"));
+        File.WriteAllText(Path.Combine(top, "id_rsa"), "the user's key");
+        File.WriteAllText(Path.Combine(root, "id_rsa"), "a decoy");
+        File.WriteAllText(Path.Combine(root, "order.json"), "{}");
+        try
+        {
+            Directory.CreateSymbolicLink(Path.Combine(root, "d"), Path.Combine("..", "keys"));
+            File.CreateSymbolicLink(Path.Combine(root, "logo.png"), Path.Combine(root, "d", "..", "id_rsa"));
+            File.CreateSymbolicLink(Path.Combine(root, "sub", "order.json"), Path.Combine("..", "order.json"));
+        }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException)
+        {
+            Assert.Skip($"Cannot create symbolic links here (Windows needs Developer Mode or elevation): {e.Message}");
+        }
+
+        var workspace = ApiWorkspace.Open(root);
+        var collection = workspace.CreateCollection("API");
+        using var runner = new RequestRunner(workspace);
+        List<string> Errors(string file) => runner.Prepare(collection, null, new HttpRequestSpec
+        {
+            Method = "PUT",
+            Url = "https://api.example/upload",
+            Body = new RequestBody { Mode = BodyMode.File, FileSrc = file },
+        }).Errors;
+
+        // Linux and macOS read the key there. Windows takes such a .. as text when the link is made: it leads to the decoy.
+        var leadsOut = File.ReadAllText(Path.Combine(root, "logo.png")) == "the user's key";
+        Assert.True(leadsOut || OperatingSystem.IsWindows());
+        if (leadsOut)
+        {
+            Assert.StartsWith($"Body file '{Path.Combine(root, "logo.png")}' leads outside the workspace folder through a link, so it is not sent",
+                Assert.Single(Errors("logo.png")), StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Empty(Errors("logo.png"));
+        }
+
+        Assert.Empty(Errors(Path.Combine("sub", "order.json"))); // a link out of a folder and back into the workspace
+    }
+
+    [Fact]
+    public void Certificates_and_a_ca_bundle_on_network_shares_are_not_opened_until_files_from_outside_are_allowed()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), @"Network paths (\\server\share) are Windows'.");
+
+        // A cloned repository's settings and certificate registry, and a request pinning a certificate. On Windows, looking at a
+        // file on a share signs in to its server with the user's credentials (nothing answers here: a look would wait).
+        const string share = @"\\termrest.invalid\share";
+        var root = TestFiles.NewTempDirectory();
+        Directory.CreateDirectory(Path.Combine(root, ".termrest"));
+        File.WriteAllText(Path.Combine(root, ".termrest", "settings.json"), new JsonObject { ["caBundle"] = share + @"\ca.pem" }.ToJsonString());
+        var workspace = ApiWorkspace.Open(root);
+        workspace.Certificates.Entries.Add(new CertificateEntry { Name = "shared", Matches = ["<all_urls>"], Pfx = new FileSource { Src = share + @"\client.pfx" } });
+        var collection = workspace.CreateCollection("API");
+        using var runner = new RequestRunner(workspace);
+
+        var pinned = runner.Prepare(collection, null, new HttpRequestSpec
+        {
+            Url = "https://api.example/",
+            Certificate = new CertificateSpec { Name = "pinned", CertSrc = share + @"\client.pem", KeySrc = share + @"\client.key" },
+        });
+        var registered = runner.Prepare(collection, null, new HttpRequestSpec { Url = "https://api.example/" });
+
+        Assert.Contains($@"CA bundle '{share}\ca.pem' not loaded: {ClientCertificateProvider.OnNetworkShare}", pinned.Warnings);
+        Assert.Contains($@"Client certificate 'pinned' not used: '{share}\client.pem': {ClientCertificateProvider.OnNetworkShare}", pinned.Warnings);
+        Assert.Contains($@"Client certificate 'shared' not used: '{share}\client.pfx': {ClientCertificateProvider.OnNetworkShare}", registered.Warnings);
+        Assert.Null(registered.ClientCertificate);
+
+        Assert.All((string[])[@"\\server\share\c.pem", "//server/share/c.pem", @"\\?\UNC\server\share\c.pem", @"\??\UNC\server\share\c.pem", @"\\.\pipe\x"],
+            path => Assert.True(RealPath.IsNetworkPath(path), path));
+        Assert.All((string[])[@"C:\certs\c.pem", @"\\?\C:\certs\c.pem", @"\??\C:\c.pem", @"\\?\Volume{0a1b2c3d-0000-0000-0000-000000000000}\c.pem", @"certs\c.pem", @"\certs"],
+            path => Assert.False(RealPath.IsNetworkPath(path), path));
+    }
+
+    [Fact]
     public void Runner_resolves_environment_over_collection_variables()
     {
         var workspace = OpenSampleCopy();

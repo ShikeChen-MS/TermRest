@@ -96,6 +96,93 @@ public class PostmanV3Tests
     }
 
     [Fact]
+    public void Folders_of_a_workspace_that_cannot_be_listed_are_load_errors_and_the_rest_opens()
+    {
+        // As a link to a collection of another repository that was moved, or a folder of another user.
+        var root = V3Fixture.Create();
+        var shared = Directory.CreateDirectory(Path.Combine(root, "postman", "collections", "Shared")).FullName;
+        var environments = Path.Combine(root, "postman", "environments");
+        Listable(shared, false);
+        Listable(environments, false);
+        try
+        {
+            try
+            {
+                Directory.GetFileSystemEntries(environments);
+                Assert.Skip("This user can list any folder (root).");
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // as for other users
+            }
+
+            var workspace = ApiWorkspace.Open(root);
+
+            Assert.Equal(["Widget API"], workspace.Collections.Select(c => c.Name));
+            Assert.NotNull(workspace.Globals);
+            Assert.Contains(workspace.LoadErrors, e => e.StartsWith("Shared: ", StringComparison.Ordinal));
+            Assert.Contains(workspace.LoadErrors, e => e.StartsWith(Path.Combine("postman", "environments") + ": ", StringComparison.Ordinal));
+        }
+        finally
+        {
+            Listable(shared, true);
+            Listable(environments, true);
+        }
+    }
+
+    [Fact]
+    public void Links_of_a_workspace_to_folders_that_are_gone_are_load_errors()
+    {
+        // As a collection linked from another repository that was moved: on Linux and macOS, such a link is no folder at all.
+        var root = V3Fixture.Create();
+        var gone = Path.Combine(TestFiles.NewTempDirectory(), "gone");
+        var environments = Path.Combine(root, "postman", "environments");
+        Directory.Delete(environments, recursive: true);
+        try
+        {
+            Directory.CreateSymbolicLink(environments, gone);
+            Directory.CreateSymbolicLink(Path.Combine(root, "postman", "collections", "Payments"), gone);
+        }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException)
+        {
+            Assert.Skip($"Cannot create symbolic links here (Windows needs Developer Mode or elevation): {e.Message}");
+        }
+
+        var workspace = ApiWorkspace.Open(root);
+
+        Assert.Equal(["Widget API"], workspace.Collections.Select(c => c.Name));
+        Assert.Contains($"Payments: it links to {gone}, which is not there.", workspace.LoadErrors);
+        Assert.Contains($"{Path.Combine("postman", "environments")}: it links to {gone}, which is not there.", workspace.LoadErrors);
+        Assert.DoesNotContain(workspace.LoadErrors, e => e.StartsWith("Payments: ", StringComparison.Ordinal) && !e.Contains("it links to", StringComparison.Ordinal));
+    }
+
+    /// <summary>Lets the current user list <paramref name="folder"/>, or not.</summary>
+    private static void Listable(string folder, bool listable)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var directory = new DirectoryInfo(folder);
+            var security = directory.GetAccessControl();
+            var rule = new System.Security.AccessControl.FileSystemAccessRule(System.Security.Principal.WindowsIdentity.GetCurrent().User!,
+                System.Security.AccessControl.FileSystemRights.ListDirectory, System.Security.AccessControl.AccessControlType.Deny);
+            if (listable)
+            {
+                security.RemoveAccessRule(rule);
+            }
+            else
+            {
+                security.AddAccessRule(rule);
+            }
+
+            directory.SetAccessControl(security);
+        }
+        else
+        {
+            File.SetUnixFileMode(folder, listable ? UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute : UnixFileMode.None);
+        }
+    }
+
+    [Fact]
     public void A_collection_whose_requests_are_all_in_folders_and_that_has_no_definition_is_loaded()
     {
         // Postman writes no definition for a collection without settings of its own; a folder of other files is no collection.

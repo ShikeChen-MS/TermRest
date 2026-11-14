@@ -50,6 +50,13 @@ public sealed class UserSettings
     public Dictionary<string, string>? AllowedProxies { get; set; }
 
     /// <summary>
+    /// The workspace folders whose requests may send body and form-data files from outside them. Elsewhere only a
+    /// workspace's own files are sent: a collection from a repository someone else wrote could otherwise send the user's
+    /// files (SSH keys, cloud credentials) to a server of its choosing.
+    /// </summary>
+    public List<string>? OutsideFilesAllowed { get; set; }
+
+    /// <summary>
     /// Why <see cref="Load"/> could not read the file (<c>path: problem</c>), if it could not: these are the defaults then,
     /// and <see cref="Save"/> does not save over the file.
     /// </summary>
@@ -156,6 +163,33 @@ public sealed class UserSettings
     }
 
     private static string ProxyHash(string proxy) => "sha256:" + Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(proxy.Trim())));
+
+    /// <summary>Whether requests of the workspace in <paramref name="workspaceRoot"/> may send files from outside it.</summary>
+    public bool AreOutsideFilesAllowed(string workspaceRoot) => OutsideFilesAllowed?.Any(f => SameFolder(f, workspaceRoot)) == true;
+
+    /// <summary>
+    /// Allows, or no longer allows, the requests of the workspace in <paramref name="workspaceRoot"/> to send files from
+    /// outside it. Returns false when nothing changed (there is nothing to save then).
+    /// </summary>
+    public bool AllowOutsideFiles(string workspaceRoot, bool allow)
+    {
+        if (AreOutsideFilesAllowed(workspaceRoot) == allow)
+        {
+            return false;
+        }
+
+        if (allow)
+        {
+            (OutsideFilesAllowed ??= []).Add(NormalizeFolder(workspaceRoot));
+        }
+        else
+        {
+            OutsideFilesAllowed!.RemoveAll(f => SameFolder(f, workspaceRoot));
+            OutsideFilesAllowed = OutsideFilesAllowed.Count == 0 ? null : OutsideFilesAllowed;
+        }
+
+        return true;
+    }
 
     private static bool SameFolder(string a, string b) =>
         string.Equals(NormalizeFolder(a), NormalizeFolder(b), OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);

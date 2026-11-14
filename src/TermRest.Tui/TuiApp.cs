@@ -59,6 +59,7 @@ public static class TuiApp
             runner.ConfigureHistory();
             runner.ConfigureScripts();
             runner.ConfigureProxy();
+            runner.ConfigureFiles();
             using var app = Application.Create();
             app.Init(options.Driver);
             ThemeCatalog.Apply(theme);
@@ -195,6 +196,7 @@ public static class TuiApp
         using var runner = new RequestRunner(workspace) { RequireScriptRuntimes = false };
         runner.ConfigureScripts();
         runner.ConfigureProxy();
+        runner.ConfigureFiles();
         using var app = Application.Create();
         app.Init(Terminal.Gui.Drivers.DriverRegistry.Names.ANSI);
         app.Driver!.SetScreenSize(width, height);

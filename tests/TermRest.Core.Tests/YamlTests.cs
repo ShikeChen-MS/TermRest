@@ -219,6 +219,8 @@ public class YamlTests
     [InlineData("@at")]
     [InlineData("`tick")]
     [InlineData("12:30")]
+    [InlineData("Accept *")]
+    [InlineData("a *b")]
     public void Written_strings_read_back_unchanged(string value)
     {
         foreach (var style in (YamlStyle[])[YamlStyle.Default, new YamlStyle(PreferSingleQuotes: true)])
@@ -227,6 +229,7 @@ public class YamlTests
             {
                 ["value"] = value,
                 ["list"] = new JsonArray(value, new JsonObject { ["nested"] = value }),
+                ["map"] = new JsonObject { [value] = "as a key" },
             };
 
             var text = YamlFile.Write(root, style);

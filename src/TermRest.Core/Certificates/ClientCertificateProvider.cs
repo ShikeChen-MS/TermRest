@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using TermRest.Core.IO;
 using TermRest.Core.Model;
 
 namespace TermRest.Core.Certificates;
@@ -26,6 +27,12 @@ public sealed record ClientCertificateSelection(CertificateEntry Entry, LoadedCe
 /// </summary>
 public sealed class ClientCertificateProvider(CertificateRegistry registry) : IDisposable
 {
+    /// <summary>Why a certificate or CA bundle file on a network share is not opened, and how to allow it.</summary>
+    public const string OnNetworkShare =
+        "it is on a network share outside the workspace folder, or a link leads there, so it is not opened (Windows would sign in to " +
+        "that server with your credentials): allow files from outside the folder for this workspace in the full-screen UI " +
+        "(Tools › Settings…), or with --allow-outside-files.";
+
     // Keyed by source (see BuildCacheKey); a replaced certificate or bundle may still be in use by a request in flight,
     // so it is retired and released with the provider.
     private readonly Dictionary<string, (string Version, LoadedCertificate Certificate)> _cache = new(StringComparer.Ordinal);
@@ -36,12 +43,17 @@ public sealed class ClientCertificateProvider(CertificateRegistry registry) : ID
 
     public CertificateRegistry Registry { get; } = registry;
 
+    /// <param name="filesFolder">
+    /// While set, a certificate file on a network share outside it is not opened (see <see cref="RealPath.ReachesNetwork"/>):
+    /// the registry and the requests come with the repository.
+    /// </param>
     public ClientCertificateSelection? Select(
         Uri uri,
         CertificateSpec? requestCertificate,
         string requestBaseDirectory,
         Func<string?, string?> resolveSecret,
-        ICollection<string> warnings)
+        ICollection<string> warnings,
+        string? filesFolder = null)
     {
         if (requestCertificate is { } pinned && (pinned.CertSrc is not null || pinned.PfxSrc is not null))
         {
@@ -58,23 +70,36 @@ public sealed class ClientCertificateProvider(CertificateRegistry registry) : ID
                     Pfx = pinned.PfxSrc is null ? null : new FileSource { Src = pinned.PfxSrc },
                     Passphrase = pinned.Passphrase,
                 };
-                return TrySelect(entry, requestBaseDirectory, "pinned on request", resolveSecret, warnings);
+                return TrySelect(entry, requestBaseDirectory, "pinned on request", resolveSecret, warnings, filesFolder);
             }
         }
 
         if (Registry.FindBestMatch(uri) is { } match)
         {
-            return TrySelect(match.Entry, Registry.BaseDirectory, $"matched {match.Pattern}", resolveSecret, warnings);
+            return TrySelect(match.Entry, Registry.BaseDirectory, $"matched {match.Pattern}", resolveSecret, warnings, filesFolder);
         }
 
         return null;
     }
 
     /// <summary>Loads (or returns the cached) certificate for an entry. Throws <see cref="CertificateLoadException"/>.</summary>
-    public LoadedCertificate Load(CertificateEntry entry, string baseDirectory, Func<string?, string?>? resolveSecret = null)
+    /// <param name="filesFolder">While set, a file on a network share outside it is not opened (see <see cref="Select"/>).</param>
+    public LoadedCertificate Load(CertificateEntry entry, string baseDirectory, Func<string?, string?>? resolveSecret = null, string? filesFolder = null)
     {
         var passphrase = resolveSecret is null ? entry.Passphrase : resolveSecret(entry.Passphrase);
         string Resolve(string src) => ResolvePath(baseDirectory, src);
+
+        // Before the cache looks at the files.
+        if (filesFolder is not null)
+        {
+            foreach (var src in (string?[])[entry.Cert?.Src, entry.Key?.Src, entry.Pfx?.Src])
+            {
+                if (src is not null && Resolve(src) is var path && RealPath.ReachesNetwork(path, filesFolder))
+                {
+                    throw new CertificateLoadException($"'{path}': {OnNetworkShare}");
+                }
+            }
+        }
 
         var (source, version) = BuildCacheKey(entry, Resolve, passphrase);
         lock (_gate)
@@ -146,11 +171,12 @@ public sealed class ClientCertificateProvider(CertificateRegistry registry) : ID
         return bundle ?? throw new CertificateLoadException(error!);
     }
 
-    private ClientCertificateSelection? TrySelect(CertificateEntry entry, string baseDirectory, string origin, Func<string?, string?> resolveSecret, ICollection<string> warnings)
+    private ClientCertificateSelection? TrySelect(CertificateEntry entry, string baseDirectory, string origin, Func<string?, string?> resolveSecret,
+        ICollection<string> warnings, string? filesFolder)
     {
         try
         {
-            var loaded = Load(entry, baseDirectory, resolveSecret);
+            var loaded = Load(entry, baseDirectory, resolveSecret, filesFolder);
             var summary = loaded.Summary;
             if (summary.IsExpired)
             {

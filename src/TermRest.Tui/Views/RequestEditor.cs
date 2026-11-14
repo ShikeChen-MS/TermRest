@@ -199,6 +199,16 @@ internal sealed class RequestEditor : View
         set => _body.BaseDirectory = value;
     }
 
+    /// <summary>The folder whose files the request may send, or null for any (see <see cref="BodyEditor.FilesFolder"/>).</summary>
+    public Func<string?>? FilesFolder
+    {
+        get => _body.FilesFolder;
+        set => _body.FilesFolder = value;
+    }
+
+    /// <summary>Looks the body file up again (after files from outside the workspace folder were allowed, or no longer).</summary>
+    public void RefreshBodyFile() => _body.RefreshFile();
+
     /// <summary>What the Body tab says about the body file (for tests).</summary>
     internal string BodyFileStatus => _body.FileStatus;
 

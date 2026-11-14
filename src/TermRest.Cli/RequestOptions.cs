@@ -49,6 +49,11 @@ internal sealed class RequestOptions
 
     public Option<bool> NoScripts { get; } = new("--no-scripts") { Description = "Do not run pre-request and test scripts" };
 
+    public Option<bool> AllowOutsideFiles { get; } = new("--allow-outside-files")
+    {
+        Description = "Also send body and form-data files from outside the workspace folder (default: only where allowed for the workspace in the full-screen UI, Tools › Settings…)",
+    };
+
     public void AddTo(Command command)
     {
         command.Options.Add(Environment);
@@ -61,6 +66,7 @@ internal sealed class RequestOptions
         command.Options.Add(PowerShell);
         command.Options.Add(ScriptOrder);
         command.Options.Add(NoScripts);
+        command.Options.Add(AllowOutsideFiles);
     }
 
     /// <summary>
@@ -193,6 +199,9 @@ internal sealed class RequestOptions
                            "your requests through a proxy of its choosing; requests use the system's proxy settings. Allow it in the full-screen UI " +
                            "(Tools > Settings > Save), or set HTTPS_PROXY.");
         }
+
+        runner.ConfigureFiles();
+        runner.OutsideFilesAllowed |= parseResult.GetValue(AllowOutsideFiles);
 
         if (parseResult.GetValue(Environment) is { } environment)
         {

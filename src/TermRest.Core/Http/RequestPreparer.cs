@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using TermRest.Core.Auth;
 using TermRest.Core.Certificates;
+using TermRest.Core.IO;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Variables;
@@ -27,6 +28,14 @@ public sealed class ExecutionDefaults
     public long MaxResponseBytes { get; set; } = 50L * 1024 * 1024;
 
     public string HttpVersion { get; set; } = "1.1";
+
+    /// <summary>
+    /// The folder whose body and form-data files requests may send (the workspace's), links resolved; null: any file. A
+    /// collection from a repository someone else wrote could otherwise send the user's files to a server of its choosing.
+    /// Client certificates and the CA bundle may be anywhere but on a network share outside it (see
+    /// <see cref="TermRest.Core.IO.RealPath.ReachesNetwork"/>).
+    /// </summary>
+    public string? FilesFolder { get; set; }
 }
 
 /// <summary>Turns an editable <see cref="HttpRequestSpec"/> into a <see cref="PreparedRequest"/>.</summary>
@@ -158,7 +167,7 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
             }
         }
 
-        prepared.Body = PrepareBody(spec.Body, prepared, baseDirectory, R);
+        prepared.Body = PrepareBody(spec.Body, prepared, baseDirectory, defaults.FilesFolder, R);
 
         // TLS and transport settings: request settings override workspace defaults.
         prepared.StrictSsl = spec.Settings.StrictSsl ?? defaults.StrictSsl;
@@ -184,14 +193,14 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
                 var own = pinned is { Matches.Count: 0 } && !(origin is not null && uri.Scheme == origin.Scheme && uri.Port == origin.Port
                     && string.Equals(uri.IdnHost, origin.IdnHost, StringComparison.OrdinalIgnoreCase)) ? null : pinned;
                 var warnings = new List<string>();
-                var selection = certificates.Select(uri, own, baseDirectory, ResolveSecret, warnings);
+                var selection = certificates.Select(uri, own, baseDirectory, ResolveSecret, warnings, defaults.FilesFolder);
                 prepared.Warnings.AddRange(warnings.Except(prepared.Warnings));
                 return selection;
             };
 
             if (prepared.Uri is { } target && target.Scheme == Uri.UriSchemeHttps)
             {
-                prepared.ClientCertificate = certificates.Select(target, pinned, baseDirectory, ResolveSecret, prepared.Warnings);
+                prepared.ClientCertificate = certificates.Select(target, pinned, baseDirectory, ResolveSecret, prepared.Warnings, defaults.FilesFolder);
             }
         }
 
@@ -266,6 +275,12 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
             return null;
         }
 
+        if (defaults.FilesFolder is { } folder && RealPath.ReachesNetwork(defaults.CaBundlePath, folder))
+        {
+            warnings.Add($"CA bundle '{defaults.CaBundlePath}' not loaded: {ClientCertificateProvider.OnNetworkShare}");
+            return EmptyTrust;
+        }
+
         try
         {
             // The provider keeps it parsed for the session (a CA bundle can hold hundreds of certificates).
@@ -278,7 +293,12 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
         }
     }
 
-    private static PreparedBody PrepareBody(RequestBody body, PreparedRequest prepared, string baseDirectory, Func<string?, string> resolve)
+    /// <summary>Why a body or form-data file is not sent, and how to send such files.</summary>
+    private static string OutsideFolder(string kind, string path, string where) =>
+        $"{kind} '{path}' {where}, so it is not sent (a collection could otherwise send any of your files): allow files from outside " +
+        "it for this workspace in the full-screen UI (Tools › Settings…), or with --allow-outside-files.";
+
+    private static PreparedBody PrepareBody(RequestBody body, PreparedRequest prepared, string baseDirectory, string? filesFolder, Func<string?, string> resolve)
     {
         if (body.Disabled)
         {
@@ -287,8 +307,48 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
 
         string? explicitType = prepared.GetHeader("Content-Type");
 
-        // A path typed or pasted with spaces around it, as the Body tab finds it.
-        string FilePath(string path) => Path.IsPathRooted(path = path.Trim()) ? path : Path.GetFullPath(Path.Combine(baseDirectory, path));
+        // A path typed or pasted with spaces around it, as the Body tab finds it; with no . or .. left, as it is checked and opened.
+        string FilePath(string path)
+        {
+            try
+            {
+                return Path.GetFullPath(Path.IsPathRooted(path = path.Trim()) ? path : Path.Combine(baseDirectory, path));
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                return path; // no file has that name (a NUL in it)
+            }
+        }
+
+        // A file that is there and, unless any may be sent (see ExecutionDefaults.FilesFolder), in the files' folder, also once
+        // its links are resolved. Nothing outside the folder is looked at: on Windows, looking at \\server\share sends the
+        // user's Windows credentials to that server.
+        string? realFolder = null;
+        bool Sendable(string kind, string path)
+        {
+            if (filesFolder is not null)
+            {
+                if (!RealPath.IsWithin(path, filesFolder))
+                {
+                    prepared.Errors.Add(OutsideFolder(kind, path, "is outside the workspace folder"));
+                    return false;
+                }
+
+                if (!RealPath.IsInside(path, filesFolder, realFolder ??= RealPath.Of(filesFolder) ?? filesFolder))
+                {
+                    prepared.Errors.Add(OutsideFolder(kind, path, "leads outside the workspace folder through a link"));
+                    return false;
+                }
+            }
+
+            if (!File.Exists(path))
+            {
+                prepared.Errors.Add($"{kind} '{path}' does not exist.");
+                return false;
+            }
+
+            return true;
+        }
 
         // As in Postman, an empty body is no body, sent without a Content-Type (some servers refuse an empty JSON body): raw
         // text that is empty once its variables are replaced, a form without an enabled field (with a key), a file body
@@ -341,13 +401,9 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
                         foreach (var src in (field.Src ?? "").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                         {
                             var path = FilePath(resolve(src));
-                            if (File.Exists(path))
+                            if (Sendable("Form-data file", path))
                             {
                                 parts.Add(new MultipartPart { Name = name, FilePath = path, ContentType = type });
-                            }
-                            else
-                            {
-                                prepared.Errors.Add($"Form-data file '{path}' does not exist.");
                             }
                         }
                     }
@@ -376,9 +432,8 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
                 }
 
                 var path = FilePath(source);
-                if (!File.Exists(path))
+                if (!Sendable("Body file", path))
                 {
-                    prepared.Errors.Add($"Body file '{path}' does not exist.");
                     return PreparedBody.None;
                 }
 
