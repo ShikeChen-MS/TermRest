@@ -341,9 +341,10 @@ internal static class PythonWorkerCode
 
             @headers.setter
             def headers(self, value):
-                # As with requests: a dict, or (name, value) pairs, replaces the headers.
+                # As with requests: a dict, any other mapping (requests' CaseInsensitiveDict), or (name, value) pairs
+                # replaces the headers.
                 if not isinstance(value, Headers):
-                    pairs = value.items() if isinstance(value, dict) else value
+                    pairs = value.items() if callable(getattr(value, "items", None)) else value
                     value = Headers([(name, _text(item)) for name, item in pairs], self._writable)
                 self._headers = value
 

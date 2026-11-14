@@ -3320,9 +3320,16 @@ public sealed class MainWindowTests : IDisposable
     [Fact]
     public async Task A_curl_command_pasted_into_a_request_from_history_is_sent_on_its_own()
     {
-        // Not as the request the entry was sent from: its folder's token is not meant for the host the command names.
+        // Not as the request the entry was sent from: its token, and its script that adds another, are not meant for the
+        // host the command names.
         var path = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
         File.WriteAllText(path, File.ReadAllText(path).Replace("\"value\": \"{{token}}\"", "\"value\": \"folder-s3cret\"", StringComparison.Ordinal)); // the Auth folder's
+        var setup = PostmanCollection.Load(path);
+        var node = setup.FindRequest("Auth/Auth inherited from folder")!;
+        var withScript = node.ReadSpec();
+        withScript.Scripts = new ScriptSet("tr.request.headers.set('X-Signature', 'request-s3cret')", "", ScriptLanguage.Python);
+        setup.UpdateRequest(node, withScript);
+        setup.Save();
         await using var server = await LocalEchoServer.StartAsync();
         var state = Path.Combine(_directory, ".state");
         using var ui = new Harness(_directory, runner =>
@@ -3333,13 +3340,16 @@ public sealed class MainWindowTests : IDisposable
         var collection = Assert.Single(ui.Workspace.Collections);
         var request = collection.FindRequest("Auth/Auth inherited from folder")!;
         await ui.Runner.SendAsync(collection, request, request.ReadSpec(), TestContext.Current.CancellationToken);
+        ScriptSet? historyScripts = null, pastedScripts = null;
 
         var screens = Drive(ui, () =>
             {
                 ui.App.InjectKey(Key.F9);
                 ui.Click("/echo/headers"); // its history entry, which takes its auth from the folder
+                historyScripts = ui.Window.Editor.Spec.Scripts;
                 ui.Click("{{baseUrl}}/headers");
                 ui.App.RaisePasteEvent($"curl '{server.BaseUrl}/echo/pasted'");
+                pastedScripts = ui.Window.Editor.Spec.Scripts;
                 ui.App.InjectKey(Key.F5);
             },
             ("200 OK", () => ui.App.RequestStop()),
@@ -3347,6 +3357,8 @@ public sealed class MainWindowTests : IDisposable
 
         Assert.Equal(2, screens.Count);
         OnScreen("Request (imported)", screens[0]);
+        Assert.True(historyScripts!.Has(ScriptPhase.PreRequest));
+        Assert.True(pastedScripts!.IsEmpty);
         var sent = ui.Window.ResponsePane.Exchange!.Request;
         Assert.EndsWith("/echo/pasted", sent.Url, StringComparison.Ordinal);
         Assert.DoesNotContain(sent.Headers, h => h.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase));

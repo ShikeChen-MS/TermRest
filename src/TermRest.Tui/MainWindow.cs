@@ -1866,12 +1866,9 @@ internal sealed class MainWindow : Runnable
         var spec = imported.Spec;
         if (intoCurrent)
         {
-            spec.Description = _editor.Spec.Description;
-            spec.Scripts = _editor.Spec.Scripts;
-            spec.ScriptSettings = _editor.Spec.ScriptSettings;
-
             // Pasted into a request from history, a command is a request of its own, as one imported from the menu: not the
-            // request the entry was sent from, whose folders' auth and scripts are not meant for the host it names.
+            // request the entry was sent from, whose auth and scripts (its own and its folders') are not meant for the host it
+            // names.
             var detach = _node is null && _historyEntry is not null;
             if (detach)
             {
@@ -1879,6 +1876,12 @@ internal sealed class MainWindow : Runnable
                 _historyOrigin = null;
                 _collection = _scratch ??= PostmanCollection.Create("Scratch");
                 _detachedName = imported.SuggestedName;
+            }
+            else
+            {
+                spec.Description = _editor.Spec.Description;
+                spec.Scripts = _editor.Spec.Scripts;
+                spec.ScriptSettings = _editor.Spec.ScriptSettings;
             }
 
             _editor.Replace(spec);

@@ -168,7 +168,7 @@ public sealed class ApiWorkspace
         else if (Directory.Exists(fullPath))
         {
             root = fullPath;
-            if (!Directory.Exists(Path.Combine(fullPath, PostmanFolder)) && V3Names.IsCollectionDirectory(fullPath))
+            if (IsCollectionFolder(fullPath))
             {
                 // A v3 collection folder: open the workspace around it (its settings, environments, certificates).
                 explicitFolder = fullPath;
@@ -297,9 +297,17 @@ public sealed class ApiWorkspace
     {
         var full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
         return File.Exists(full) ? RootForFile(full)
-            : Directory.Exists(full) && !Directory.Exists(Path.Combine(full, PostmanFolder)) && V3Names.IsCollectionDirectory(full) ? V3Names.WorkspaceRootFor(full)
+            : Directory.Exists(full) && IsCollectionFolder(full) ? V3Names.WorkspaceRootFor(full)
             : full;
     }
+
+    /// <summary>
+    /// Whether a folder given on its own is a v3 collection, opened in the workspace around it: a folder with a
+    /// <c>postman</c> folder is a workspace, unless it is in a <c>postman/collections</c> folder (where a collection may have a
+    /// folder of that name).
+    /// </summary>
+    private static bool IsCollectionFolder(string fullPath) =>
+        (V3Names.IsInCollectionsFolder(fullPath) || !Directory.Exists(Path.Combine(fullPath, PostmanFolder))) && V3Names.IsCollectionDirectory(fullPath);
 
     /// <summary>The globals file of the workspace in <paramref name="root"/>, if it has one: the first one found.</summary>
     private static string? FindGlobalsFile(string root)

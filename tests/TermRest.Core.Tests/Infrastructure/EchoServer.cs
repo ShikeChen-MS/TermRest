@@ -92,10 +92,17 @@ public sealed class EchoServer : IAsyncDisposable
         });
 
         // As IIS without "Negotiate Client Certificate" and servers that want one for some paths only: the certificate is
-        // asked for once the request came in.
+        // asked for once the request came in. macOS can't renegotiate: there the request is echoed without one.
         app.Map("/renegotiate", async (HttpContext ctx) =>
         {
-            await ctx.Connection.GetClientCertificateAsync(ctx.RequestAborted);
+            try
+            {
+                await ctx.Connection.GetClientCertificateAsync(ctx.RequestAborted);
+            }
+            catch (PlatformNotSupportedException)
+            {
+            }
+
             await EchoAsync(ctx, clientChains);
         });
         app.Map("/mirror", async (HttpContext ctx) =>

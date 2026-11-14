@@ -98,7 +98,8 @@ internal static class V3Names
         }
     }
 
-    private static bool IsInCollectionsFolder(string directory)
+    /// <summary>Whether <paramref name="directory"/> is in a <c>postman/collections</c> folder, where Postman keeps collections.</summary>
+    public static bool IsInCollectionsFolder(string directory)
     {
         var parent = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory)));
         return parent is not null && string.Equals(Path.GetFileName(parent), CollectionFolders[0], StringComparison.OrdinalIgnoreCase)

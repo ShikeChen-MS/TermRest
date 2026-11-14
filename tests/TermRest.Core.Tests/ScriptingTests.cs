@@ -315,10 +315,13 @@ public class ScriptingTests
         Assert.Null(notJson.Response);
         Assert.StartsWith("The pre-request scripts set the request body to a dict that cannot be sent as JSON: ", notJson.Scripts!.Error!.Message, StringComparison.Ordinal);
 
-        // Headers may be given as with requests: a dict (or pairs) replaces them.
+        // Headers may be given as with requests: a dict (or any other mapping, or pairs) replaces them.
         var headers = await Send("tr.request.headers = {'X-Api-Key': 'k-1', 'X-Count': 2}");
         Assert.True(headers.Scripts!.Succeeded, headers.Scripts.Describe());
         Assert.Equal(("k-1", "2"), (Header(headers, "x-api-key"), Header(headers, "x-count")));
+        var mapping = await Send("import types\ntr.request.headers = types.MappingProxyType({'X-Api-Key': 'k-2'})");
+        Assert.True(mapping.Scripts!.Succeeded, mapping.Scripts.Describe());
+        Assert.Equal("k-2", Header(mapping, "x-api-key"));
 
         // A request the scripts left unusable is not sent, and what they did is kept.
         var broken = await Send("""

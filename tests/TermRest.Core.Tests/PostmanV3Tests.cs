@@ -77,6 +77,25 @@ public class PostmanV3Tests
     }
 
     [Fact]
+    public void A_collection_with_a_folder_named_postman_opens_as_a_collection_of_its_workspace()
+    {
+        var root = TestFiles.NewTempDirectory();
+        var integrations = Path.Combine(root, "postman", "collections", "Integrations");
+        foreach (var folder in (string[])["GitHub", "postman"])
+        {
+            Directory.CreateDirectory(Path.Combine(integrations, folder));
+            File.WriteAllText(Path.Combine(integrations, folder, "Ping.request.yaml"), $"$kind: http-request\nurl: https://{folder.ToLowerInvariant()}.example.com/ping\nmethod: GET\n");
+        }
+
+        var workspace = ApiWorkspace.Open(integrations);
+
+        Assert.Equal(Path.TrimEndingDirectorySeparator(root), Path.TrimEndingDirectorySeparator(workspace.RootPath));
+        Assert.Equal(Path.TrimEndingDirectorySeparator(root), ApiWorkspace.RootFor(integrations));
+        Assert.Equal(["Integrations"], workspace.Collections.Select(c => c.Name));
+        Assert.NotNull(workspace.FindCollection(integrations));
+    }
+
+    [Fact]
     public void A_collection_whose_requests_are_all_in_folders_and_that_has_no_definition_is_loaded()
     {
         // Postman writes no definition for a collection without settings of its own; a folder of other files is no collection.
