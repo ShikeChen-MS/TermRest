@@ -3,20 +3,19 @@ using System.Security.Cryptography;
 namespace TermRest.Core.IO;
 
 /// <summary>
-/// What a file held when TermRest last read or wrote it: its length, last write time and a hash of its content. Tells
-/// whether another program (a <c>git pull</c>, Postman, an editor) changed it since; one that only touched it did not.
+/// What a file held when TermRest last read or wrote it: its length and a hash of its content. Tells whether another
+/// program (a <c>git pull</c>, Postman, an editor) changed it since; one that only touched it did not. The content decides
+/// also when the file's time is the same: a copy that keeps its time (<c>cp -p</c>, an archive) may hold other content.
 /// </summary>
 internal sealed class FileStamp
 {
     private readonly long _length;
     private readonly byte[] _hash;
-    private DateTime _lastWriteTimeUtc;
 
-    public FileStamp(DateTime lastWriteTimeUtc, ReadOnlySpan<byte> content)
+    public FileStamp(ReadOnlySpan<byte> content)
     {
         _length = content.Length;
         _hash = SHA256.HashData(content);
-        _lastWriteTimeUtc = lastWriteTimeUtc;
     }
 
     /// <summary>True when <paramref name="path"/> holds other content now, or cannot be read.</summary>
@@ -30,19 +29,7 @@ internal sealed class FileStamp
                 return true;
             }
 
-            if (File.GetLastWriteTimeUtc(stream.SafeFileHandle) == _lastWriteTimeUtc)
-            {
-                return false;
-            }
-
-            var content = TextFile.ReadAll(stream, path, out var lastWriteTimeUtc);
-            if (!SHA256.HashData(content).AsSpan().SequenceEqual(_hash))
-            {
-                return true;
-            }
-
-            _lastWriteTimeUtc = lastWriteTimeUtc; // only touched: no need to read it again next time
-            return false;
+            return !SHA256.HashData(TextFile.ReadAll(stream, path)).AsSpan().SequenceEqual(_hash);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

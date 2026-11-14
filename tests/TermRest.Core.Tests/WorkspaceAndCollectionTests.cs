@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json.Nodes;
 using TermRest.Core.Certificates;
 using TermRest.Core.Http;
@@ -820,6 +821,46 @@ public class WorkspaceAndCollectionTests
         File.SetLastWriteTimeUtc(collection.FilePath!, DateTime.UtcNow.AddMinutes(2));
         collection.MarkDirty();
         collection.Save();
+    }
+
+    [Fact]
+    public void A_file_replaced_by_one_of_the_same_length_and_time_is_not_saved_over()
+    {
+        // A copy that keeps its time (cp -p, rsync -t, an archive) changes neither the length nor the time of the file.
+        var environment = OpenSampleCopy().Environments[0];
+        var path = environment.FilePath!;
+        var time = File.GetLastWriteTimeUtc(path);
+        var original = File.ReadAllBytes(path);
+        var replaced = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(original).Replace("env-token-123", "env-token-456", StringComparison.Ordinal));
+        Assert.Equal(original.Length, replaced.Length);
+        File.WriteAllBytes(path, replaced);
+        File.SetLastWriteTimeUtc(path, time);
+        environment.SetValue("baseUrl", "http://localhost:5000");
+
+        Assert.Equal([Path.GetFullPath(path)], Assert.Throws<FileChangedException>(() => environment.Save()).Paths);
+        Assert.Equal(replaced, File.ReadAllBytes(path));
+    }
+
+    [Fact]
+    public void An_environment_saved_under_a_name_that_differs_only_in_case_is_as_private_as_its_source()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Skip("Unix file modes only.");
+            return;
+        }
+
+        const UnixFileMode Private = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        var directory = TestFiles.NewTempDirectory();
+        var source = Path.Combine(directory, "dev.postman_environment.json");
+        File.WriteAllText(source, """{ "name": "dev", "values": [ { "key": "token", "value": "a-secret-token", "enabled": true } ] }""");
+        File.SetUnixFileMode(source, Private);
+
+        // On Linux that is another file; on macOS, as on Windows, the same one.
+        var copy = Path.Combine(directory, "DEV.postman_environment.json");
+        PostmanEnvironment.Load(source).Save(copy);
+
+        Assert.Equal(Private, File.GetUnixFileMode(copy));
     }
 
     [Fact]

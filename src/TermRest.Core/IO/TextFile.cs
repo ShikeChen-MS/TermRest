@@ -28,15 +28,15 @@ public static class TextFile
     public static (string Text, TextFileInfo Info) Read(string path)
     {
         using var stream = OpenRead(path);
-        return Decode(path, ReadAll(stream, path, out _));
+        return Decode(path, ReadAll(stream, path));
     }
 
     /// <summary>Like <see cref="Read(string)"/>, and tells what the file held, to find out later whether another program changed it.</summary>
     internal static (string Text, TextFileInfo Info) Read(string path, out FileStamp stamp)
     {
         using var stream = OpenRead(path);
-        var bytes = ReadAll(stream, path, out var lastWriteTimeUtc);
-        stamp = new FileStamp(lastWriteTimeUtc, bytes);
+        var bytes = ReadAll(stream, path);
+        stamp = new FileStamp(bytes);
         return Decode(path, bytes);
     }
 
@@ -47,7 +47,7 @@ public static class TextFile
     /// as /dev/zero or /dev/stdin) and a file over <see cref="MaxSize"/> are refused: reading them would never end, block,
     /// or exhaust memory.
     /// </summary>
-    internal static byte[] ReadAll(FileStream stream, string path, out DateTime lastWriteTimeUtc)
+    internal static byte[] ReadAll(FileStream stream, string path)
     {
         if (!stream.CanSeek)
         {
@@ -60,7 +60,6 @@ public static class TextFile
             throw new IOException($"'{path}' is too large ({length / (1024 * 1024)} MB; TermRest reads files of up to {MaxSize / (1024 * 1024)} MB).");
         }
 
-        lastWriteTimeUtc = File.GetLastWriteTimeUtc(stream.SafeFileHandle);
         var bytes = new byte[length];
         stream.ReadExactly(bytes);
         if (stream.ReadByte() >= 0)
@@ -190,7 +189,6 @@ public static class TextFile
                 }
             }
 
-            var lastWriteTimeUtc = stamp ? File.GetLastWriteTimeUtc(temp) : default; // moving the file keeps it
             written = true;
             if (mode is { } unixMode && !OperatingSystem.IsWindows())
             {
@@ -215,7 +213,7 @@ public static class TextFile
                 }
             }
 
-            return stamp ? new FileStamp(lastWriteTimeUtc, bytes) : null;
+            return stamp ? new FileStamp(bytes) : null;
         }
         finally
         {

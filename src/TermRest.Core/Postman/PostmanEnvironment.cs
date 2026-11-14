@@ -173,8 +173,9 @@ public sealed class PostmanEnvironment
             ? IsYamlPath(path) ? NewYamlFile : TextFileInfo.PostmanDefault
             : FileInfo;
 
-        // A copy saved elsewhere (an imported or converted environment) is as private as the file it was read from.
-        var newFileMode = samePath || FilePath is null ? null : TextFile.CopyMode(FilePath);
+        // A copy saved elsewhere (an imported or converted environment) is as private as the file it was read from; a file
+        // saved over keeps its own permissions. Also when the path differs only in case, which is another file on Linux.
+        var newFileMode = FilePath is null ? null : TextFile.CopyMode(FilePath);
         if (IsYamlPath(path))
         {
             // Only the changed values are rewritten; the rest of the file keeps its exact text.
