@@ -462,6 +462,29 @@ public class CurlImporterTests
     }
 
     [Fact]
+    public void A_cmd_value_that_holds_an_apostrophe_keeps_the_lines_that_follow()
+    {
+        // cmd.exe has no '…': an apostrophe is a character there, where the other shells start a quoted value with it.
+        var result = CurlImporter.Import("curl https://h/x --data foo'bar ^\n  -H X-Test:ok");
+
+        Assert.Equal(ShellDialect.Cmd, result.Dialect);
+        Assert.Equal(("foo'bar", "ok"), (result.Spec.Body.Raw, Header(result.Spec, "X-Test")));
+    }
+
+    [Theory]
+    [InlineData("curl https://h/x -d 'it'\\''s ```\nx'", "it's ```\nx")]
+    [InlineData("curl https://h/x -d 'a ^\nb'", "a ^\nb")]
+    public void A_line_that_ends_inside_a_closed_quoted_value_says_nothing_about_the_shell(string command, string body)
+    {
+        // Read as PowerShell or cmd.exe would read it, the quotes of 'it'\''s fall elsewhere: only a value they leave open
+        // has them try other shells' quoting.
+        var result = CurlImporter.Import(command);
+
+        Assert.Equal(ShellDialect.Posix, result.Dialect);
+        Assert.Equal(body, result.Spec.Body.Raw);
+    }
+
+    [Fact]
     public void Browser_escapes_of_emoji_keep_the_character()
     {
         // Firefox and Chrome escape text one UTF-16 unit at a time: 😀 is \ud83d\ude00. A lone half is still dropped.

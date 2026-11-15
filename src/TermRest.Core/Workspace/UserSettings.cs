@@ -191,8 +191,13 @@ public sealed class UserSettings
         return true;
     }
 
+    /// <summary>
+    /// Whether two workspace folders are the same, for the choices kept for them: on Windows without regard to case, as its
+    /// file systems are; elsewhere by their paths exactly, as on Linux and on a case-sensitive macOS volume work/api and
+    /// work/API are two folders (a repository cloned next to a trusted one must not get its runtimes or approvals).
+    /// </summary>
     private static bool SameFolder(string a, string b) =>
-        string.Equals(NormalizeFolder(a), NormalizeFolder(b), OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+        string.Equals(NormalizeFolder(a), NormalizeFolder(b), OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
 
     private static string NormalizeFolder(string path)
     {

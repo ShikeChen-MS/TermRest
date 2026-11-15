@@ -6,6 +6,7 @@ using TermRest.Core.IO;
 using TermRest.Core.Json;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
+using TermRest.Core.Scripting;
 using TermRest.Core.Tests.Infrastructure;
 using TermRest.Core.Workspace;
 using Xunit;
@@ -249,6 +250,26 @@ public class WorkspaceAndCollectionTests
         Assert.False(other.OutsideFilesAllowed);
         Assert.True(user.AllowOutsideFiles(root, false));
         Assert.Null(user.OutsideFilesAllowed);
+    }
+
+    [Fact]
+    public void Approvals_for_a_workspace_folder_do_not_cover_its_path_in_another_case_outside_windows()
+    {
+        // On a case-sensitive volume (Linux, and macOS volumes formatted so), work/api and work/API are two folders: a
+        // repository cloned next to a trusted one must not get its script runtime, its proxy or files from outside it.
+        var parent = TestFiles.NewTempDirectory();
+        var root = Path.Combine(parent, "api");
+        var otherCase = Path.Combine(parent, "API");
+        const string Proxy = "http://proxy.example:3128";
+        var user = new UserSettings();
+        user.SetScriptRuntime(ScriptLanguage.Python, root, "python3");
+        user.AllowProxy(root, Proxy);
+        user.AllowOutsideFiles(root, true);
+
+        var sameFolder = OperatingSystem.IsWindows();
+        Assert.Equal(sameFolder, user.GetScriptRuntime(ScriptLanguage.Python, otherCase) is not null);
+        Assert.Equal(sameFolder, user.IsProxyAllowed(otherCase, Proxy));
+        Assert.Equal(sameFolder, user.AreOutsideFilesAllowed(otherCase));
     }
 
     [Fact]

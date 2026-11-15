@@ -1,3 +1,5 @@
+using System.Runtime.ExceptionServices;
+
 namespace TermRest.Core.Postman.V3;
 
 /// <summary>File and folder naming rules of the Postman collection format v3 layout.</summary>
@@ -84,18 +86,45 @@ internal static class V3Names
     private static bool HasContent(string directory) =>
         File.Exists(DefinitionPath(directory)) || Directory.EnumerateFiles(directory, "*.request.y*ml").Any(IsRequestFile);
 
-    /// <summary>Whether folders of <paramref name="directory"/> (not hidden ones, nor links) have definitions or requests.</summary>
+    /// <summary>
+    /// Whether folders of <paramref name="directory"/> (not hidden ones, nor links) have definitions or requests. A folder that
+    /// cannot be listed (another user's) may hold them: when no other folder has any, its error is thrown, so that loading
+    /// says why rather than the collection being left out without a word.
+    /// </summary>
     private static bool FoldersHaveContent(string directory, int depth)
     {
-        try
-        {
-            return depth > 0 && Directory.EnumerateDirectories(directory, "*", FolderSearch)
-                .Any(sub => !Path.GetFileName(sub).StartsWith('.') && (HasContent(sub) || FoldersHaveContent(sub, depth - 1)));
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        if (depth <= 0)
         {
             return false;
         }
+
+        Exception? unreadable = null;
+        foreach (var sub in Directory.EnumerateDirectories(directory, "*", FolderSearch))
+        {
+            if (Path.GetFileName(sub).StartsWith('.'))
+            {
+                continue;
+            }
+
+            try
+            {
+                if (HasContent(sub) || FoldersHaveContent(sub, depth - 1))
+                {
+                    return true;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                unreadable ??= ex; // another folder may have them
+            }
+        }
+
+        if (unreadable is not null)
+        {
+            ExceptionDispatchInfo.Throw(unreadable);
+        }
+
+        return false;
     }
 
     /// <summary>Whether <paramref name="directory"/> is in a <c>postman/collections</c> folder, where Postman keeps collections.</summary>
