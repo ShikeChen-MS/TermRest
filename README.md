@@ -771,3 +771,7 @@ Notes:
   - Proxy authentication.
   - Code snippets.
 - **Packaging:** winget, Homebrew, `.deb`/`.rpm`, and signed binaries.
+
+## License
+
+TermRest is released under the [MIT License](LICENSE). Its icon is in [`assets`](assets): `termrest.svg` is the source, and `termrest.ico` and `termrest.png` are drawn from it.

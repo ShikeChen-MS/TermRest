@@ -8,6 +8,7 @@
     <Deterministic>true</Deterministic>
     <Version>0.1.0</Version>
     <Product>TermRest</Product>
+    <Copyright>Copyright (c) 2026 Shike Chen</Copyright>
     <Description>A lightweight, mouse-friendly terminal REST client with Postman-compatible collections.</Description>
     <NeutralLanguage>en</NeutralLanguage>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
