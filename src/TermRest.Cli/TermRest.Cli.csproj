@@ -11,6 +11,11 @@
     <StripSymbols>true</StripSymbols>
     <ServerGarbageCollector>false</ServerGarbageCollector>
     <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <!--
+      The Windows icon of termrest.exe: assets/termrest.svg drawn at 16, 20, 24, 32, 40, 48 and 64 px (32-bit bitmaps) and
+      256 px (PNG), the largest size Windows takes from an icon. Native AOT copies it into the executable.
+    -->
+    <ApplicationIcon>..\..\assets\termrest.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

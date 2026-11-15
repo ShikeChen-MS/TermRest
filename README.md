@@ -186,7 +186,7 @@ A runtime answers in about a millisecond once started; starting takes 0.1–0.3 
 **Choosing the runtimes**
 
 - **In the UI:** *Tools › Scripts…*, one row for each language. Type a command (`python3`, `node`, `bun`, `dotnet`, `pwsh`) or a path, which may be relative to the workspace (`.venv/bin/python`, `.venv\Scripts\python.exe`). A command is looked up in the folders of PATH only (on Windows as `name.exe`, unless the name already ends with a program extension from PATHEXT, such as `.cmd`: `python3.12` is `python3.12.exe`; for pyenv-win's shim, type `python.bat`), never in the workspace or TermRest's own folder. A file picked with *Browse…* in the workspace's own folder is kept as `./name`, a path. Or press **Find**: for Python, it looks for `.venv`, `venv` and `env` in the workspace, then `python3` and `python` on PATH; for JavaScript, `node` and `bun` on PATH; for C#, `dotnet` on PATH, then `~/.dotnet`; for PowerShell, `pwsh` on PATH, then `C:\Program Files\PowerShell\7` on Windows. A Python found in the workspace is filled in without being run, as it may have come with the repository: **Check** runs it and shows the version. Python 3.8, Node.js 18 or Bun 1.1, the .NET 10 SDK, and PowerShell 7.0 or later are needed (for C#, the SDK: a .NET runtime alone cannot build scripts; for PowerShell, `pwsh`: Windows PowerShell 5.1, `powershell.exe`, is too old).
-- **Your choices are kept per workspace folder in your user settings**, never in the workspace. A cloned repository cannot choose a program for TermRest to run.
+- **Your choices are kept per workspace folder in your user settings**, never in the workspace. A cloned repository cannot choose a program for TermRest to run. Outside Windows, a folder is known by its path exactly as written: a path in another case may be another folder (on Linux, and on a macOS volume formatted case-sensitive), so neither these choices nor the proxy and files from outside the folder you allowed carry over to it.
 - **On the command line:** `--python <path>`, `--javascript <path>`, `--csharp <path>` and `--powershell <path>` on `send` and `run`; without them, the UI's choices for that workspace apply. A path there is relative to the current folder, as the command line's other paths are (from a repository's root: `termrest run postman/api.postman_collection.json --python .venv/bin/python`); a command such as `node` is looked up on PATH. `--script-order <languages>` changes the [language order](#languages) for the run. `--no-scripts` turns scripts off.
 - **No runtime chosen for a language:** in the UI, its scripts are skipped and the request is sent; the status line says `⚠ scripts not run` and the *Scripts* tab says which. On the command line, that is an error (so a CI run never passes without its tests): the request is not sent, and the message says to pass `--python`, `--javascript`, `--csharp`, `--powershell` or `--no-scripts`. A missing runtime does not make a request choose another language: the language depends on the scripts only (see below).
 
@@ -771,3 +771,7 @@ Notes:
   - Proxy authentication.
   - Code snippets.
 - **Packaging:** winget, Homebrew, `.deb`/`.rpm`, and signed binaries.
+
+## License
+
+TermRest is released under the [MIT License](LICENSE). Its icon is in [`assets`](assets): `termrest.svg` is the source, and `termrest.ico` and `termrest.png` are drawn from it.

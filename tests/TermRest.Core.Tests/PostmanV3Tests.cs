@@ -157,6 +157,38 @@ public class PostmanV3Tests
     }
 
     /// <summary>Lets the current user list <paramref name="folder"/>, or not.</summary>
+    [Fact]
+    public void A_collection_whose_requests_are_in_a_folder_that_cannot_be_listed_is_a_load_error()
+    {
+        // Without a definition, only its folders tell a folder of postman/collections is a collection: one that cannot be
+        // listed (another user's) may hold its requests, so the collection is not left out without a word.
+        var root = TestFiles.NewTempDirectory();
+        var cart = Directory.CreateDirectory(Path.Combine(root, "postman", "collections", "Shop", "Cart")).FullName;
+        File.WriteAllText(Path.Combine(cart, "Add item.request.yaml"), "$kind: http-request\nurl: https://shop.example.com/cart/items\nmethod: POST\n");
+        Listable(cart, false);
+        try
+        {
+            try
+            {
+                Directory.GetFileSystemEntries(cart);
+                Assert.Skip("This user can list any folder (root).");
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // as for other users
+            }
+
+            var workspace = ApiWorkspace.Open(root);
+
+            Assert.Empty(workspace.Collections);
+            Assert.Contains(workspace.LoadErrors, e => e.StartsWith("Shop: ", StringComparison.Ordinal));
+        }
+        finally
+        {
+            Listable(cart, true);
+        }
+    }
+
     private static void Listable(string folder, bool listable)
     {
         if (OperatingSystem.IsWindows())

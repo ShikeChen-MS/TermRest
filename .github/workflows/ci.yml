@@ -90,7 +90,7 @@ jobs:
           mkdir -p dist
           cp out/termrest* dist/ 2>/dev/null || true
           rm -rf dist/*.pdb dist/*.dbg dist/*.dSYM
-          cp README.md dist/
+          cp README.md LICENSE dist/
           ls -la dist
       - uses: actions/upload-artifact@v4
         with:

@@ -23,7 +23,7 @@ public static class ShellWords
 {
     /// <summary>
     /// Guesses the shell from continuation characters and Windows-only escapes outside quoted values (see
-    /// <see cref="FindMarks"/> and <see cref="HasPowerShellContinuation"/>); defaults to POSIX.
+    /// <see cref="FindMarks"/>, <see cref="HasPowerShellContinuation"/> and <see cref="HasCmdContinuation"/>); defaults to POSIX.
     /// </summary>
     public static ShellDialect Detect(string text)
     {
@@ -43,9 +43,19 @@ public static class ShellWords
             return ShellDialect.Posix;
         }
 
-        if (HasPowerShellContinuation(text))
+        // A quoted value left open may be one another shell closes, or never opens: PowerShell's "…" ends at the quote after
+        // a \ ("C:\temp\"), and cmd.exe has no '…' (foo'bar). A line continuation outside that shell's quoted values tells.
+        if (marks.Unclosed)
         {
-            return ShellDialect.PowerShell;
+            if (HasPowerShellContinuation(text))
+            {
+                return ShellDialect.PowerShell;
+            }
+
+            if (HasCmdContinuation(text))
+            {
+                return ShellDialect.Cmd;
+            }
         }
 
         var start = text.TrimStart();
@@ -80,10 +90,11 @@ public static class ShellWords
     /// <c>curl ^"https://…^"</c>), outside quoted values, which say nothing about the shell: '…' (PowerShell's '' inside one
     /// ends it and starts another), $'…' (where \ escapes the next character) and "…" (where \ and ` do). Outside them, \, ^
     /// and ` escape the next character, so \' and ^" start no quoted value, and a # that starts a word starts a comment.
+    /// Also whether a quoted value is left open, as the text ends before its closing quote.
     /// </summary>
-    private static (bool Backtick, bool Caret, bool Backslash, bool CaretQuote) FindMarks(string text)
+    private static (bool Backtick, bool Caret, bool Backslash, bool CaretQuote, bool Unclosed) FindMarks(string text)
     {
-        bool backtick = false, caret = false, backslash = false, caretQuote = false;
+        bool backtick = false, caret = false, backslash = false, caretQuote = false, unclosed = false;
         for (var i = 0; i < text.Length; i++)
         {
             var wordStart = i == 0 || IsBlank(text[i - 1]);
@@ -102,12 +113,15 @@ public static class ShellWords
                     break;
                 case '\'':
                     i = QuotedEnd(text, i + 1, '\'', "");
+                    unclosed |= i >= text.Length;
                     break;
                 case '$' when i + 1 < text.Length && text[i + 1] == '\'':
                     i = QuotedEnd(text, i + 2, '\'', "\\");
+                    unclosed |= i >= text.Length;
                     break;
                 case '"':
                     i = QuotedEnd(text, i + 1, '"', "\\`");
+                    unclosed |= i >= text.Length;
                     break;
                 case '#' when wordStart:
                     while (i + 1 < text.Length && text[i + 1] != '\n')
@@ -119,7 +133,7 @@ public static class ShellWords
             }
         }
 
-        return (backtick, caret, backslash, caretQuote);
+        return (backtick, caret, backslash, caretQuote, unclosed);
     }
 
     /// <summary>Where the quoted value whose text starts at <paramref name="i"/> ends: its closing quote, or the end of the text.</summary>
@@ -168,6 +182,33 @@ public static class ShellWords
                     }
 
                     break;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a ^ ends a line outside quoted values as cmd.exe reads them: only "…", in which ^ is a character. An apostrophe
+    /// is a character there too (foo'bar), where <see cref="FindMarks"/> starts a quoted value that hides the ^ ending a line.
+    /// </summary>
+    private static bool HasCmdContinuation(string text)
+    {
+        var quoted = false;
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '"')
+            {
+                quoted = !quoted;
+            }
+            else if (text[i] == '^' && !quoted)
+            {
+                if (NewlineLength(text, i + 1) > 0)
+                {
+                    return true;
+                }
+
+                i++;
             }
         }
 
