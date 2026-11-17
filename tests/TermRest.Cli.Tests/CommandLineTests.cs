@@ -788,6 +788,41 @@ public sealed class CommandLineTests
     }
 
     [Fact]
+    public async Task Send_filter_prints_the_values_a_jsonpath_query_selects()
+    {
+        await using var server = await TestServer.StartAsync();
+        var directory = TestFiles.NewTempDirectory();
+        var collection = WriteCollection(directory, "Api",
+        [
+            ("Login", "GET", server.BaseUrl + "/token"),
+            ("User", "GET", server.BaseUrl + "/utf8"),
+            ("Image", "GET", server.BaseUrl + "/bytes"),
+        ]);
+        var file = Path.Combine(directory, "type.json");
+
+        var pretty = await Termrest.RunAsync(["send", collection, "Login", "--filter", "$[?@ == 'Bearer' || @ > 3000]", "--no-history"]);
+        var compact = await Termrest.RunAsync(["send", collection, "User", "--filter", "$.name", "--raw", "--no-history"]);
+        var saved = await Termrest.RunAsync(["send", collection, "Login", "--filter", "$.token_type", "-o", file, "--no-history"]);
+        var binary = await Termrest.RunAsync(["send", collection, "Image", "--filter", "$", "--no-history"]);
+        var invalid = await Termrest.RunAsync(["send", collection, "Login", "--filter", "$.a[", "--no-history"]);
+
+        Assert.True(pretty.ExitCode == 0, pretty.ToString());
+        Assert.Equal("[\n  \"Bearer\",\n  3600\n]\n", pretty.Text.ReplaceLineEndings("\n"));
+        Assert.Equal("[\"" + "Zoë – 東京 ✓" + "\"]\n", compact.Text.ReplaceLineEndings("\n"));
+        Assert.True(saved.ExitCode == 0, saved.ToString());
+        Assert.Empty(saved.Output);
+        Assert.Equal("[\n  \"Bearer\"\n]\n", File.ReadAllText(file));
+        Assert.Contains("Saved 1 value to " + file, saved.Error, StringComparison.Ordinal);
+        Assert.True(binary.ExitCode == 1, binary.ToString());
+        Assert.Contains("error: --filter: The body is binary, not JSON.", binary.Error, StringComparison.Ordinal);
+
+        // A query that is not JSONPath is a usage error: the request is not sent.
+        Assert.True(invalid.ExitCode == 2, invalid.ToString());
+        Assert.Contains("--filter: The query ends where", invalid.Error, StringComparison.Ordinal);
+        Assert.Equal(4, server.Requests);
+    }
+
+    [Fact]
     public async Task Send_curl_prints_no_command_that_curl_would_send_differently()
     {
         var directory = TestFiles.NewTempDirectory();

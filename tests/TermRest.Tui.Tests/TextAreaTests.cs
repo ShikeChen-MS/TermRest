@@ -5,13 +5,16 @@ using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Terminal.Gui.App;
+using Terminal.Gui.Drawing;
 using Terminal.Gui.Drivers;
 using Terminal.Gui.Input;
 using Terminal.Gui.Testing;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
+using TermRest.Tui.Theming;
 using TermRest.Tui.Views;
 using Xunit;
+using Attribute = Terminal.Gui.Drawing.Attribute;
 
 namespace TermRest.Tui.Tests;
 
@@ -225,6 +228,129 @@ public sealed class TextAreaTests
 
         Assert.True(area.Viewport.X > 999_000, $"scrolled to {area.Viewport.X}");
         Assert.True(watch.Elapsed < TimeSpan.FromSeconds(4), $"a redraw took {watch.Elapsed}"); // ~0.3 s; 11 s when the short lines were cleared from where they end
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Read_only_text_is_colored_and_wrapped_lines_keep_their_colors(bool wrap)
+    {
+        using var screen = new Screen();
+        var area = screen.Show(
+            new TextArea { X = 1, Y = 1, Width = wrap ? 22 : 50, Height = 8, ReadOnly = true, WordWrap = wrap, SyntaxLanguage = "json" },
+            "{\n  \"name\": \"one two three four five\",\n  \"count\": 12\n}");
+        AssertColors();
+        if (wrap)
+        {
+            area.Width = 17; // wrapped again, at other places
+            AssertColors();
+        }
+
+        void AssertColors()
+        {
+            screen.App.LayoutAndDraw(forceRedraw: true);
+            var palette = ThemeCatalog.Current.Palette;
+            Assert.Equal(palette.SyntaxVariable, CellAttribute(screen, area, "\"name\"").Foreground);
+            Assert.Equal(palette.SyntaxString, CellAttribute(screen, area, "five").Foreground); // on a row after the string's start
+            Assert.Equal(palette.SyntaxNumber, CellAttribute(screen, area, "12").Foreground);
+            Assert.Equal(area.GetAttributeForRole(VisualRole.ReadOnly), CellAttribute(screen, area, "{"));
+        }
+    }
+
+    [Fact]
+    public void Coloring_a_large_text_whose_words_wrap_is_quick_down_to_its_end()
+    {
+        using var screen = new Screen(120, 40);
+        var area = screen.Show(new TextArea { ReadOnly = true, WordWrap = true, SyntaxLanguage = "json" }, Json(1_000_000));
+        var watch = Stopwatch.StartNew();
+        area.MoveEnd();
+        screen.App.LayoutAndDraw(forceRedraw: true);
+        watch.Stop();
+
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(4), $"a redraw took {watch.Elapsed}");
+        Assert.Equal(ThemeCatalog.Current.Palette.SyntaxVariable, CellAttribute(screen, area, "\"active\"").Foreground);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Find_highlights_each_match_and_selects_one_in_turn_across_wrapped_rows(bool wrap)
+    {
+        using var screen = new Screen();
+        var area = screen.Show(new TextArea { X = 1, Y = 1, Width = wrap ? 11 : 40, Height = 8, ReadOnly = true, WordWrap = wrap },
+            "abcdefghijklmnopqrstuvwxyz\nHIJKLM hijklm");
+        area.Find("hijklm", matchCase: false);
+        var first = (area.MatchCount, area.CurrentMatch, area.SelectedText, Marks());
+        var spans = area.SelectionStartRow != area.CurrentRow; // wrapped: the match goes on to the next row
+        if (wrap)
+        {
+            area.Width = 9; // wrapped again, at other places
+        }
+
+        area.SelectNextMatch();
+        var second = (area.CurrentMatch, area.SelectedText, Marks());
+        area.SelectNextMatch(backwards: true);
+        area.SelectNextMatch(backwards: true);
+        var last = (area.CurrentMatch, area.SelectedText);
+        area.Find("HIJKLM", matchCase: true);
+        var matchCase = (area.MatchCount, area.CurrentMatch, area.SelectedText);
+
+        Assert.Equal((3, 0, "hijklm", (Selected: 6, Highlighted: 12)), first);
+        Assert.Equal(wrap, spans);
+        Assert.Equal((1, "HIJKLM", (6, 12)), second);
+        Assert.Equal((2, "hijklm"), last); // round from the first to the last
+        Assert.Equal((1, 0, "HIJKLM"), matchCase);
+
+        // The cells the selected match and the other matches cover.
+        (int Selected, int Highlighted) Marks()
+        {
+            screen.App.LayoutAndDraw(forceRedraw: true);
+            var contents = screen.App.Driver!.Contents!;
+            var frame = area.FrameToScreen();
+            var (selected, highlighted) = (area.GetAttributeForRole(VisualRole.Active), ThemeCatalog.Current.Palette.Warning);
+            var marks = (Selected: 0, Highlighted: 0);
+            for (var y = frame.Top; y < frame.Bottom; y++)
+            {
+                for (var x = frame.Left; x < frame.Right; x++)
+                {
+                    var attribute = contents[y, x].Attribute!.Value;
+                    if (attribute.Background == selected.Background && attribute.Foreground == selected.Foreground)
+                    {
+                        marks.Selected++;
+                    }
+                    else if (attribute.Background == highlighted)
+                    {
+                        marks.Highlighted++;
+                    }
+                }
+            }
+
+            return marks;
+        }
+    }
+
+    /// <summary>The colors of the first cell of <paramref name="text"/> where the view shows it.</summary>
+    private static Attribute CellAttribute(Screen screen, View view, string text)
+    {
+        var contents = screen.App.Driver!.Contents!;
+        var frame = view.FrameToScreen();
+        for (var y = frame.Top; y < frame.Bottom; y++)
+        {
+            var row = new StringBuilder();
+            for (var x = frame.Left; x < frame.Right; x++)
+            {
+                row.Append(contents[y, x].Grapheme);
+            }
+
+            var at = row.ToString().IndexOf(text, StringComparison.Ordinal);
+            if (at >= 0)
+            {
+                return contents[y, frame.Left + at].Attribute!.Value;
+            }
+        }
+
+        Assert.Fail($"'{text}' is not shown:\n{screen.App.Driver}");
+        return default;
     }
 
     [Fact]

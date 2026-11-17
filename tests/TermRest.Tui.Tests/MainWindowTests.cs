@@ -3,6 +3,7 @@ using Terminal.Gui.App;
 using Terminal.Gui.Drivers;
 using Terminal.Gui.Input;
 using Terminal.Gui.Testing;
+using TermRest.Core.Http;
 using TermRest.Core.Model;
 using TermRest.Core.Postman;
 using TermRest.Core.Recording;
@@ -165,6 +166,54 @@ public sealed class MainWindowTests : IDisposable
         Assert.Equal(["foo", "source", "debug", "page"], spec.QueryParams.Select(q => q.Key));
         Assert.False(spec.QueryParams[2].Enabled);
         Assert.Contains("Saved", ui.Window.StatusMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Ctrl_F_finds_in_the_response_from_any_field_and_F3_goes_to_the_next_match()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.Window.ResponsePane.ShowExchange(new HttpExchange(new PreparedRequest { Method = "GET", Url = "https://api.example.com/x" })
+        {
+            Response = new ResponseSnapshot { StatusCode = 200, ReasonPhrase = "OK", ContentType = "application/json", Body = "{\"a\":\"xy\",\"b\":\"xy\"}"u8.ToArray() },
+        });
+
+        ui.App.InjectKey(Key.L.WithCtrl); // in the URL bar, where Ctrl+F moved the cursor right
+        ui.App.InjectKey(Key.F.WithCtrl);
+        ui.Type("xy");
+        var found = (ui.Window.Editor.Spec.Url, ui.Window.ResponsePane.FindStatus);
+        ui.App.InjectKey(Key.F3);
+        var next = ui.Window.ResponsePane.FindStatus;
+        ui.App.InjectKey(Key.F3.WithShift);
+        var previous = ui.Window.ResponsePane.FindStatus;
+        ui.App.InjectKey(Key.Esc);
+        var screen = ui.Screen();
+        ui.App.InjectKey(Key.S.WithCtrl); // nothing left unsaved, whatever the keys did
+        ui.App.End(token!);
+
+        Assert.Equal(("{{baseUrl}}/get?foo=bar&source=termrest", "1 of 2"), found);
+        Assert.Equal("2 of 2", next);
+        Assert.Equal("1 of 2", previous);
+        Assert.DoesNotContain("Match case", screen, StringComparison.Ordinal); // Esc closed the find bar
+    }
+
+    [Fact]
+    public void A_raw_body_is_colored_in_the_language_chosen_for_it()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+
+        ui.Click("POST POST JSON");
+        var json = ui.Window.Editor.RawBodySyntax;
+        ui.Click("Body");
+        ui.Click("XML");
+        var xml = ui.Window.Editor.RawBodySyntax;
+        ui.Click("Text");
+        var text = ui.Window.Editor.RawBodySyntax;
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        Assert.Equal(("json", "xml", null), (json, xml, text));
     }
 
     [Fact]
@@ -1807,10 +1856,10 @@ public sealed class MainWindowTests : IDisposable
 
         // Each column starts at the same place on every row (a message box would center every line on its own).
         int Column(params string[] texts) => Assert.Single(texts.Select(t => At(screen, t).X).Distinct());
-        var keys = Column("F5, Ctrl+Enter", "Esc ", "F2 ", "Insert ", "F8 ");
-        var actions = Column("Send (again to cancel)", "Cancel a running request", "Rename tree item", "Add a table row", "Client certificates");
-        var moreKeys = Column("F9 ", "F12  ", "Tab, Shift+Tab", "←, → (tab row)", "Shift+F10", "Ctrl+L");
-        var moreActions = Column("Collections ⇄ History", "Start / stop recording", "Next / previous field", "Previous / next tab", "Focus the URL bar");
+        var keys = Column("F5, Ctrl+Enter", "Esc ", "F2 ", "Insert ", "F8 ", "F9 ");
+        var actions = Column("Send (again to cancel)", "Cancel a running request", "Rename tree item", "Add a table row", "Client certificates", "Collections ⇄ History");
+        var moreKeys = Column("F12  ", "Tab, Shift+Tab", "←, → (tab row)", "Shift+F10", "Ctrl+L", "Ctrl+F ", "F3, Shift+F3");
+        var moreActions = Column("Start / stop recording", "Next / previous field", "Previous / next tab", "Focus the URL bar", "Find in the response", "Next / previous match");
         Assert.True(keys < actions && actions < moreKeys && moreKeys < moreActions, screen);
         Assert.Equal(At(screen, "Esc ").Y + 1, At(screen, "Ctrl+S ").Y);
         OnScreen("Right-click the tree or the history for actions", screen);
@@ -1822,7 +1871,7 @@ public sealed class MainWindowTests : IDisposable
         var wide = MainWindow.KeysHelp(120).Split('\n');
         var narrow = MainWindow.KeysHelp(80).Split('\n');
 
-        Assert.Equal(wide.Length + 9, narrow.Length);
+        Assert.Equal(wide.Length + 10, narrow.Length);
         Assert.Contains("  F12             Start / stop recording", narrow);
         Assert.All(narrow.TakeWhile(l => l.Length > 0), l => Assert.True(l.Length <= 60, l));
         Assert.All(wide, l => Assert.True(l.Length <= 92, l));

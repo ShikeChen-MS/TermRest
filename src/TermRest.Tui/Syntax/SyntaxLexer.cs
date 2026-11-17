@@ -76,13 +76,19 @@ internal abstract class SyntaxLexer
     [ThreadStatic]
     private static int _nesting;
 
-    /// <summary>The lexer of a script language (<see cref="ScriptLanguage"/>), or null for plain text.</summary>
+    /// <summary>
+    /// The lexer of a language: a script language (<see cref="ScriptLanguage"/>), or a body's (json, xml, html, javascript);
+    /// null for plain text.
+    /// </summary>
     public static SyntaxLexer? For(string? language) => language switch
     {
         ScriptLanguage.Python => PythonLexer.Instance,
         ScriptLanguage.JavaScript => JavaScriptLexer.Instance,
         ScriptLanguage.CSharp => CSharpLexer.Instance,
         ScriptLanguage.PowerShell => PowerShellLexer.Instance,
+        "json" => JsonLexer.Instance,
+        "xml" => MarkupLexer.Xml,
+        "html" => MarkupLexer.Html,
         _ => null,
     };
 

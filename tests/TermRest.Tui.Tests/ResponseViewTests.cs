@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 using Terminal.Gui.App;
 using Terminal.Gui.Drivers;
+using Terminal.Gui.Input;
 using Terminal.Gui.Testing;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
@@ -266,6 +267,104 @@ public sealed class ResponseViewTests : IDisposable
         Assert.Equal("No TLS session was established.", _view.TlsText);
         Assert.StartsWith("No scripts ran for this request.", _view.ScriptsText, StringComparison.Ordinal);
         Assert.Contains("\nAuth: No auth\nClient certificate: none\nSSL verification: on · Redirects: follow\n", _view.TimelineText, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("application/json", "{\"a\":1}", "json")]
+    [InlineData("application/problem+json; charset=utf-8", "{\"a\":1}", "json")]
+    [InlineData("text/plain", " [1, 2]", "json")]
+    [InlineData("application/xml", "<a/>", "xml")]
+    [InlineData("text/plain", "<?xml version=\"1.0\"?><a/>", "xml")]
+    [InlineData("text/html; charset=utf-8", "<p>hi</p>", "html")]
+    [InlineData("", "<!DOCTYPE html><p>hi</p>", "html")]
+    [InlineData("application/javascript", "let a = 1;", "javascript")]
+    [InlineData("text/plain", "hello", null)]
+    [InlineData("application/octet-stream", "\0\u0001", null)]
+    public void A_body_is_colored_in_the_language_it_is_written_in(string contentType, string body, string? language)
+    {
+        _view.ShowExchange(Exchange(Encoding.UTF8.GetBytes(body), contentType));
+
+        Assert.Equal(language, _view.BodySyntax);
+    }
+
+    [Fact]
+    public void A_filter_shows_the_values_its_query_selects_in_each_response_until_it_is_closed()
+    {
+        _view.ShowExchange(Exchange("{\"items\":[{\"id\":1,\"name\":\"a\"},{\"id\":2,\"name\":\"b\"}]}"u8.ToArray()));
+        Click("Filter");
+        Type("$.items[*].id");
+        var filtered = (_view.BodyText, _view.BodySyntax, _view.FilterStatus);
+        Type("["); // not JSONPath while it is typed
+        var typing = (_view.BodyText, _view.FilterStatus);
+        _app.InjectKey(Key.Backspace);
+        _view.ShowExchange(Exchange("{\"items\":[{\"id\":3}]}"u8.ToArray()));
+        var next = (_view.BodyText, _view.FilterStatus);
+        Click("Pretty: on");
+        var compact = _view.BodyText;
+        _view.ShowExchange(Exchange("<a/>"u8.ToArray(), "application/xml"));
+        var xml = (_view.BodyText, _view.BodySyntax, _view.FilterStatus);
+        Click("✕");
+
+        Assert.Equal(("[\n  1,\n  2\n]", "json", "2 values"), filtered);
+        Assert.Equal("[\n  1,\n  2\n]", typing.BodyText);
+        Assert.StartsWith("✗ The query ends where", typing.FilterStatus, StringComparison.Ordinal);
+        Assert.Equal(("[\n  3\n]", "1 value"), next);
+        Assert.Equal("[3]", compact);
+        Assert.Equal(("<a/>", "xml", "✗ The body is not JSON: line 1, byte 1."), xml);
+        Assert.Equal("<a/>", _view.BodyText); // closed: the body as it is
+    }
+
+    [Fact]
+    public void A_large_body_is_filtered_in_the_background_and_the_values_it_selects_copied()
+    {
+        _view.ShowExchange(Exchange(Items(3_000_000)));
+        RunUntil(() => _view.BodyText != "Formatting…");
+        _view.SetFilter("$[?@.id < 2].name");
+        var placeholder = _view.BodyText;
+        RunUntil(() => _view.BodyText != placeholder);
+        Click("Copy");
+        RunUntil(() => _notices.Count > 1);
+
+        Assert.Equal("Filtering…", placeholder);
+        Assert.Equal("[\n  \"Item 0\",\n  \"Item 1\"\n]", _view.BodyText);
+        Assert.Equal("2 values", _view.FilterStatus);
+        Assert.Equal(["Copying the values the filter selects…", "The values the filter selects copied to the clipboard."], _notices);
+        Assert.Equal("[\n  \"Item 0\",\n  \"Item 1\"\n]", _app.Clipboard!.GetClipboardData());
+    }
+
+    [Fact]
+    public void Find_selects_each_match_in_the_tab_shown_in_turn()
+    {
+        _view.ShowExchange(Exchange("[{\"name\":\"Alpha\"},{\"name\":\"alpha beta\"},{\"name\":\"ALPHA\"}]"u8.ToArray()));
+        _view.Find("alpha");
+        var steps = new List<string> { _view.FindStatus };
+        foreach (var key in new[] { Key.Enter, Key.Enter, Key.Enter, Key.Enter.WithShift })
+        {
+            _app.InjectKey(key);
+            steps.Add(_view.FindStatus);
+        }
+
+        _view.Find("alpha", matchCase: true);
+        steps.Add(_view.FindStatus);
+        Click("Headers");
+        steps.Add(_view.FindStatus);
+        Click("Timeline");
+        steps.Add(_view.FindStatus);
+        _view.Find("items");
+        steps.Add(_view.FindStatus);
+        _app.InjectKey(Key.Esc);
+        _app.LayoutAndDraw(forceRedraw: true);
+
+        Assert.Equal(["1 of 3", "2 of 3", "3 of 3", "1 of 3", "3 of 3", "1 of 1", "Not in this tab", "No matches", "1 of 1"], steps);
+        Assert.DoesNotContain("Match case", _app.Driver!.ToString(), StringComparison.Ordinal); // Esc closed the find bar
+    }
+
+    private void Type(string text)
+    {
+        foreach (var c in text)
+        {
+            _app.InjectKey(new Key(c));
+        }
     }
 
     public void Dispose()

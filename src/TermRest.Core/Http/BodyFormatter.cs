@@ -27,9 +27,13 @@ public static class BodyFormatter
 
     public static bool IsHtml(string? contentType) => SubtypeHasWord(contentType, "html", "xhtml");
 
-    /// <summary>A short language label for the body (json, xml, html, text, binary).</summary>
+    /// <summary>A short language label for the body (json, xml, html, javascript, text, binary).</summary>
     public static string Language(byte[] body, string? contentType) =>
-        IsJson(contentType) ? "json" : IsHtml(contentType) ? "html" : IsXml(contentType) ? "xml" : LooksLikeText(body, contentType) ? "text" : "binary";
+        IsJson(contentType) ? "json"
+        : IsHtml(contentType) ? "html"
+        : IsXml(contentType) ? "xml"
+        : SubtypeHasWord(contentType, "javascript", "ecmascript") ? "javascript"
+        : LooksLikeText(body, contentType) ? "text" : "binary";
 
     /// <summary>Whether a body is shown as text: its Content-Type declares text, or no NUL byte is near its start.</summary>
     public static bool LooksLikeText(byte[] body, string? contentType) => IsTextType(contentType) || !HasNulNearStart(body);
