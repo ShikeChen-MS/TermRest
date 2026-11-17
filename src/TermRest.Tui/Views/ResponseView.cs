@@ -5,12 +5,16 @@ using Terminal.Gui.Text;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using TermRest.Core.Http;
+using TermRest.Core.Json;
 using TermRest.Tui.Dialogs;
 using TermRest.Tui.Theming;
 
 namespace TermRest.Tui.Views;
 
-/// <summary>Response pane: status line plus Body / Headers / Timeline / TLS tabs.</summary>
+/// <summary>
+/// Response pane: status line plus Body / Headers / Timeline / TLS / Scripts tabs. The body is colored as its type says,
+/// can be filtered with JSONPath, and Find (Ctrl+F) looks for text in the tab shown.
+/// </summary>
 internal sealed class ResponseView : View
 {
     /// <summary>
@@ -21,6 +25,9 @@ internal sealed class ResponseView : View
 
     /// <summary>Bodies of this many bytes or more are formatted (decoded, pretty printed) in the background.</summary>
     private const int BackgroundSize = 1_048_576;
+
+    /// <summary>A filter's values are written up to this many bytes (of UTF-8): the body tab shows their start, Copy all of them.</summary>
+    internal const long MaxFilteredBytes = 16 * 1024 * 1024;
 
     /// <summary>The Timeline tab shows this many characters of a request's body at most.</summary>
     private const int TimelineBodyLength = 4000;
@@ -43,10 +50,21 @@ internal sealed class ResponseView : View
     private readonly TextArea _timeline;
     private readonly TextArea _tls;
     private readonly TextArea _scripts;
+    private readonly View _filterRow;
+    private readonly TextField _filterField;
+    private readonly Label _filterStatus;
+    private readonly View _findBar;
+    private readonly TextField _findField;
+    private readonly CheckBox _matchCase;
+    private readonly Label _findCount;
     private HttpExchange? _exchange;
     private bool _fromHistory; // the exchange shown came from the history: its body as the history keeps it
     private bool _prettyOn = true;
     private int _bodyVersion; // a body formatted in the background is shown only if no other body replaced it meanwhile
+    private CancellationTokenSource? _rendering; // the body formatted or filtered in the background, stopped when replaced
+    private JsonPath? _filter; // the query the body is filtered with, kept for the responses that follow
+    private bool _filterInvalid; // the query typed is not valid JSONPath: the filter row says why
+    private TextArea? _findTarget; // the text of the tab that Find looks in
     private bool _disposed;
 
     public ResponseView()
@@ -77,8 +95,20 @@ internal sealed class ResponseView : View
         copy.Accepted += (_, _) => CopyBody();
         var save = new Button { Text = "Save as…", X = Pos.Right(copy) + 2, Y = 0, NoDecorations = true, ShadowStyle = null };
         save.Accepted += (_, _) => SaveBody();
+        var filter = new Button { Text = "Filter", X = Pos.Right(save) + 2, Y = 0, NoDecorations = true, ShadowStyle = null };
+        filter.Accepted += (_, _) => ToggleFilter();
         _body = new TextArea { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(), ReadOnly = true };
-        _bodyTab.Add(_pretty, _wrap, copy, save, _body);
+
+        // JSONPath: the body shows the values the query selects, as a JSON array.
+        _filterRow = new View { X = 0, Y = 1, Width = Dim.Fill(), Height = 1, CanFocus = true, Visible = false };
+        var filterLabel = new Label { Text = "JSONPath:", X = 0, Y = 0 };
+        _filterField = new TextField { X = Pos.Right(filterLabel) + 1, Y = 0, Width = Dim.Percent(45) };
+        _filterField.TextChanged += (_, _) => FilterChanged();
+        _filterStatus = new Label { HotKeySpecifier = Ui.NoHotKey, X = Pos.Right(_filterField) + 1, Y = 0, Width = Dim.Fill(3), Text = "" };
+        var closeFilter = new Button { Text = "✕", X = Pos.AnchorEnd(2), Y = 0, NoDecorations = true, ShadowStyle = null };
+        closeFilter.Accepted += (_, _) => CloseFilter();
+        _filterRow.Add(filterLabel, _filterField, _filterStatus, closeFilter);
+        _bodyTab.Add(_pretty, _wrap, copy, save, filter, _filterRow, _body);
 
         var headersTab = new View { Title = "Headers", Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
         _headers = new TableView { Width = Dim.Fill(), Height = Dim.Fill(), FullRowSelect = true };
@@ -107,7 +137,51 @@ internal sealed class ResponseView : View
         scriptsTab.Add(_scripts);
 
         _tabs.AddTabs(_bodyTab, headersTab, timelineTab, tlsTab, scriptsTab);
-        Add(_status, _tabs);
+
+        // Find (Ctrl+F): in the text of the tab shown.
+        _findBar = new View { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = true, Visible = false };
+        var findLabel = new Label { Text = "Find:", X = 0, Y = 0 };
+        _findField = new TextField { X = Pos.Right(findLabel) + 1, Y = 0, Width = Dim.Fill(38) };
+        _findField.TextChanged += (_, _) => FindChanged();
+        var previous = new Button { Text = "▲", X = Pos.Right(_findField) + 1, Y = 0, NoDecorations = true, ShadowStyle = null };
+        previous.Accepted += (_, _) => FindNext(backwards: true);
+        var next = new Button { Text = "▼", X = Pos.Right(previous) + 1, Y = 0, NoDecorations = true, ShadowStyle = null };
+        next.Accepted += (_, _) => FindNext();
+        _matchCase = new CheckBox { Text = "Match case", X = Pos.Right(next) + 2, Y = 0 };
+        _matchCase.ValueChanged += (_, _) => FindChanged();
+        _findCount = new Label { HotKeySpecifier = Ui.NoHotKey, X = Pos.Right(_matchCase) + 2, Y = 0, Width = Dim.Fill(3), Text = "" };
+        var closeFind = new Button { Text = "✕", X = Pos.AnchorEnd(2), Y = 0, NoDecorations = true, ShadowStyle = null };
+        closeFind.Accepted += (_, _) => CloseFind();
+        _findBar.Add(findLabel, _findField, previous, next, _matchCase, _findCount, closeFind);
+
+        // Enter and Shift+Enter go to the next and previous match (Esc closes the bar: see OnKeyDown).
+        _findField.KeyDown += (_, key) =>
+        {
+            if (key == Key.Enter || key == Key.Enter.WithShift)
+            {
+                FindNext(backwards: key.IsShift);
+                key.Handled = true;
+            }
+        };
+        _tabs.ValueChanged += (_, _) =>
+        {
+            if (_findBar.Visible)
+            {
+                FindIn(SearchedArea());
+            }
+        };
+        foreach (var area in new[] { _body, _timeline, _tls, _scripts })
+        {
+            area.MatchesChanged += (sender, _) =>
+            {
+                if (sender == _findTarget)
+                {
+                    ShowFindCount();
+                }
+            };
+        }
+
+        Add(_status, _tabs, _findBar);
         SetHeaders([]);
         _scripts.SetText(NoScripts);
     }
@@ -139,6 +213,15 @@ internal sealed class ResponseView : View
     /// <summary>The TLS tab's text (for tests).</summary>
     internal string TlsText => _tls.GetText();
 
+    /// <summary>The language the Body tab colors its text in (for tests).</summary>
+    internal string? BodySyntax => _body.SyntaxLanguage;
+
+    /// <summary>What the filter row says: how many values the query selects, or why it can't (for tests).</summary>
+    internal string FilterStatus => _filterStatus.Text;
+
+    /// <summary>What the find bar says: which match is selected, of how many (for tests).</summary>
+    internal string FindStatus => _findCount.Text;
+
     public void Clear()
     {
         _exchange = null;
@@ -146,6 +229,7 @@ internal sealed class ResponseView : View
         _status.Text = "No response yet. Press F5 (or Enter in the URL bar) to send.";
         _status.SchemeName = null;
         ShowBody("");
+        SetFilterStatus("", error: false);
         _timeline.SetText("");
         _tls.SetText("");
         _scripts.SetText(NoScripts);
@@ -184,6 +268,7 @@ internal sealed class ResponseView : View
 
             // When a script stopped the request, its traceback is what the user needs to see.
             ShowBody(exchange.Cancelled ? "" : scripts?.Error is not null ? ShownScripts($"{exchange.ErrorMessage}\n\n{scripts.Describe()}") : exchange.ErrorMessage ?? "");
+            SetFilterStatus(_filter is null ? "" : "No response to filter.", error: false);
             SetHeaders([]);
         }
         else
@@ -218,12 +303,15 @@ internal sealed class ResponseView : View
     }
 
     /// <summary>
-    /// Shows the response body, pretty or not, formatted from the response each time (as Copy is): the editor's text has
-    /// its own line breaks (a lone CR shows as one) and only the start of a long body, and keeping the whole text as well
-    /// would take memory. A large body is formatted in the background, and shown if nothing replaced it meanwhile.
+    /// Shows the response body, pretty or not (or the values the filter selects in it), formatted from the response each time
+    /// (as Copy is): the editor's text has its own line breaks (a lone CR shows as one) and only the start of a long body,
+    /// and keeping the whole text as well would take memory. A large body is formatted in the background, and shown if
+    /// nothing replaced it meanwhile.
     /// </summary>
     private void RenderBody()
     {
+        _rendering?.Cancel();
+        _rendering = null;
         if (_exchange?.Response is not { } response)
         {
             return;
@@ -233,23 +321,38 @@ internal sealed class ResponseView : View
         if (BodyNotKept)
         {
             ShowBody("(response body not kept in the history)");
+            SetFilterStatus(_filter is null ? "" : "✗ The history kept no copy of this response body.", error: true);
             return;
         }
 
-        var pretty = _prettyOn;
+        var (pretty, filter) = (_prettyOn, _filter);
         if (App is not { } app || response.Body.Length < BackgroundSize)
         {
-            ShowBody(Shown(response, pretty));
+            Show(Render(response, pretty, filter, CancellationToken.None));
             return;
         }
 
-        var version = ShowBody("Formatting…");
-        _ = Task.Run(() => Shown(response, pretty)).ContinueWith(
+        var rendering = _rendering = new CancellationTokenSource();
+        var version = ShowBody(filter is null ? "Formatting…" : "Filtering…");
+        _ = Task.Run(() => Render(response, pretty, filter, rendering.Token), rendering.Token).ContinueWith(
             task => app.AddTimeout(TimeSpan.Zero, () =>
             {
+                if (_rendering == rendering)
+                {
+                    _rendering = null;
+                }
+
+                rendering.Dispose();
                 if (version == _bodyVersion && !_disposed)
                 {
-                    _body.SetText(task.IsCompletedSuccessfully ? task.Result : $"✗ {task.Exception?.GetBaseException().Message}");
+                    if (task.IsCompletedSuccessfully)
+                    {
+                        Show(task.Result);
+                    }
+                    else if (!task.IsCanceled)
+                    {
+                        ShowBody($"✗ {task.Exception?.GetBaseException().Message}");
+                    }
                 }
 
                 return false;
@@ -257,17 +360,88 @@ internal sealed class ResponseView : View
             TaskScheduler.Default);
     }
 
+    /// <summary>What the body tab shows of a response, the language it is colored in, and what the filter row says.</summary>
+    internal readonly record struct RenderedBody(string Text, string? Language, string FilterStatus = "", bool FilterFailed = false);
+
+    /// <summary>
+    /// The body as the body tab shows it (see <see cref="Shown"/>), or, with a filter, the values it selects (as much of them
+    /// as <see cref="MaxShownLength"/> allows). A body the filter can't apply to is shown as it is, and the filter row says why.
+    /// </summary>
+    internal static RenderedBody Render(ResponseSnapshot response, bool pretty, JsonPath? filter, CancellationToken cancellationToken)
+    {
+        if (filter is not null)
+        {
+            try
+            {
+                var filtered = BodyFilter.Apply(filter, response.Body, response.ContentType, pretty, MaxFilteredBytes, cancellationToken);
+                var text = filtered.Text.Length <= MaxShownLength
+                    ? filtered.Text
+                    : string.Concat(Start(filtered.Text), $"\n\n… showing the first {HttpExchange.FormatSize(MaxShownLength)} of {HttpExchange.FormatSize(filtered.Text.Length)}: Copy gives them all");
+                return new RenderedBody(text, "json", Describe(filtered));
+            }
+            catch (JsonPathException ex)
+            {
+                var shown = Shown(response, pretty);
+                var cut = response.BodyTruncated ? " The body was cut at the maximum response size (Tools > Settings)." : "";
+                return new RenderedBody(shown, SyntaxOf(response, shown), $"✗ {ex.Message}{cut}", FilterFailed: true);
+            }
+        }
+
+        var body = Shown(response, pretty);
+        return new RenderedBody(body, SyntaxOf(response, body));
+    }
+
+    /// <summary>How many values a filter selected, and how many of them it wrote.</summary>
+    private static string Describe(FilteredBody filtered)
+    {
+        var count = filtered.Count.ToString("N0", CultureInfo.InvariantCulture);
+        return filtered.Count == 0 ? "No values"
+            : filtered.Shown < filtered.Count ? $"{count} values: the first {filtered.Shown.ToString("N0", CultureInfo.InvariantCulture)}, {HttpExchange.FormatSize(MaxFilteredBytes)}, are shown"
+            : filtered.Count == 1 ? "1 value"
+            : $"{count} values";
+    }
+
+    /// <summary>
+    /// The language the body tab colors a response body in: the one its Content-Type names, or JSON, HTML or other markup
+    /// (as XML) that a body of another type (text/plain, say) or none holds. Null for other text and for a hex dump.
+    /// </summary>
+    internal static string? SyntaxOf(ResponseSnapshot response, string shown)
+    {
+        var language = BodyFormatter.Language(response.Body, response.ContentType);
+        if (language != "text")
+        {
+            return language == "binary" ? null : language;
+        }
+
+        // Pretty printing drops an XML declaration: the text shown starts with the root element then.
+        var start = shown.AsSpan().TrimStart();
+        return start.StartsWith('{') || start.StartsWith('[') ? "json"
+            : start.StartsWith("<!doctype html", StringComparison.OrdinalIgnoreCase) || start.StartsWith("<html", StringComparison.OrdinalIgnoreCase) ? "html"
+            : start.StartsWith('<') ? "xml"
+            : null;
+    }
+
+    private void Show(RenderedBody rendered)
+    {
+        ShowBody(rendered.Text, rendered.Language);
+        if (rendered.FilterStatus.Length > 0)
+        {
+            SetFilterStatus(rendered.FilterStatus, rendered.FilterFailed);
+        }
+    }
+
     /// <summary>The response comes from the history, which has no copy of its body, though the body was not empty.</summary>
     private bool BodyNotKept => _fromHistory && _exchange?.Response?.Body.Length == 0 && _exchange.HistoryEntry?.Size > 0;
 
-    /// <summary>Shows <paramref name="text"/> in the body tab, in place of a body still being formatted.</summary>
-    private int ShowBody(string text)
+    /// <summary>Shows <paramref name="text"/> in the body tab, colored in <paramref name="language"/>, in place of a body still being formatted.</summary>
+    private int ShowBody(string text, string? language = null)
     {
+        _body.SyntaxLanguage = language;
         _body.SetText(text);
         return ++_bodyVersion;
     }
 
-    /// <summary>Copies the whole body, as formatted (a large one is formatted in the background).</summary>
+    /// <summary>Copies the whole body, as formatted, or the values the filter selects (a large body is done in the background).</summary>
     private void CopyBody()
     {
         if (_exchange?.Response is not { } response)
@@ -281,15 +455,15 @@ internal sealed class ResponseView : View
             return;
         }
 
-        var pretty = _prettyOn;
+        var (pretty, filter) = (_prettyOn, _filter);
         if (App is not { } app || response.Body.Length < BackgroundSize)
         {
-            Copied(Whole(response, pretty));
+            Copied(Whole(response, pretty, filter));
             return;
         }
 
-        Notify("Copying the response body…");
-        _ = Task.Run(() => Whole(response, pretty)).ContinueWith(
+        Notify(filter is null ? "Copying the response body…" : "Copying the values the filter selects…");
+        _ = Task.Run(() => Whole(response, pretty, filter)).ContinueWith(
             task => app.AddTimeout(TimeSpan.Zero, () =>
             {
                 if (task.IsCompletedSuccessfully)
@@ -306,19 +480,36 @@ internal sealed class ResponseView : View
             TaskScheduler.Default);
     }
 
-    private void Copied(string text)
+    private void Copied((string Text, bool Filtered) copied)
     {
         if (!_disposed)
         {
-            Notify(Ui.CopyToClipboard(App, text) ? "Response body copied to the clipboard." : "Clipboard is not available in this terminal.");
+            Notify(!Ui.CopyToClipboard(App, copied.Text) ? "Clipboard is not available in this terminal."
+                : copied.Filtered ? "The values the filter selects copied to the clipboard."
+                : "Response body copied to the clipboard.");
         }
     }
 
-    /// <summary>The whole body as formatted, with a note when the size limit cut it.</summary>
-    private static string Whole(ResponseSnapshot response, bool pretty)
+    /// <summary>
+    /// What Copy copies: the values the filter selects (up to <see cref="MaxFilteredBytes"/>), or the whole body as formatted,
+    /// with a note when the size limit cut it.
+    /// </summary>
+    private static (string Text, bool Filtered) Whole(ResponseSnapshot response, bool pretty, JsonPath? filter)
     {
+        if (filter is not null)
+        {
+            try
+            {
+                return (BodyFilter.Apply(filter, response.Body, response.ContentType, pretty, MaxFilteredBytes).Text, true);
+            }
+            catch (JsonPathException)
+            {
+                // Not JSON: the body tab shows the body, which is copied.
+            }
+        }
+
         var text = BodyFormatter.Format(response.Body, response.ContentType, pretty);
-        return response.BodyTruncated ? text + "\n\n… (truncated)" : text;
+        return (response.BodyTruncated ? text + "\n\n… (truncated)" : text, false);
     }
 
     /// <summary>
@@ -457,9 +648,206 @@ internal sealed class ResponseView : View
 
     private void Notify(string message) => Notice?.Invoke(this, message);
 
+    // ----- filter ---------------------------------------------------------------------------
+
+    /// <summary>The Filter button: shows the JSONPath row (or closes it, which clears the filter).</summary>
+    internal void ToggleFilter()
+    {
+        if (_filterRow.Visible)
+        {
+            CloseFilter();
+            return;
+        }
+
+        _filterRow.Visible = true;
+        _body.Y = 2;
+        _tabs.Select(_bodyTab, focusPage: false);
+        _filterField.SetFocus();
+        FilterChanged();
+    }
+
+    private void CloseFilter()
+    {
+        _filterRow.Visible = false;
+        _body.Y = 1;
+        _filterField.Text = ""; // the filter goes with it
+        FilterChanged();
+        _body.SetFocus();
+    }
+
+    /// <summary>The query in the filter row, as typed; the body shows what it selects in this response and the ones after it.</summary>
+    internal void SetFilter(string query)
+    {
+        if (!_filterRow.Visible)
+        {
+            ToggleFilter();
+        }
+
+        _filterField.Text = query;
+    }
+
+    /// <summary>
+    /// The query was edited: the body shows what it selects. While it is not valid JSONPath (being typed), the row says why
+    /// and the body shows what the last valid one selected.
+    /// </summary>
+    private void FilterChanged()
+    {
+        var text = _filterField.Text.TrimEnd();
+        _filterInvalid = false;
+        if (text.Length == 0)
+        {
+            SetFilterStatus("Type a JSONPath query, such as $.items[*].id", error: false);
+            if (_filter is not null)
+            {
+                _filter = null;
+                RenderBody();
+            }
+
+            return;
+        }
+
+        try
+        {
+            _filter = JsonPath.Parse(text);
+        }
+        catch (JsonPathException ex)
+        {
+            SetFilterStatus($"✗ {ex.Message}", error: true);
+            _filterInvalid = true;
+            return;
+        }
+
+        if (_exchange?.Response is null)
+        {
+            SetFilterStatus("No response to filter yet.", error: false);
+            return;
+        }
+
+        RenderBody();
+    }
+
+    private void SetFilterStatus(string text, bool error)
+    {
+        if (_filterInvalid)
+        {
+            return; // the row says why the query typed is not valid
+        }
+
+        _filterStatus.Text = text;
+        _filterStatus.SchemeName = error ? "Error" : null;
+    }
+
+    // ----- find -----------------------------------------------------------------------------
+
+    /// <summary>Ctrl+F: shows the find bar, its text selected to type over, looking in the text of the tab shown.</summary>
+    internal void OpenFind()
+    {
+        if (!_findBar.Visible)
+        {
+            _findBar.Visible = true;
+            _tabs.Height = Dim.Fill(1);
+            FindIn(SearchedArea());
+        }
+
+        _findField.SetFocus();
+        _findField.SelectAll();
+    }
+
+    /// <summary>
+    /// F3 or Enter in the find bar: selects the next match (Shift: the previous one), going round. Opens the find bar when it
+    /// is closed or has no text.
+    /// </summary>
+    internal void FindNext(bool backwards = false)
+    {
+        if (!_findBar.Visible || _findField.Text.Length == 0)
+        {
+            OpenFind();
+            return;
+        }
+
+        _findTarget?.SelectNextMatch(backwards);
+        ShowFindCount();
+    }
+
+    /// <summary>The text the find bar looks for (for tests).</summary>
+    internal void Find(string text, bool matchCase = false)
+    {
+        OpenFind();
+        _matchCase.Value = matchCase ? CheckState.Checked : CheckState.UnChecked;
+        _findField.Text = text;
+    }
+
+    private void CloseFind()
+    {
+        var area = _findTarget;
+        FindIn(null);
+        _findBar.Visible = false;
+        _tabs.Height = Dim.Fill();
+        if (area is not null)
+        {
+            area.SetFocus();
+        }
+        else
+        {
+            _tabs.FocusSelectedPage();
+        }
+    }
+
+    private void FindChanged()
+    {
+        _findTarget?.Find(_findField.Text, _matchCase.Value == CheckState.Checked);
+        ShowFindCount();
+    }
+
+    /// <summary>Looks for the find bar's text in <paramref name="area"/> (the text of the tab shown), and no longer in another.</summary>
+    private void FindIn(TextArea? area)
+    {
+        if (_findTarget is { } previous && previous != area)
+        {
+            previous.Find(null, matchCase: false);
+        }
+
+        _findTarget = area;
+        area?.Find(_findField.Text, _matchCase.Value == CheckState.Checked);
+        ShowFindCount();
+    }
+
+    /// <summary>The text of the tab shown; none for Headers, a table.</summary>
+    private TextArea? SearchedArea() => _tabs.Value?.SubViews.OfType<TextArea>().FirstOrDefault();
+
+    private void ShowFindCount()
+    {
+        static string Count(TextArea area) => area.MatchCount.ToString("N0", CultureInfo.InvariantCulture) + (area.MoreMatches ? "+" : "");
+        _findCount.Text = _findTarget is not { } target ? "Not in this tab"
+            : _findField.Text.Length == 0 ? ""
+            : target.MatchCount == 0 ? "No matches"
+            : target.CurrentMatch >= 0 ? $"{target.CurrentMatch + 1} of {Count(target)}"
+            : $"{Count(target)} matches";
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Esc in the find bar or the filter row closes it (elsewhere in the main window, it cancels a request).</remarks>
+    protected override bool OnKeyDown(Key key)
+    {
+        if (key == Key.Esc && _findBar.HasFocus)
+        {
+            CloseFind();
+            return true;
+        }
+
+        if (key == Key.Esc && _filterRow.HasFocus)
+        {
+            CloseFilter();
+            return true;
+        }
+
+        return base.OnKeyDown(key);
+    }
+
     protected override void Dispose(bool disposing)
     {
         _disposed = true; // formatting that finishes later must not touch the disposed views
+        _rendering?.Cancel();
         base.Dispose(disposing);
     }
 

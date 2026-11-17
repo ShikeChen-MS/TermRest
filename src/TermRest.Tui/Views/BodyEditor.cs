@@ -80,6 +80,7 @@ internal sealed class BodyEditor : View
         _language = new OptionSelector { X = 0, Y = 1, Orientation = Orientation.Horizontal, Labels = LanguageLabels, Value = 0 };
         _language.ValueChanged += (_, e) =>
         {
+            ColorRaw();
             if (!_loading && e.NewValue is int index)
             {
                 _body.RawLanguage = Languages[index];
@@ -90,6 +91,7 @@ internal sealed class BodyEditor : View
         _beautify.Accepted += (_, _) => Beautify();
 
         _raw = new TextArea { X = 0, Y = 2, Width = Dim.Fill(), Height = Dim.Fill() };
+        ColorRaw();
         _raw.UserEdited += (_, text) =>
         {
             _body.Raw = text;
@@ -160,7 +162,7 @@ internal sealed class BodyEditor : View
             _body.GraphQLQuery = text;
             RaiseChanged();
         };
-        _graphQLVariables = new TextArea { X = Pos.Right(_graphQLQuery) + 1, Y = 1, Width = Dim.Fill(), Height = Dim.Fill() };
+        _graphQLVariables = new TextArea { X = Pos.Right(_graphQLQuery) + 1, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(), SyntaxLanguage = "json" };
         _graphQLVariables.UserEdited += (_, text) =>
         {
             _body.GraphQLVariables = text;
@@ -198,6 +200,12 @@ internal sealed class BodyEditor : View
 
     /// <summary>What the file panel says about the chosen file (for tests).</summary>
     internal string FileStatus => _fileStatus.Text;
+
+    /// <summary>The language the raw body is colored in (for tests).</summary>
+    internal string? RawSyntax => _raw.SyntaxLanguage;
+
+    /// <summary>Colors the raw body in the language chosen for it (none for Text).</summary>
+    private void ColorRaw() => _raw.SyntaxLanguage = _language.Value is int index && Languages[index] != "text" ? Languages[index] : null;
 
     public void Load(RequestBody body)
     {

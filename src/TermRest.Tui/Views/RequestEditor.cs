@@ -212,6 +212,9 @@ internal sealed class RequestEditor : View
     /// <summary>What the Body tab says about the body file (for tests).</summary>
     internal string BodyFileStatus => _body.FileStatus;
 
+    /// <summary>The language the raw body is colored in (for tests).</summary>
+    internal string? RawBodySyntax => _body.RawSyntax;
+
     /// <summary>The Scripts tab (for tests).</summary>
     internal ScriptsEditor ScriptsTab => _scripts;
 

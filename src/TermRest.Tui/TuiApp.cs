@@ -1,6 +1,7 @@
 using System.Text;
 using Terminal.Gui.App;
 using Terminal.Gui.Input;
+using Terminal.Gui.Views;
 using TermRest.Core.History;
 using TermRest.Core.Workspace;
 using TermRest.Tui.Theming;
@@ -141,6 +142,13 @@ public static class TuiApp
         {
             Application.RemoveDefaultKeyBinding(Command.Refresh);
         }
+
+        // Ctrl+F finds in the response: not the cursor moving right (Emacs), which is all Command.Right adds to the arrow key
+        // in Terminal.Gui 2.5's text fields and editors.
+        TextField.DefaultKeyBindings?.Remove(Command.Right);
+#pragma warning disable CS0618 // TextView: the editor TextArea derives from
+        TextView.DefaultKeyBindings?.Remove(Command.Right);
+#pragma warning restore CS0618
     }
 
     /// <summary>Creates the main window without running it (used by tests).</summary>

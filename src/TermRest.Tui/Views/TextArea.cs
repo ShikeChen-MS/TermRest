@@ -36,6 +36,35 @@ internal sealed class TextArea : TextView
     private int[] _cellStarts = [];
     private SyntaxKind[] _charKinds = [];
 
+    /// <summary>While words wrap: TextView's whole text, against which rows are matched to find the lines they are parts of.</summary>
+    private string? _wrappedText;
+
+    /// <summary>Where the first row not matched yet starts in <see cref="_wrappedText"/>.</summary>
+    private int _wrappedAt;
+
+    /// <summary>For each row matched so far, whether a line ends with it.</summary>
+    private readonly List<bool> _rowEndsLine = [];
+
+    /// <summary>The rows did not add up to the text: each row is then colored as a line.</summary>
+    private bool _rowsUnmatched;
+
+    /// <summary>Whether words wrapped, and at which width, when rows were matched to lines (TextView wraps again when it changes).</summary>
+    private (bool Wrap, int Width) _rowsLayout;
+
+    /// <summary>The text <see cref="Find"/> looks for, or null.</summary>
+    private string? _findText;
+
+    private bool _findMatchCase;
+
+    /// <summary>Where <see cref="_findText"/> is, in order.</summary>
+    private readonly List<Match> _matches = [];
+
+    /// <summary>The match selected by <see cref="SelectMatch"/>, or -1.</summary>
+    private int _currentMatch = -1;
+
+    /// <summary>The columns of the row being drawn that matches cover.</summary>
+    private readonly List<(int From, int To)> _rowMatches = [];
+
     public TextArea()
     {
         Width = Dim.Fill();
@@ -162,7 +191,7 @@ internal sealed class TextArea : TextView
     /// <summary>The text as last set or reported by <see cref="UserEdited"/>; kept only while something listens.</summary>
     private string? _text;
 
-    /// <summary>The script language (<see cref="Core.Scripting.ScriptLanguage"/>) whose syntax is colored; null for plain text.</summary>
+    /// <summary>The language whose syntax is colored (a script language, or a body's: json, xml, html); null for plain text.</summary>
     public string? SyntaxLanguage
     {
         get => _syntaxLanguage;
@@ -175,7 +204,7 @@ internal sealed class TextArea : TextView
 
             _syntaxLanguage = value;
             _lexer = SyntaxLexer.For(value);
-            _linesLexed = 0;
+            ForgetColors();
             SetNeedsDraw();
         }
     }
@@ -252,7 +281,8 @@ internal sealed class TextArea : TextView
 
     public override void OnContentsChanged()
     {
-        _linesLexed = 0;
+        ForgetColors();
+        FindAgain();
         _contentsChanged = true;
         base.OnContentsChanged();
         if (_settingText || _userEdited is not { } edited)
@@ -492,15 +522,25 @@ internal sealed class TextArea : TextView
     /// <summary>Text with the editor's line endings normalized to LF.</summary>
     public string GetText() => Text.Replace("\r\n", "\n", StringComparison.Ordinal);
 
-    /// <summary>Colors are kept by line, so wrapped text (whose rows are parts of lines) is left plain.</summary>
-    private bool Highlighting => _lexer is not null && !WordWrap;
+    private bool Highlighting => _lexer is not null;
 
     /// <inheritdoc/>
     /// <remarks>Setting <see cref="TextView.Text"/> replaces the text without <see cref="OnContentsChanged"/>.</remarks>
     protected override void OnTextChanged()
     {
-        _linesLexed = 0;
+        ForgetColors();
+        FindAgain();
         base.OnTextChanged();
+    }
+
+    /// <summary>The colors are worked out again from the first row (the text, its language, or its rows changed).</summary>
+    private void ForgetColors()
+    {
+        _linesLexed = 0;
+        _wrappedText = null;
+        _wrappedAt = 0;
+        _rowEndsLine.Clear();
+        _rowsUnmatched = false;
     }
 
     /// <inheritdoc/>
@@ -512,24 +552,37 @@ internal sealed class TextArea : TextView
     /// </remarks>
     protected override bool OnDrawingContent(DrawContext? context)
     {
+        // TextView wraps words again (without a change of contents) when the view's width changes: the rows are other parts
+        // of the lines then. It keeps the cursor and the selection on the same text, so the match selected stays so.
+        var layout = (WordWrap, WordWrap ? Viewport.Width : 0);
+        if (layout != _rowsLayout)
+        {
+            var widthOnly = layout.WordWrap == _rowsLayout.Wrap;
+            _rowsLayout = layout;
+            ForgetColors();
+            FindAgain(keepCurrent: widthOnly);
+        }
+
         var colors = new CellColors
         {
             Editable = GetAttributeForRole(VisualRole.Editable),
             ReadOnly = GetAttributeForRole(VisualRole.ReadOnly),
             Selected = GetAttributeForRole(VisualRole.Active),
             Focus = GetAttributeForRole(VisualRole.Focus),
+            Match = MatchColors(),
             Highlighting = Highlighting,
         };
         if (colors.Highlighting)
         {
             LexLinesInView();
             var palette = ThemeCatalog.Current.Palette;
+            var text = ReadOnly ? colors.ReadOnly : colors.Editable;
             for (var kind = 0; kind < _syntaxAttributes.Length; kind++)
             {
                 var color = palette.SyntaxColor((SyntaxKind)kind);
                 var readable = !color.Equals(Color.None)
-                               && (colors.Editable.Background.Equals(Color.None) || ThemePalette.Contrast(color, colors.Editable.Background) >= MinimumContrast);
-                _syntaxAttributes[kind] = new Attribute(readable ? color : colors.Editable.Foreground, colors.Editable.Background, colors.Editable.Style);
+                               && (text.Background.Equals(Color.None) || ThemePalette.Contrast(color, text.Background) >= MinimumContrast);
+                _syntaxAttributes[kind] = new Attribute(readable ? color : text.Foreground, text.Background, text.Style);
             }
         }
 
@@ -565,6 +618,7 @@ internal sealed class TextArea : TextView
         public Attribute ReadOnly;
         public Attribute Selected;
         public Attribute Focus;
+        public Attribute Match;
         public bool Highlighting;
         public long SelectionStart;
         public long SelectionEnd;
@@ -579,6 +633,7 @@ internal sealed class TextArea : TextView
     {
         var right = viewport.Width;
         var count = line.Count;
+        MatchesOnRow(index);
 
         // Where the view's left edge cuts the line: TextView takes the widths of the first Viewport.X cells (cells, not
         // columns) and starts with the cell that goes past it, at a negative column when it is cut.
@@ -672,8 +727,8 @@ internal sealed class TextArea : TextView
     }
 
     /// <summary>
-    /// The color of a cell, chosen as TextView's OnDraw*Color methods do: selected, overwrite cursor, read-only, script
-    /// colors, normal.
+    /// The color of a cell, chosen as TextView's OnDraw*Color methods do: selected, overwrite cursor, a match of Find,
+    /// syntax colors (in read-only text too, where plain text keeps the read-only color), read-only, normal.
     /// </summary>
     private void SetCellColor(Cell cell, int column, int index, in CellColors colors)
     {
@@ -687,16 +742,20 @@ internal sealed class TextArea : TextView
             var used = cell.Attribute ?? colors.Focus;
             SetAttribute(new Attribute(used.Background, used.Foreground, used.Style));
         }
+        else if (InMatch(column))
+        {
+            SetAttribute(colors.Match);
+        }
+        else if (colors.Highlighting && index < _linesLexed && column < _lineKinds[index].Length && (!ReadOnly || _lineKinds[index][column] != SyntaxKind.Plain))
+        {
+            SetAttribute(_syntaxAttributes[(int)_lineKinds[index][column]]);
+        }
         else if (ReadOnly)
         {
             var readOnly = cell.Attribute ?? colors.ReadOnly;
             SetAttribute(readOnly.Foreground == readOnly.Background
                 ? new Attribute(readOnly.Foreground, readOnly.Background, readOnly.Style)
                 : colors.ReadOnly);
-        }
-        else if (colors.Highlighting && index < _linesLexed && column < _lineKinds[index].Length)
-        {
-            SetAttribute(_syntaxAttributes[(int)_lineKinds[index][column]]);
         }
         else
         {
@@ -716,48 +775,46 @@ internal sealed class TextArea : TextView
         }
     }
 
-    /// <summary>Colors the lines not colored yet down to the last one in view (a line's colors depend on the lines above it).</summary>
+    /// <summary>
+    /// Colors the lines not colored yet down to the last one in view (a line's colors depend on the lines above it). When
+    /// words wrap, each line is colored whole, and its colors split over the rows it takes.
+    /// </summary>
     private void LexLinesInView()
     {
         var last = Math.Min(Lines, Viewport.Y + Viewport.Height);
-        for (; _linesLexed < last; _linesLexed++)
+        while (_linesLexed < last)
         {
-            var row = _linesLexed;
-            var cells = GetLine(row);
-
-            // The line's text, and where each cell (a grapheme) starts in it.
-            Grow(ref _cellStarts, cells.Count);
-            var length = 0;
-            for (var i = 0; i < cells.Count; i++)
-            {
-                var grapheme = cells[i].Grapheme ?? "";
-                _cellStarts[i] = length;
-                Grow(ref _chars, length + grapheme.Length);
-                grapheme.CopyTo(_chars.AsSpan(length));
-                length += grapheme.Length;
-            }
-
+            var first = _linesLexed;
+            var rows = WordWrap ? RowsOfLine(first) : 1;
+            var (length, _) = LoadLine(first, rows);
             Grow(ref _charKinds, length);
             var charKinds = _charKinds.AsSpan(0, length);
             charKinds.Clear();
-            var end = _lexer!.Lex(_chars.AsSpan(0, length), charKinds, row == 0 ? LexState.Code : _lineEnds[row - 1]);
+            var end = _lexer!.Lex(_chars.AsSpan(0, length), charKinds, first == 0 ? LexState.Code : _lineEnds[first - 1]);
 
-            var kinds = row < _lineKinds.Count && _lineKinds[row].Length == cells.Count ? _lineKinds[row] : new SyntaxKind[cells.Count];
-            for (var i = 0; i < cells.Count; i++)
+            var cell = 0;
+            for (var row = first; row < first + rows; row++)
             {
-                kinds[i] = _cellStarts[i] < length ? charKinds[_cellStarts[i]] : SyntaxKind.Plain;
+                var count = GetLine(row).Count;
+                var kinds = row < _lineKinds.Count && _lineKinds[row].Length == count ? _lineKinds[row] : new SyntaxKind[count];
+                for (var i = 0; i < count; i++, cell++)
+                {
+                    kinds[i] = _cellStarts[cell] < length ? charKinds[_cellStarts[cell]] : SyntaxKind.Plain;
+                }
+
+                if (row < _lineKinds.Count)
+                {
+                    _lineKinds[row] = kinds;
+                    _lineEnds[row] = end;
+                }
+                else
+                {
+                    _lineKinds.Add(kinds);
+                    _lineEnds.Add(end);
+                }
             }
 
-            if (row < _lineKinds.Count)
-            {
-                _lineKinds[row] = kinds;
-                _lineEnds[row] = end;
-            }
-            else
-            {
-                _lineKinds.Add(kinds);
-                _lineEnds.Add(end);
-            }
+            _linesLexed = first + rows;
         }
 
         if (_linesLexed == Lines && _lineKinds.Count > Lines)
@@ -767,12 +824,327 @@ internal sealed class TextArea : TextView
         }
     }
 
+    /// <summary>How many rows the line that starts at row <paramref name="first"/> takes, when words wrap.</summary>
+    private int RowsOfLine(int first)
+    {
+        var row = first;
+        while (row + 1 < Lines && !RowEndsLine(row))
+        {
+            row++;
+        }
+
+        return row - first + 1;
+    }
+
+    /// <summary>
+    /// Whether a line ends with <paramref name="row"/>, when words wrap: rows are matched in order to TextView's whole text
+    /// (where the lines are), as far as needed. A row whose text is not where the previous one ended ends a line.
+    /// </summary>
+    private bool RowEndsLine(int row)
+    {
+        while (_rowEndsLine.Count <= row)
+        {
+            var next = _rowEndsLine.Count;
+            if (_rowsUnmatched)
+            {
+                _rowEndsLine.Add(true);
+                continue;
+            }
+
+            _wrappedText ??= Text;
+            var at = _wrappedAt;
+            foreach (var cell in GetLine(next))
+            {
+                var grapheme = cell.Grapheme ?? "";
+                if (!_wrappedText.AsSpan(at).StartsWith(grapheme, StringComparison.Ordinal))
+                {
+                    _rowsUnmatched = true;
+                    break;
+                }
+
+                at += grapheme.Length;
+            }
+
+            var ends = _rowsUnmatched || next == Lines - 1 || _wrappedText.AsSpan(at).StartsWith(Environment.NewLine, StringComparison.Ordinal);
+            _wrappedAt = ends ? at + Environment.NewLine.Length : at;
+            _rowEndsLine.Add(ends);
+        }
+
+        return _rowEndsLine[row];
+    }
+
     private static void Grow<T>(ref T[] array, int size)
     {
         if (array.Length < size)
         {
             Array.Resize(ref array, Math.Max(size, array.Length * 2));
         }
+    }
+
+    /// <summary>
+    /// Reads the line that rows <paramref name="first"/> to <paramref name="first"/> + <paramref name="rows"/> - 1 make into
+    /// <see cref="_chars"/>, and where each of its cells (a grapheme) starts into <see cref="_cellStarts"/>.
+    /// </summary>
+    private (int Length, int Cells) LoadLine(int first, int rows)
+    {
+        var (length, count) = (0, 0);
+        for (var row = first; row < first + rows; row++)
+        {
+            var cells = GetLine(row);
+            Grow(ref _cellStarts, count + cells.Count);
+            for (var i = 0; i < cells.Count; i++)
+            {
+                var grapheme = cells[i].Grapheme ?? "";
+                _cellStarts[count + i] = length;
+                Grow(ref _chars, length + grapheme.Length);
+                grapheme.CopyTo(_chars.AsSpan(length));
+                length += grapheme.Length;
+            }
+
+            count += cells.Count;
+        }
+
+        return (length, count);
+    }
+
+    // ----- Find ----------------------------------------------------------------------------
+
+    /// <summary>At most this many matches are found: Find then counts "100000+".</summary>
+    internal const int MaxMatches = 100_000;
+
+    /// <summary>A match of Find: from its first cell to the cell after its last (TextView's rows and columns).</summary>
+    private readonly record struct Match(int StartRow, int StartColumn, int EndRow, int EndColumn);
+
+    /// <summary>Raised when the matches of <see cref="Find"/> changed: found anew, or after the text or its rows changed.</summary>
+    public event EventHandler? MatchesChanged;
+
+    /// <summary>How many matches <see cref="Find"/> found (at most <see cref="MaxMatches"/>).</summary>
+    public int MatchCount => _matches.Count;
+
+    /// <summary>Whether there are more matches than <see cref="MatchCount"/>.</summary>
+    public bool MoreMatches { get; private set; }
+
+    /// <summary>The match selected (from 0), or -1.</summary>
+    public int CurrentMatch => _currentMatch;
+
+    /// <summary>
+    /// Highlights each place <paramref name="text"/> is (ignoring case unless <paramref name="matchCase"/>; null or empty for
+    /// none), and selects the first match from the one selected, or from the cursor: a longer text keeps to the match it
+    /// grew from. The matches are found again when the text or its rows change.
+    /// </summary>
+    public void Find(string? text, bool matchCase)
+    {
+        var from = _currentMatch >= 0 ? (_matches[_currentMatch].StartRow, _matches[_currentMatch].StartColumn) : (CurrentRow, CurrentColumn);
+        var selected = _currentMatch >= 0 && IsSelecting;
+        _findText = string.IsNullOrEmpty(text) ? null : text;
+        _findMatchCase = matchCase;
+        FindMatches();
+        if (_findText is not null && _matches.Count > 0)
+        {
+            SelectMatch(MatchFrom(from.Item1, from.Item2));
+        }
+        else if (selected && _findText is not null)
+        {
+            IsSelecting = false; // the text the match was is no longer looked for
+        }
+    }
+
+    /// <summary>Selects the next match after the selected one (or the cursor), or the one before it, going round.</summary>
+    public void SelectNextMatch(bool backwards = false)
+    {
+        if (_matches.Count == 0)
+        {
+            return;
+        }
+
+        // The cursor moved since a match was selected: from where it is now.
+        if (_currentMatch >= 0 && (CurrentRow, CurrentColumn) != (_matches[_currentMatch].EndRow, _matches[_currentMatch].EndColumn))
+        {
+            _currentMatch = -1;
+        }
+
+        SelectMatch(_currentMatch >= 0 ? _currentMatch + (backwards ? -1 : 1)
+            : backwards ? MatchFrom(CurrentRow, CurrentColumn) - 1 : MatchFrom(CurrentRow, CurrentColumn));
+    }
+
+    /// <summary>Selects match <paramref name="index"/> (going round), with the cursor at its end, and scrolls to it.</summary>
+    public void SelectMatch(int index)
+    {
+        if (_matches.Count == 0)
+        {
+            return;
+        }
+
+        _currentMatch = ((index % _matches.Count) + _matches.Count) % _matches.Count;
+        var match = _matches[_currentMatch];
+        InsertionPoint = new Point(match.EndColumn, match.EndRow);
+        SelectionStartRow = match.StartRow;
+        SelectionStartColumn = match.StartColumn;
+        SetNeedsDraw();
+        MatchesChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>The first match that starts at or after the position (0 past the last: Find goes round).</summary>
+    private int MatchFrom(int row, int column)
+    {
+        var position = Encode(row, column);
+        var (low, high) = (0, _matches.Count);
+        while (low < high)
+        {
+            var middle = (low + high) / 2;
+            if (Encode(_matches[middle].StartRow, _matches[middle].StartColumn) < position)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        return low == _matches.Count ? 0 : low;
+    }
+
+    /// <summary>Finds the text looked for again, if any: the text or its rows changed.</summary>
+    private void FindAgain(bool keepCurrent = false)
+    {
+        if (_findText is not null)
+        {
+            FindMatches(keepCurrent);
+        }
+    }
+
+    /// <summary>
+    /// Finds every match, line by line (when words wrap, a line's rows together), each after the one before it. A match
+    /// that starts or ends inside a cell (a grapheme: part of an emoji) covers that cell. The match selected stays so when
+    /// <paramref name="keepCurrent"/> (the same text, wrapped again).
+    /// </summary>
+    private void FindMatches(bool keepCurrent = false)
+    {
+        var current = keepCurrent ? _currentMatch : -1;
+        _matches.Clear();
+        _currentMatch = -1;
+        MoreMatches = false;
+        if (_findText is { } text)
+        {
+            var comparison = _findMatchCase ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+            for (var first = 0; first < Lines && !MoreMatches;)
+            {
+                var rows = WordWrap ? RowsOfLine(first) : 1;
+                var (length, cells) = LoadLine(first, rows);
+                var line = _chars.AsSpan(0, length);
+
+                // Where the cells of the line's rows start: matches are in order, so it only moves on.
+                var (row, rowStart, rowCells) = (first, 0, GetLine(first).Count);
+                for (var at = 0; at < length;)
+                {
+                    var found = line[at..].IndexOf(text, comparison);
+                    if (found < 0)
+                    {
+                        break;
+                    }
+
+                    var (start, end) = (at + found, at + found + text.Length);
+                    var startCell = CellAt(start, cells);
+                    while (startCell >= rowStart + rowCells && row + 1 < first + rows)
+                    {
+                        (row, rowStart, rowCells) = (row + 1, rowStart + rowCells, GetLine(row + 1).Count);
+                    }
+
+                    var (startRow, startColumn) = (row, startCell - rowStart);
+                    var endCell = CellAt(end - 1, cells) + 1;
+                    while (endCell > rowStart + rowCells && row + 1 < first + rows)
+                    {
+                        (row, rowStart, rowCells) = (row + 1, rowStart + rowCells, GetLine(row + 1).Count);
+                    }
+
+                    _matches.Add(new Match(startRow, startColumn, row, endCell - rowStart));
+                    if (_matches.Count == MaxMatches)
+                    {
+                        MoreMatches = true;
+                        break;
+                    }
+
+                    at = end;
+                }
+
+                first += rows;
+            }
+        }
+
+        _currentMatch = current < _matches.Count ? current : -1;
+        SetNeedsDraw();
+        MatchesChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>The cell of the line loaded by <see cref="LoadLine"/> that character <paramref name="index"/> is part of.</summary>
+    private int CellAt(int index, int cells)
+    {
+        var found = Array.BinarySearch(_cellStarts, 0, cells, index);
+        return found >= 0 ? found : ~found - 1;
+    }
+
+    /// <summary>Notes which columns of row <paramref name="index"/> the matches cover, for <see cref="InMatch"/>.</summary>
+    private void MatchesOnRow(int index)
+    {
+        _rowMatches.Clear();
+        if (_matches.Count == 0)
+        {
+            return;
+        }
+
+        // The first match that does not end before the row starts (they end in order too).
+        var (low, high) = (0, _matches.Count);
+        while (low < high)
+        {
+            var middle = (low + high) / 2;
+            var match = _matches[middle];
+            if (match.EndRow < index || (match.EndRow == index && match.EndColumn == 0))
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        for (var i = low; i < _matches.Count && _matches[i].StartRow <= index; i++)
+        {
+            var match = _matches[i];
+            _rowMatches.Add((match.StartRow == index ? match.StartColumn : 0, match.EndRow == index ? match.EndColumn : int.MaxValue));
+        }
+    }
+
+    /// <summary>Whether a match covers <paramref name="column"/> of the row being drawn.</summary>
+    private bool InMatch(int column)
+    {
+        foreach (var (from, to) in _rowMatches)
+        {
+            if (column >= from && column < to)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The colors of matches: dark or light text (whichever reads better) on the theme's warning color, a highlighter's
+    /// yellow in most themes. The selected match has the selection's colors.
+    /// </summary>
+    private Attribute MatchColors()
+    {
+        var background = ThemeCatalog.Current.Palette.Warning;
+        if (background.Equals(Color.None))
+        {
+            var focus = GetAttributeForRole(VisualRole.Focus);
+            return new Attribute(focus.Foreground, focus.Background, TextStyle.Underline);
+        }
+
+        var (black, white) = (new Color(0, 0, 0), new Color(255, 255, 255));
+        return new Attribute(ThemePalette.Contrast(black, background) >= ThemePalette.Contrast(white, background) ? black : white, background);
     }
 }
 

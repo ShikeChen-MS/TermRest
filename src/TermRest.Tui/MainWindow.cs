@@ -305,6 +305,8 @@ internal sealed class MainWindow : Runnable
             new MenuItem("_Import from cURL…", "", ShowCurlImport),
             new MenuItem("_History", Key.F9, ToggleHistory),
             new MenuItem("Focus _URL bar", Key.L.WithCtrl, () => _editor.FocusUrl()),
+            new MenuItem("Find in res_ponse", Key.F.WithCtrl, () => _response.OpenFind()),
+            new MenuItem("Filter response with _JSONPath", "", () => _response.ToggleFilter()),
             new Line(),
             new MenuItem("Collection or folder scrip_ts…", "", () => EditScripts(TargetFolder())),
         ]),
@@ -1958,6 +1960,8 @@ internal sealed class MainWindow : Runnable
         ("F10", "Menu"),
         ("Shift+F10", "Context menu"),
         ("Ctrl+L", "Focus the URL bar"),
+        ("Ctrl+F", "Find in the response"),
+        ("F3, Shift+F3", "Next / previous match"),
         ("Ctrl+Q", "Quit"),
     ];
 
@@ -2169,6 +2173,19 @@ internal sealed class MainWindow : Runnable
         if (key == Key.L.WithCtrl)
         {
             _editor.FocusUrl();
+            return true;
+        }
+
+        // Text fields and editors leave Ctrl+F (see TuiApp.ConfigureKeyBindings) and F3 to the window.
+        if (key == Key.F.WithCtrl)
+        {
+            _response.OpenFind();
+            return true;
+        }
+
+        if (key == Key.F3 || key == Key.F3.WithShift)
+        {
+            _response.FindNext(backwards: key.IsShift);
             return true;
         }
 

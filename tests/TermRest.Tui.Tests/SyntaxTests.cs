@@ -6,8 +6,8 @@ using Xunit;
 namespace TermRest.Tui.Tests;
 
 /// <summary>
-/// Syntax highlighting of scripts. Expected lines mark each colored part as «kind text»: C comment, K keyword, S string,
-/// N number or constant, V variable, F function, T type, P parameter.
+/// Syntax highlighting of scripts and bodies. Expected lines mark each colored part as «kind text»: C comment, K keyword,
+/// S string, N number or constant, V variable, F function, T type, P parameter.
 /// </summary>
 public sealed class SyntaxTests
 {
@@ -165,7 +165,48 @@ public sealed class SyntaxTests
     }
 
     [Theory]
-    [InlineData(ScriptLanguage.JavaScript, "`${")]
+    [InlineData("{\"name\": \"Zoë\", \"tags\": [\"a\"], \"id\": -12.5e3, \"ok\": true, \"none\": null}",
+        "{«V \"name\"»: «S \"Zoë\"», «V \"tags\"»: [«S \"a\"»], «V \"id\"»: «N -12.5e3», «V \"ok\"»: «K true», «V \"none\"»: «K null»}")]
+    [InlineData("  \"say \\\"hi\\\":\" : \"a:b\",", "  «V \"say \\\"hi\\\":\"» : «S \"a:b\"»,")]
+    [InlineData("[1, 2-3, x1, truex] // note", "[«N 1», «N 2»-«N 3», x1, truex] «C // note»")]
+    public void Json(string line, string expected) => Assert.Equal(expected, Colored("json", line));
+
+    [Fact]
+    public void Json_comments_go_on_over_lines() =>
+        AssertColored("json", "{ /* a\nb */ \"k\": 1 }", "{ «C /* a»\n«C b */» «V \"k\"»: «N 1» }");
+
+    [Theory]
+    [InlineData("xml", "<?xml version=\"1.0\"?>", "«T <?xml» «V version»=«S \"1.0\"»?>")]
+    [InlineData("xml", "<a:item id='1' xmlns:a=\"urn:x\">Tom &amp; Jerry &#x26;</a:item>",
+        "<«K a:item» «V id»=«S '1'» «V xmlns:a»=«S \"urn:x\"»>Tom «N &amp;» Jerry «N &#x26;»</«K a:item»>")]
+    [InlineData("xml", "<!-- note --><b/> 1 < 2 & 3", "«C <!-- note -->»<«K b»/> 1 < 2 & 3")]
+    [InlineData("xml", "<![CDATA[a < b]]>", "«T <![CDATA[»«S a < b»«T ]]>»")]
+    [InlineData("html", "<!DOCTYPE html><input disabled value=on>", "«T <!DOCTYPE» «V html»><«K input» «V disabled» «V value»=«S on»>")]
+    public void Markup(string language, string line, string expected) => Assert.Equal(expected, Colored(language, line));
+
+    [Fact]
+    public void Markup_tags_values_comments_and_script_content_go_on_over_lines()
+    {
+        AssertColored("html",
+            """
+            <a href="x
+            y" title=t
+              class='c'>text <!-- a
+            b --> <script type="module">
+            if (a < b) {}
+            </script><p>&lt;</p>
+            """,
+            """
+            <«K a» «V href»=«S "x»
+            «S y"» «V title»=«S t»
+              «V class»=«S 'c'»>text «C <!-- a»
+            «C b -->» <«K script» «V type»=«S "module"»>
+            if (a < b) {}
+            </«K script»><«K p»>«N &lt;»</«K p»>
+            """);
+    }
+
+    [Theory]
     [InlineData(ScriptLanguage.Python, "f\"{")]
     [InlineData(ScriptLanguage.CSharp, "$\"{")]
     [InlineData(ScriptLanguage.PowerShell, "\"$(")]
@@ -199,6 +240,9 @@ public sealed class SyntaxTests
     [InlineData(ScriptLanguage.CSharp, "'\\", 90_000)] // 'characters' that never close
     [InlineData(ScriptLanguage.Python, "'''", 60_000)] // closing quotes counted to the end of the line
     [InlineData(ScriptLanguage.Python, "\"", 180_000)]
+    [InlineData("json", "\"a\" ", 120_000)] // a key is looked for after each string
+    [InlineData("html", "<a b=\"", 90_000)] // values that never close
+    [InlineData("xml", "<!--", 120_000)]
     public void Scans_that_could_go_to_the_end_of_a_long_line_each_time_stay_quick(string language, string piece, int times)
     {
         var line = string.Concat(Enumerable.Repeat(piece, times));

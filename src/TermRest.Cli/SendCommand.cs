@@ -1,5 +1,7 @@
 using System.CommandLine;
+using System.Text;
 using TermRest.Core.Http;
+using TermRest.Core.Json;
 using TermRest.Core.Postman;
 
 namespace TermRest.Cli;
@@ -14,8 +16,9 @@ internal static class SendCommand
         var request = new Argument<string>("request") { Description = "Request path such as \"Users/Get user\", or a unique request name" };
         var include = new Option<bool>("--include", "-i") { Description = "Also print the response status line and headers to stdout" };
         var verbose = new Option<bool>("--verbose", "-v") { Description = "Print the request, timing and TLS details to stderr" };
-        var output = new Option<string?>("--output", "-o") { Description = "Write the raw response body to a file" };
-        var raw = new Option<bool>("--raw") { Description = "Print the body as received (no JSON/XML pretty printing)" };
+        var output = new Option<string?>("--output", "-o") { Description = "Write the raw response body (with --filter, the values selected) to a file" };
+        var raw = new Option<bool>("--raw") { Description = "Print the body as received (no JSON/XML pretty printing); with --filter, the values on one line" };
+        var filter = new Option<string?>("--filter") { Description = "Print only the values a JSONPath query (RFC 9535) selects in a JSON body, as an array: --filter '$.items[?@.price < 10].id'" };
         var fail = new Option<bool>("--fail", "-f") { Description = "Exit with code 22 when the HTTP status is 400 or higher" };
         var curl = new Option<bool>("--curl") { Description = "Print the request as a cURL command instead of sending it (scripts do not run)" };
         var noHistory = new Option<bool>("--no-history") { Description = "Do not record this request in the workspace history" };
@@ -27,12 +30,28 @@ internal static class SendCommand
         command.Options.Add(verbose);
         command.Options.Add(output);
         command.Options.Add(raw);
+        command.Options.Add(filter);
         command.Options.Add(fail);
         command.Options.Add(curl);
         command.Options.Add(noHistory);
 
         command.SetAction(async (parseResult, cancellationToken) =>
         {
+            // A query that is not valid JSONPath is reported before anything is sent.
+            JsonPath? query = null;
+            if (parseResult.GetValue(filter) is { } text)
+            {
+                try
+                {
+                    query = JsonPath.Parse(text.TrimEnd());
+                }
+                catch (JsonPathException ex)
+                {
+                    Output.Error($"--filter: {ex.Message}");
+                    return 2;
+                }
+            }
+
             if (options.Open(parseResult, parseResult.GetValue(collection)!, insecure) is not { } opened)
             {
                 return 2;
@@ -110,7 +129,7 @@ internal static class SendCommand
                 printed = prepared.Warnings.Count;
             }, cancellationToken);
             var recorded = options.SaveRecording(parseResult, runner, recorder, cancellationToken.IsCancellationRequested);
-            var code = await ReportAsync(parseResult, exchange, verbose, include, output, raw, fail, cancellationToken);
+            var code = await ReportAsync(parseResult, exchange, query, verbose, include, output, raw, fail, cancellationToken);
 
             // Those raised while it was sent: a redirect not followed, a header left out, a body cut short …
             PrintWarnings(exchange.Request, printed);
@@ -165,8 +184,8 @@ internal static class SendCommand
     }
 
     private static async Task<int> ReportAsync(
-        ParseResult parseResult, HttpExchange exchange, Option<bool> verbose, Option<bool> include, Option<string?> output, Option<bool> raw, Option<bool> fail,
-        CancellationToken cancellationToken)
+        ParseResult parseResult, HttpExchange exchange, JsonPath? query, Option<bool> verbose, Option<bool> include, Option<string?> output, Option<bool> raw,
+        Option<bool> fail, CancellationToken cancellationToken)
     {
         if (parseResult.GetValue(verbose))
         {
@@ -191,7 +210,14 @@ internal static class SendCommand
             Console.Out.WriteLine();
         }
 
-        if (parseResult.GetValue(output) is { } file)
+        if (query is not null)
+        {
+            if (await WriteFilteredAsync(query, response, parseResult.GetValue(raw), parseResult.GetValue(output), cancellationToken) is { } failed)
+            {
+                return failed;
+            }
+        }
+        else if (parseResult.GetValue(output) is { } file)
         {
             try
             {
@@ -228,6 +254,44 @@ internal static class SendCommand
         // Only the start of the body was received (a warning says where it was cut): exit as curl does when --max-filesize
         // stops a transfer, so that a script does not take what was written for the whole body.
         return response.BodyTruncated ? 63 : 0;
+    }
+
+    /// <summary>The values <paramref name="query"/> selects in the body, printed or saved; the exit code when they cannot be.</summary>
+    private static async Task<int?> WriteFilteredAsync(JsonPath query, ResponseSnapshot response, bool compact, string? file, CancellationToken cancellationToken)
+    {
+        FilteredBody filtered;
+        try
+        {
+            filtered = BodyFilter.Apply(query, response.Body, response.ContentType, indented: !compact, cancellationToken: cancellationToken);
+        }
+        catch (JsonPathException ex)
+        {
+            Output.Error($"--filter: {ex.Message}");
+            return 1;
+        }
+        catch (OperationCanceledException)
+        {
+            return 130;
+        }
+
+        if (file is null)
+        {
+            Console.Out.WriteLine(filtered.Text);
+            return null;
+        }
+
+        try
+        {
+            await File.WriteAllTextAsync(file, filtered.Text + "\n", new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), cancellationToken);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            Output.Error($"The values could not be saved to {file}: {ex.Message}");
+            return 1;
+        }
+
+        Output.Info($"Saved {filtered.Count} value{(filtered.Count == 1 ? "" : "s")} to {file}");
+        return null;
     }
 
     private static void PrintVerbose(HttpExchange exchange)
