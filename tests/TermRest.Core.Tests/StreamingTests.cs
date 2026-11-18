@@ -106,14 +106,17 @@ public class StreamingTests
     public async Task The_request_timeout_stops_a_stream_and_keeps_what_arrived()
     {
         await using var server = await EchoServer.StartAsync();
-        var request = Prepare(server.Url("events?count=0&delay=20"), timeout: TimeSpan.FromMilliseconds(400));
+
+        // A new server's first answer can take a while on a busy machine (CI), longer than the timeout would leave the stream.
+        await new HttpExecutor().SendAsync(Prepare(server.Url("events?count=1")), _ct);
+        var request = Prepare(server.Url("events?count=0&delay=20"), timeout: TimeSpan.FromSeconds(2));
 
         var exchange = await new HttpExecutor().SendAsync(request, _ct);
 
-        var response = exchange.Response!;
-        Assert.True(response.Stopped);
-        Assert.StartsWith("id: 1\nevent: tick\n", Encoding.UTF8.GetString(response.Body), StringComparison.Ordinal);
-        Assert.Equal(["The stream was stopped at the request timeout (400 ms): its body is what arrived until then."], request.Warnings);
+        Assert.True(exchange.Response is not null, exchange.ErrorMessage);
+        Assert.True(exchange.Response.Stopped);
+        Assert.StartsWith("id: 1\nevent: tick\n", Encoding.UTF8.GetString(exchange.Response.Body), StringComparison.Ordinal);
+        Assert.Equal(["The stream was stopped at the request timeout (2.00 s): its body is what arrived until then."], request.Warnings);
     }
 
     [Fact]
