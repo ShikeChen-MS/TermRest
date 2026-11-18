@@ -1,6 +1,8 @@
+using System.Buffers;
 using System.CommandLine;
 using System.Text;
 using TermRest.Core.Http;
+using TermRest.Core.IO;
 using TermRest.Core.Json;
 using TermRest.Core.Postman;
 
@@ -339,12 +341,15 @@ internal static class SendCommand
     /// <summary>
     /// A response that streams (server-sent events, JSON lines): its body printed to standard output as it arrives (with -i,
     /// after its headers), unless <c>print</c> is off (-o, --filter: they get it whole). The first Ctrl+C stops it, keeping
-    /// what arrived, which is then reported as the response.
+    /// what arrived, which is then reported as the response; once its body is read, Ctrl+C cancels as before (the scripts
+    /// that run on it). A console gets it as text, as the rest of the output; a pipe or file the bytes as they are, and a pipe
+    /// whose reader went (| head -n 5) stops it, as nothing reads it any more.
     /// </summary>
     private sealed class ConsoleStream(bool print, bool include) : IStreamWatcher, IDisposable
     {
         private readonly CancellationTokenSource _stop = new();
         private Stream? _stdout;
+        private Decoder? _text; // a console: UTF-8 parts as text (a character split between two parts too), as Console.Out writes text
 
         public CancellationToken Stopping => _stop.Token;
 
@@ -372,27 +377,52 @@ internal static class SendCommand
                 Console.Out.Flush();
             }
 
-            _stdout = Console.OpenStandardOutput();
+            if (Console.IsOutputRedirected)
+            {
+                _stdout = StandardOutput.OpenPipe() ?? Console.OpenStandardOutput();
+            }
+            else
+            {
+                _text = Encoding.UTF8.GetDecoder();
+            }
+
             Printed = true;
         }
 
         public void Received(ReadOnlySpan<byte> data)
         {
-            if (_stdout is null || data.IsEmpty)
+            if (data.IsEmpty)
             {
                 return;
             }
 
             try
             {
-                _stdout.Write(data);
-                _stdout.Flush();
+                if (_text is not null)
+                {
+                    Write(data, flush: false);
+                }
+                else if (_stdout is not null)
+                {
+                    _stdout.Write(data);
+                    _stdout.Flush();
+                }
             }
             catch (IOException)
             {
-                // What reads the output went (| head -n 5): the stream is stopped, as nothing reads it any more.
-                _stdout = null;
+                // What reads the output went: the stream is stopped, as nothing reads it any more.
+                (_stdout, _text) = (null, null);
                 Stop();
+            }
+        }
+
+        public void Ended()
+        {
+            CliApp.Interrupt = null;
+            if (_text is not null)
+            {
+                Write([], flush: true); // the end of a character the stream did not finish
+                _text = null;
             }
         }
 
@@ -402,6 +432,21 @@ internal static class SendCommand
             CliApp.Interrupt = null;
             _stdout?.Dispose();
             _stop.Dispose();
+        }
+
+        private void Write(ReadOnlySpan<byte> data, bool flush)
+        {
+            var chars = ArrayPool<char>.Shared.Rent(Math.Max(1, Encoding.UTF8.GetMaxCharCount(data.Length)));
+            try
+            {
+                var count = _text!.GetChars(data, chars, flush);
+                Console.Out.Write(chars, 0, count);
+                Console.Out.Flush();
+            }
+            finally
+            {
+                ArrayPool<char>.Shared.Return(chars);
+            }
         }
 
         private void Stop()

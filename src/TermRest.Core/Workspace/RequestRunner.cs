@@ -413,6 +413,11 @@ public sealed partial class RequestRunner : IDisposable
             .Where(e => e.Enabled)
             .Select(e => new KeyValuePair<string, string?>(e.Key, e.Value));
         variables = variables.Concat(LocalVariables.Select(v => new KeyValuePair<string, string?>(v.Key, v.Value)));
+        if (_iterationText is { Count: > 0 } data)
+        {
+            variables = variables.Concat(data.Select(v => new KeyValuePair<string, string?>(v.Key, v.Value))); // a data file's apiToken column
+        }
+
         IEnumerable<IReadOnlyDictionary<string, string?>?> setByScripts =
             [environment is not null ? Session.Find(environment) : null, Session.Find(collection), Session.Globals, requestVariables];
         variables = variables.Concat(setByScripts.SelectMany(values => values ?? new Dictionary<string, string?>()));

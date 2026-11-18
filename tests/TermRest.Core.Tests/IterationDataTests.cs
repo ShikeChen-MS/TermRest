@@ -63,6 +63,26 @@ public class IterationDataTests
         Assert.Equal("data.json: item 2 of the array is not an object ({\"name\": value, …}) but number.", notObject.Message);
         var broken = Assert.Throws<InvalidDataException>(() => RowsAsync("""[{"id": 1""", ".json").GetAwaiter().GetResult());
         Assert.StartsWith("data.json is not a JSON array of objects:", broken.Message, StringComparison.Ordinal);
+
+        // Found when the file is read through, before the run, not when the row is used (also in an object a value holds).
+        var repeated = Assert.Throws<InvalidDataException>(() => RowsAsync("""[{"id": 1}, {"id": 2, "id": 3}]""", ".json").GetAwaiter().GetResult());
+        Assert.Equal("data.json: item 2 of the array has \"id\" twice in an object: a name can be there once.", repeated.Message);
+        var nested = Assert.Throws<InvalidDataException>(() => RowsAsync("""[{"user": [{"name": "a", "name": "b"}]}]""", ".json").GetAwaiter().GetResult());
+        Assert.Contains("item 1 of the array has \"name\" twice", nested.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Data_values_named_like_secrets_are_redacted_in_recordings_and_reports()
+    {
+        var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
+        using var runner = new RequestRunner(workspace);
+        runner.IterationData = (JsonObject)JsonNode.Parse("""{ "apiToken": "tok-1234567890", "user": "ada" }""")!;
+
+        var prepared = runner.Prepare(workspace.CreateCollection("API"), null, new HttpRequestSpec { Url = "https://api.example.test/items/{{apiToken}}?user={{user}}" });
+
+        var report = new TermRest.Core.Recording.Redactor().ForReport(new HttpExchange(prepared)).Url(prepared.Url, "url");
+        Assert.DoesNotContain("tok-1234567890", report, StringComparison.Ordinal);
+        Assert.Contains("user=ada", report, StringComparison.Ordinal);
     }
 
     [Fact]

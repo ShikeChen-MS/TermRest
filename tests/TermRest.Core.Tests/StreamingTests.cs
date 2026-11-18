@@ -27,9 +27,13 @@ public class StreamingTests
 
         public int Parts { get; private set; }
 
+        public bool HasEnded { get; private set; }
+
         public string Text => _text.ToString();
 
         public void Started(ResponseSnapshot head) => Head = head;
+
+        public void Ended() => HasEnded = true;
 
         public void Dispose() => _stop.Dispose();
 
@@ -47,6 +51,8 @@ public class StreamingTests
     [Theory]
     [InlineData("events?count=3&delay=30")]
     [InlineData("events?count=3&delay=30&gzip")] // decoded as it arrives
+    [InlineData("events?count=3&delay=30&deflate")]
+    [InlineData("events?count=3&delay=30&rawdeflate")] // deflate without its zlib header, as some servers send it
     public async Task A_stream_is_read_as_it_arrives_and_its_watcher_sees_each_part(string path)
     {
         await using var server = await EchoServer.StartAsync();
@@ -66,7 +72,8 @@ public class StreamingTests
         Assert.Equal(string.Concat(Enumerable.Range(1, 3).Select(n => $"id: {n}\nevent: tick\ndata: {{\"n\":{n}}}\n\n")), body);
         Assert.False(response.Stopped);
         Assert.Empty(request.Warnings);
-        if (path.EndsWith("gzip", StringComparison.Ordinal))
+        Assert.True(watcher.HasEnded);
+        if (path.Contains("deflate", StringComparison.Ordinal) || path.EndsWith("gzip", StringComparison.Ordinal))
         {
             Assert.NotEqual(response.Body.LongLength, response.ReceivedBodySize);
         }
@@ -88,6 +95,7 @@ public class StreamingTests
         var exchange = await new HttpExecutor().SendAsync(request, _ct);
 
         Assert.False(exchange.Cancelled);
+        Assert.True(watcher.HasEnded); // stopping it now does nothing: what runs next (scripts) is cancelled as for any request
         var response = exchange.Response!;
         Assert.True(response.Stopped);
         Assert.StartsWith("{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n", Encoding.UTF8.GetString(response.Body), StringComparison.Ordinal);
@@ -131,12 +139,13 @@ public class StreamingTests
             "event: update\nid: 7\ndata: {\"a\":1}\n\n" +
             "event: no data\n\n" +
             "data: after\rid\r\r" + // an id with no value clears it
+            "event:\ndata: typed nothing\n\n" + // an empty type is message's
             "data: the last, never ended\n");
 
         var events = ServerSentEvents.Parse(body, _ct);
 
-        Assert.Equal([("message", null), ("update", "7"), ("message", "")], events.Select(e => (e.Type, e.Id(body))));
-        Assert.Equal(["first\n two lines", "{\"a\":1}", "after"], events.Select(e => e.Data(body)));
+        Assert.Equal([("message", null), ("update", "7"), ("message", ""), ("message", "")], events.Select(e => (e.Type, e.Id(body))));
+        Assert.Equal(["first\n two lines", "{\"a\":1}", "after", "typed nothing"], events.Select(e => e.Data(body)));
         Assert.StartsWith(": a comment", Encoding.UTF8.GetString(body, events[0].Start, events[0].Length), StringComparison.Ordinal);
     }
 }

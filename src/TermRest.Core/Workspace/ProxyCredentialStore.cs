@@ -92,9 +92,12 @@ public sealed class ProxyCredentialStore
 
     /// <summary>
     /// Keeps <paramref name="user"/> and <paramref name="password"/> for <paramref name="proxy"/>; an empty user forgets
-    /// them, and a null password keeps the one kept. Returns false when nothing changed (there is nothing to save then).
+    /// them, and a null password keeps the one kept for <paramref name="keptFrom"/>: <paramref name="proxy"/>'s own by
+    /// default, or another's when the sign-in goes with a proxy setting that changed (the dialog showed that one's, masked).
+    /// Returns false when nothing changed (there is nothing to save then).
     /// </summary>
-    public bool Set(string? proxy, string? user, string? password)
+    /// <exception cref="CryptographicException">The password could not be encrypted for the user (Windows).</exception>
+    public bool Set(string? proxy, string? user, string? password, string? keptFrom = null)
     {
         if (KeyOf(proxy) is not { } key)
         {
@@ -108,12 +111,15 @@ public sealed class ProxyCredentialStore
             return _entries.Remove(key);
         }
 
-        if (current is not null && current.User == user && (password is null || Reveal(current.Password) == password))
+        // As stored (encrypted for the user on Windows, with the same entropy for every proxy): copied as it is.
+        var kept = keptFrom is null || KeyOf(keptFrom) is not { } from || from == key ? current?.Password
+            : _entries.TryGetValue(from, out var source) ? source.Password : null;
+        if (current is not null && current.User == user && (password is null ? current.Password == kept : Reveal(current.Password) == password))
         {
             return false;
         }
 
-        _entries[key] = new ProxyCredentialEntry { User = user, Password = password is null ? current?.Password : Conceal(password) };
+        _entries[key] = new ProxyCredentialEntry { User = user, Password = password is null ? kept : Conceal(password) };
         return true;
     }
 
@@ -150,8 +156,9 @@ public sealed class ProxyCredentialStore
         return slash > 0 ? new NetworkCredential(user[(slash + 1)..], password ?? "", user[..slash]) : new NetworkCredential(user, password ?? "");
     }
 
+    // An empty password is kept as it is: there is nothing to encrypt.
     private static string Conceal(string password) =>
-        OperatingSystem.IsWindows() ? DpapiPrefix + Convert.ToBase64String(Dpapi.Protect(Encoding.UTF8.GetBytes(password), Entropy)) : password;
+        OperatingSystem.IsWindows() && password.Length > 0 ? DpapiPrefix + Convert.ToBase64String(Dpapi.Protect(Encoding.UTF8.GetBytes(password), Entropy)) : password;
 
     private static string? Reveal(string? stored)
     {

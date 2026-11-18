@@ -548,9 +548,11 @@ public sealed partial class RequestRunner
         string language, CancellationToken cancellationToken)
     {
         var spec = ScriptRequest.Read(request);
-        var preparer = new RequestPreparer(VariableResolver.Literal, Certificates, CreateDefaults());
-        var prepared = preparer.Prepare(spec, spec.Auth is { Type: not "inherit" } own ? own : null, collection.BaseDirectory);
+
+        // Its own URL, headers, body and auth as written; the workspace's settings (a certificate's {{passphrase}}) as for any request.
         var resolver = CreateResolver(environment, collection, null);
+        var preparer = new RequestPreparer(VariableResolver.Literal, Certificates, CreateDefaults(), settingsVariables: resolver);
+        var prepared = preparer.Prepare(spec, spec.Auth is { Type: not "inherit" } own ? own : null, collection.BaseDirectory);
         prepared.AddSecretValues(SecretVariableValues(environment, collection, resolver));
         prepared.AddSensitiveValues(VariablesNamedLikeSecrets(environment, collection, resolver, null));
         await AuthorizeAsync(prepared, cancellationToken).ConfigureAwait(false);
@@ -559,7 +561,7 @@ public sealed partial class RequestRunner
         if (prepared.Errors.Count > 0)
         {
             var problem = string.Join(" ", prepared.Errors) + note;
-            return new JsonObject { ["error"] = problem, ["log"] = $"{sent} not sent: {problem}" };
+            return new JsonObject { ["error"] = problem, ["log"] = $"{sent} not sent: {problem}{Warnings(prepared)}" };
         }
 
         var exchange = await Executor.SendAsync(prepared, cancellationToken).ConfigureAwait(false);
@@ -568,16 +570,23 @@ public sealed partial class RequestRunner
         if (exchange.Response is not { } response)
         {
             var problem = (exchange.ErrorMessage ?? "No response.") + note;
-            return new JsonObject { ["error"] = problem, ["log"] = $"{sent} failed: {problem}" };
+            return new JsonObject { ["error"] = problem, ["log"] = $"{sent} failed: {problem}{Warnings(prepared)}" };
         }
 
         var cut = response.BodyTruncated ? ", body cut at the size limit" : "";
         return new JsonObject
         {
             ["response"] = ResponseReceived(exchange),
-            ["log"] = $"{sent} {response.StatusCode} {response.ReasonPhrase} ({exchange.Timing.Total?.TotalMilliseconds ?? 0:0} ms{cut}){note}",
+            ["log"] = $"{sent} {response.StatusCode} {response.ReasonPhrase} ({exchange.Timing.Total?.TotalMilliseconds ?? 0:0} ms{cut}){note}{Warnings(prepared)}",
         };
     }
+
+    /// <summary>
+    /// The warnings of a request that a script sent (a client certificate not used, a redirect not followed …), as lines of
+    /// the script's output after its own: the line says the unreplaced variables already.
+    /// </summary>
+    private static string Warnings(PreparedRequest request) =>
+        string.Concat(request.Warnings.Where(w => !w.StartsWith("Unresolved variables:", StringComparison.Ordinal)).Select(w => "\n  ⚠ " + w));
 
     /// <summary>Where a request went, for a script's output: without the query, which may hold a key, nor a password.</summary>
     private static string Shown(PreparedRequest request) => request.Uri is { } uri

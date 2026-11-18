@@ -112,18 +112,22 @@ public sealed class EchoServer : IAsyncDisposable
         });
 
         // A stream: server-sent events, or JSON lines with ?ndjson; ?count= of them (0: until the client goes), ?delay= ms
-        // apart, gzip-compressed (flushed after each) with ?gzip. Also /events/{count}/{delay}/…, for a URL that goes on.
+        // apart, compressed (flushed after each) with ?gzip, ?deflate or ?rawdeflate. Also /events/{count}/{delay}/…, for a URL that goes on.
         async Task Events(HttpContext ctx, int count, int delay)
         {
             var ndjson = ctx.Request.Query.ContainsKey("ndjson");
             ctx.Response.ContentType = ndjson ? "application/x-ndjson" : "text/event-stream; charset=utf-8";
-            var gzip = ctx.Request.Query.ContainsKey("gzip");
-            if (gzip)
+            var query = ctx.Request.Query;
+            var level = System.IO.Compression.CompressionLevel.Fastest;
+            await using Stream? body = query.ContainsKey("gzip") ? new System.IO.Compression.GZipStream(ctx.Response.Body, level, leaveOpen: true)
+                : query.ContainsKey("deflate") ? new System.IO.Compression.ZLibStream(ctx.Response.Body, level, leaveOpen: true)
+                : query.ContainsKey("rawdeflate") ? new System.IO.Compression.DeflateStream(ctx.Response.Body, level, leaveOpen: true) // as some servers send deflate
+                : null;
+            if (body is not null)
             {
-                ctx.Response.Headers.ContentEncoding = "gzip";
+                ctx.Response.Headers.ContentEncoding = query.ContainsKey("gzip") ? "gzip" : "deflate";
             }
 
-            await using var body = gzip ? new System.IO.Compression.GZipStream(ctx.Response.Body, System.IO.Compression.CompressionLevel.Fastest, leaveOpen: true) : null;
             var output = body ?? ctx.Response.Body;
             try
             {

@@ -96,6 +96,16 @@ public class ProxyTests
         Assert.Equal(("CONTOSO\\ada", true), read.Describe("HTTP://proxy.contoso.com:3128"));
         Assert.Null(read.Find("http://other:3128"));
 
+        // The sign-in moves with a proxy setting that changes: a password left as it was is the one kept for the proxy before.
+        Assert.True(read.Set("http://new-proxy:8080", "CONTOSO\\ada", null, keptFrom: "http://proxy.contoso.com:3128"));
+        Assert.Equal("s3cret-pw", read.Find("http://new-proxy:8080")?.Password);
+        Assert.False(read.Set("http://new-proxy:8080", "CONTOSO\\ada", null, keptFrom: "http://proxy.contoso.com:3128"));
+
+        // An empty password is kept as it is (DPAPI refuses no data).
+        Assert.True(read.Set("http://new-proxy:8080", "CONTOSO\\ada", ""));
+        Assert.Equal(("", ("CONTOSO\\ada", false)), (read.Find("http://new-proxy:8080")?.Password, read.Describe("http://new-proxy:8080")));
+        Assert.True(read.Set("http://new-proxy:8080", "", null));
+
         // A password left as it was (null) stays; an empty user forgets them; with nothing kept, the file goes.
         Assert.True(read.Set("http://proxy.contoso.com:3128", "CONTOSO\\ada2", null));
         Assert.Equal("s3cret-pw", read.Find("http://proxy.contoso.com:3128")?.Password);

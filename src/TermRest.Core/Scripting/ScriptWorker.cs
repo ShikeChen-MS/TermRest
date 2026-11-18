@@ -683,7 +683,9 @@ public sealed partial class ScriptWorker : IDisposable
             {
                 if (!_ended)
                 {
-                    await WriteAsync(input, new JsonObject { ["sent"] = answer }, _cancel.Token).ConfigureAwait(false);
+                    // Whole, once begun, even if the scripts are cancelled meanwhile: the rest of a line would join the runtime's
+                    // next message. A runtime that reads no more is stopped, which ends the write.
+                    await WriteAsync(input, new JsonObject { ["sent"] = answer }, CancellationToken.None).ConfigureAwait(false);
                 }
             }
             catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)

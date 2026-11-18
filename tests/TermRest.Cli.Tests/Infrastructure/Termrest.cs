@@ -27,8 +27,9 @@ internal static class Termrest
     /// <param name="input">Bytes for its standard input (closed right away when null).</param>
     /// <param name="whileRunning">What to do while the command runs (signal it…); its exit is awaited afterwards.</param>
     /// <param name="workingDirectory">The command's current folder (the tests' when null).</param>
+    /// <param name="outputLimit">Stop reading standard output once this many bytes came, and close it, as <c>| head -c</c> does.</param>
     public static async Task<CommandResult> RunAsync(IEnumerable<string> arguments, IReadOnlyDictionary<string, string>? environment = null, byte[]? input = null,
-        Func<Process, Task>? whileRunning = null, string? workingDirectory = null)
+        Func<Process, Task>? whileRunning = null, string? workingDirectory = null, int? outputLimit = null)
     {
         var start = new ProcessStartInfo(Dotnet)
         {
@@ -68,7 +69,9 @@ internal static class Termrest
 
         process.StandardInput.Close();
         using var output = new MemoryStream();
-        var copying = process.StandardOutput.BaseStream.CopyToAsync(output, timeout.Token);
+        var copying = outputLimit is { } limit
+            ? ReadSomeAsync(process.StandardOutput.BaseStream, output, limit, timeout.Token)
+            : process.StandardOutput.BaseStream.CopyToAsync(output, timeout.Token);
         var error = process.StandardError.ReadToEndAsync(timeout.Token);
         try
         {
@@ -86,5 +89,17 @@ internal static class Termrest
             process.Kill(entireProcessTree: true); // timed out, or whileRunning failed
             throw;
         }
+    }
+
+    private static async Task ReadSomeAsync(Stream output, MemoryStream into, int limit, CancellationToken cancellationToken)
+    {
+        var buffer = new byte[4096];
+        int read;
+        while (into.Length < limit && (read = await output.ReadAsync(buffer, cancellationToken)) > 0)
+        {
+            into.Write(buffer, 0, read);
+        }
+
+        await output.DisposeAsync(); // the reader goes
     }
 }

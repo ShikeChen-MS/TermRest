@@ -587,12 +587,12 @@ internal sealed class MainWindow : Runnable
             var version = live.Version;
             if (version != shown && opened == _opened)
             {
-                var (head, received, text, cut) = live.Read();
+                var (head, received, text, cut, ended) = live.Read();
                 if (head is not null)
                 {
                     shown = version;
-                    _response.ShowLive(head, received, text, cut);
-                    _editor.SetSending(true, streaming: true);
+                    _response.ShowLive(head, received, text, cut, ended);
+                    _editor.SetSending(true, streaming: !ended); // once read, Send cancels the scripts that run on it
                 }
             }
 
@@ -1517,11 +1517,18 @@ internal sealed class MainWindow : Runnable
 
     /// <summary>
     /// Another request is shown in the editor: a request still on its way for the one before goes on (its response goes
-    /// to the history and the status bar, not under this one), and Send sends this one.
+    /// to the history and the status bar, not under this one), and Send sends this one. A response still streaming is stopped,
+    /// keeping what arrived: nothing would show it any more, nor could stop it.
     /// </summary>
     private void DetachSending()
     {
         _opened++;
+        if (_live is { } live)
+        {
+            live.Stop();
+            _live = null;
+        }
+
         if (_sending is not null)
         {
             _sending = null;

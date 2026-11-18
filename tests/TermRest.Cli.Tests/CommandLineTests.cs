@@ -830,6 +830,33 @@ public sealed class CommandLineTests
     }
 
     [Fact]
+    public async Task Send_stops_a_stream_once_what_reads_its_output_has_gone()
+    {
+        await using var server = await TestServer.StartAsync();
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Events", "GET", server.BaseUrl + "/events?count=0")]);
+
+        var result = await Termrest.RunAsync(["send", collection, "Events", "--no-history"], outputLimit: 40); // | head -c 40
+
+        Assert.True(result.ExitCode == 0, result.ToString());
+        Assert.Contains("warning: The stream was stopped: its body is what arrived until then.", result.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Send_signs_in_to_the_system_proxy_with_proxy_user_rather_than_with_the_user_and_password_in_http_proxy()
+    {
+        await using var proxy = new SignInProxy("ada", "s3cret");
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Hello", "GET", "http://api.example.test/hello")]);
+        var environment = new Dictionary<string, string> { ["HTTP_PROXY"] = proxy.Url.Replace("http://", "http://ada:old-password@", StringComparison.Ordinal), ["NO_PROXY"] = "" };
+
+        var given = await Termrest.RunAsync(["send", collection, "Hello", "--proxy-user", "ada:s3cret", "--no-history"], environment);
+        var fromUrl = await Termrest.RunAsync(["send", collection, "Hello", "--no-history"], environment);
+
+        Assert.True(given.ExitCode == 0, given.ToString());
+        Assert.Contains("through the proxy", given.Text, StringComparison.Ordinal);
+        Assert.Contains("407", fromUrl.Error, StringComparison.Ordinal); // the URL's own, when none is given
+    }
+
+    [Fact]
     public async Task Ctrl_c_stops_a_stream_that_send_prints_keeping_what_arrived()
     {
         if (OperatingSystem.IsWindows())

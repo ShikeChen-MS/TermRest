@@ -81,9 +81,51 @@ public sealed class IterationDataFile
                         throw new InvalidDataException($"{Name}: item {number} of the array is not an object ({{\"name\": value, …}}) but {items.Current.ValueKind.ToString().ToLowerInvariant()}.");
                     }
 
+                    // Found here, when the file is read through before the run, rather than when the row is used, in the middle of it.
+                    if (RepeatedName(items.Current) is { } repeated)
+                    {
+                        throw new InvalidDataException($"{Name}: item {number} of the array has \"{repeated}\" twice in an object: a name can be there once.");
+                    }
+
                     yield return JsonObject.Create(items.Current)!;
                 }
             }
+        }
+    }
+
+    /// <summary>A name an object in <paramref name="element"/> (or in one it holds) has twice, if any.</summary>
+    private static string? RepeatedName(JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                var names = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var property in element.EnumerateObject())
+                {
+                    if (!names.Add(property.Name))
+                    {
+                        return property.Name;
+                    }
+
+                    if (RepeatedName(property.Value) is { } inner)
+                    {
+                        return inner;
+                    }
+                }
+
+                return null;
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    if (RepeatedName(item) is { } inner)
+                    {
+                        return inner;
+                    }
+                }
+
+                return null;
+            default:
+                return null;
         }
     }
 

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using Terminal.Gui.App;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
@@ -67,6 +68,7 @@ internal static class SettingsDialog
 
         // Kept for the proxy in the user's private credentials file, never in the workspace; a password left masked stays.
         const string keptPassword = "********";
+        var originalProxy = settings.Proxy;
         var (keptUser, hasPassword) = runner.ProxyCredentials.Describe(settings.Proxy);
         var proxyUser = Ui.AddRow(dialog, "Proxy sign-in", new TextField { Text = keptUser, Width = 22 }, y, 22);
         var proxyPassword = new TextField { X = Pos.Right(proxyUser) + 11, Y = y, Width = 16, Secret = true, Text = hasPassword ? keptPassword : "" };
@@ -182,13 +184,24 @@ internal static class SettingsDialog
             saved &= SaveApprovals(app, workspace, runner, outsideFiles.Value == CheckState.Checked, userDirectory);
 
             // The sign-in goes with the proxy the settings now name (the system's, or a URL), for this session and in the
-            // user's credentials file.
+            // user's credentials file, read again first: another TermRest may have saved sign-ins to it since (it is the
+            // user's, for every workspace). A password left masked is the one shown: that of the proxy named before.
+            var credentials = ProxyCredentialStore.Load(userDirectory);
             var password = proxyPassword.Text == keptPassword && hasPassword ? null : proxyPassword.Text;
-            if (runner.ProxyCredentials.Set(settings.Proxy, proxyUser.Text, password))
+            try
             {
-                saved &= Ui.TrySave(app, () => runner.ProxyCredentials.Save(userDirectory));
+                if (credentials.Set(settings.Proxy, proxyUser.Text, password, keptFrom: originalProxy ?? ProxyCredentialStore.SystemProxy))
+                {
+                    saved &= Ui.TrySave(app, () => credentials.Save(userDirectory));
+                }
+            }
+            catch (CryptographicException ex)
+            {
+                Ui.Error(app, "Proxy sign-in", $"The password could not be encrypted for your account, so the sign-in was not kept: {ex.Message}");
+                saved = false;
             }
 
+            runner.ProxyCredentials = credentials;
             return true;
         }
     }

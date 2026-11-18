@@ -231,8 +231,13 @@ public sealed class HttpExecutor
 
                 // Its sign-in: the user name and password given for it, else the user's own, which .NET sends only to an NTLM or
                 // Negotiate (Kerberos) challenge, never to a Basic or Digest one. A proxy HTTPS_PROXY names with a user and
-                // password signs in with those.
+                // password signs in with those, unless others were given for it: .NET would prefer the URL's.
                 handler.DefaultProxyCredentials = request.ProxyCredential ?? CredentialCache.DefaultCredentials;
+                if (request.ProxyCredential is { } signIn && capture.Proxy.Credentials is not null)
+                {
+                    handler.Proxy = capture.Proxy = new SignedInProxy(capture.Proxy, signIn);
+                }
+
                 break;
             case "none":
                 handler.UseProxy = false;
@@ -577,7 +582,6 @@ public sealed class HttpExecutor
     {
         var request = exchange.Request;
         var watcher = request.StreamWatcher;
-        watcher?.Started(Snapshot(response, [], truncated: false, received: 0));
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(watcher?.Stopping ?? CancellationToken.None, timeout?.Token ?? CancellationToken.None);
         using var reading = CancellationTokenSource.CreateLinkedTokenSource(stop.Token, cancellationToken);
         var codings = ContentCodings(response.Content.Headers);
@@ -588,23 +592,16 @@ public sealed class HttpExecutor
             codings.Clear();
         }
 
-        var wire = new CountingStream(await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false));
-        Stream source = wire;
-        for (var i = codings.Count - 1; i >= 0; i--)
-        {
-            source = codings[i] switch
-            {
-                "br" => new BrotliStream(source, CompressionMode.Decompress),
-                "deflate" => new ZLibStream(source, CompressionMode.Decompress),
-                _ => new GZipStream(source, CompressionMode.Decompress),
-            };
-        }
-
         using var body = new MemoryStream();
         var chunk = ArrayPool<byte>.Shared.Rent(16 * 1024);
         var (truncated, stopped) = (false, false);
+        ReadThrough? wire = null;
+        Stream? source = null;
+        watcher?.Started(Snapshot(response, [], truncated: false, received: 0));
         try
         {
+            wire = new ReadThrough(await response.Content.ReadAsStreamAsync(reading.Token).ConfigureAwait(false));
+            source = await DecodingAsync(wire, codings, reading.Token).ConfigureAwait(false);
             int read;
             while ((read = await source.ReadAsync(chunk.AsMemory(), reading.Token).ConfigureAwait(false)) > 0)
             {
@@ -637,19 +634,66 @@ public sealed class HttpExecutor
         finally
         {
             ArrayPool<byte>.Shared.Return(chunk);
-            await source.DisposeAsync().ConfigureAwait(false);
+            if (source is not null)
+            {
+                await source.DisposeAsync().ConfigureAwait(false);
+            }
+            else if (wire is not null)
+            {
+                await wire.DisposeAsync().ConfigureAwait(false);
+            }
+
+            watcher?.Ended();
         }
 
-        exchange.Response = Snapshot(response, ToArray(body), truncated, wire.Count, stopped);
+        exchange.Response = Snapshot(response, ToArray(body), truncated, wire?.Count ?? 0, stopped);
         if (warning is not null)
         {
             request.Warnings.Add(warning);
         }
     }
 
-    /// <summary>Counts what is read through it: the size of a streamed body as received, before its content codings are removed.</summary>
-    private sealed class CountingStream(Stream inner) : Stream
+    /// <summary>
+    /// A streamed body with its content codings removed as it is read, the last one applied first. Deflate is zlib data, as
+    /// the standard has it, or raw deflate data, as some servers send: its first byte tells, as for a whole body (see
+    /// <see cref="CreateDecoder"/>).
+    /// </summary>
+    private static async Task<Stream> DecodingAsync(Stream source, List<string> codings, CancellationToken cancellationToken)
     {
+        try
+        {
+            for (var i = codings.Count - 1; i >= 0; i--)
+            {
+                if (codings[i] == "deflate")
+                {
+                    var first = new byte[1];
+                    var read = await source.ReadAsync(first, cancellationToken).ConfigureAwait(false);
+                    source = new ReadThrough(source, first.AsMemory(0, read));
+                    source = read == 1 && (first[0] & 0x0F) != 8 ? new DeflateStream(source, CompressionMode.Decompress) : new ZLibStream(source, CompressionMode.Decompress);
+                }
+                else
+                {
+                    source = codings[i] == "br" ? new BrotliStream(source, CompressionMode.Decompress) : new GZipStream(source, CompressionMode.Decompress);
+                }
+            }
+
+            return source;
+        }
+        catch
+        {
+            await source.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Reads <paramref name="inner"/>, after <paramref name="prefix"/> (bytes read from it already, to look at them), and counts
+    /// what it reads from it: the size of a streamed body as received, before its content codings are removed.
+    /// </summary>
+    private sealed class ReadThrough(Stream inner, ReadOnlyMemory<byte> prefix = default) : Stream
+    {
+        private ReadOnlyMemory<byte> _prefix = prefix;
+
         public long Count { get; private set; }
 
         public override bool CanRead => true;
@@ -666,10 +710,12 @@ public sealed class HttpExecutor
             set => throw new NotSupportedException();
         }
 
-        public override int Read(byte[] buffer, int offset, int count) => Counted(inner.Read(buffer, offset, count));
+        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+
+        public override int Read(Span<byte> buffer) => _prefix.IsEmpty ? Counted(inner.Read(buffer)) : Replay(buffer);
 
         public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
-            Counted(await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false));
+            _prefix.IsEmpty ? Counted(await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) : Replay(buffer.Span);
 
         public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
             ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
@@ -705,6 +751,27 @@ public sealed class HttpExecutor
             Count += read;
             return read;
         }
+
+        private int Replay(Span<byte> buffer)
+        {
+            var count = Math.Min(buffer.Length, _prefix.Length);
+            _prefix.Span[..count].CopyTo(buffer);
+            _prefix = _prefix[count..];
+            return count;
+        }
+    }
+
+    /// <summary>
+    /// The system's proxy (<see cref="HttpClient.DefaultProxy"/>) with the user name and password given for it: .NET signs in
+    /// with a proxy's own credentials (those of a user and password in <c>HTTPS_PROXY</c>) before the handler's.
+    /// </summary>
+    private sealed class SignedInProxy(IWebProxy proxy, ICredentials credentials) : IWebProxy
+    {
+        public ICredentials? Credentials { get; set; } = credentials;
+
+        public Uri? GetProxy(Uri destination) => proxy.GetProxy(destination);
+
+        public bool IsBypassed(Uri host) => proxy.IsBypassed(host);
     }
 
     /// <summary>A body's content codings in the order they were applied, leaving out identity (and "none", which some servers send).</summary>

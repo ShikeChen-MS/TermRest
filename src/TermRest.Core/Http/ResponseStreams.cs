@@ -17,6 +17,12 @@ public interface IStreamWatcher
 
     /// <summary>A part of the body as it arrived, decoded (gzip …), within the maximum response size.</summary>
     void Received(ReadOnlySpan<byte> data);
+
+    /// <summary>
+    /// The body has been read: the stream ended, was stopped, or failed. What follows (post-response scripts …) is no longer
+    /// the stream's: stopping it does nothing now.
+    /// </summary>
+    void Ended();
 }
 
 /// <summary>
@@ -99,7 +105,8 @@ public static class ServerSentEvents
             {
                 if (hasData)
                 {
-                    events.Add(new ServerSentEvent(eventStart, eventEnd - eventStart, type ?? "message", idLine));
+                    // An empty event: field leaves the type message, as browsers have it.
+                    events.Add(new ServerSentEvent(eventStart, eventEnd - eventStart, type is { Length: > 0 } ? type : "message", idLine));
                     if ((events.Count & 1023) == 0)
                     {
                         cancellationToken.ThrowIfCancellationRequested();

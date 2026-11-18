@@ -20,17 +20,18 @@ internal sealed class LiveResponse : IStreamWatcher, IDisposable
     private long _received;
     private int _version;
     private ResponseSnapshot? _head;
+    private bool _ended;
 
     public CancellationToken Stopping => _stop.Token;
 
-    /// <summary>Whether the response streams: its head arrived, and its body is arriving.</summary>
+    /// <summary>Whether the response streams now: its head arrived, and its body is arriving (Stop ends it).</summary>
     public bool Streaming
     {
         get
         {
             lock (_gate)
             {
-                return _head is not null;
+                return _head is not null && !_ended;
             }
         }
     }
@@ -91,8 +92,20 @@ internal sealed class LiveResponse : IStreamWatcher, IDisposable
         }
     }
 
-    /// <summary>What arrived so far: the head (null until it arrives), how many bytes, and the text of the end, from the start of a line when it is cut.</summary>
-    public (ResponseSnapshot? Head, long Received, string Text, bool Cut) Read()
+    public void Ended()
+    {
+        lock (_gate)
+        {
+            _ended = true;
+            _version++;
+        }
+    }
+
+    /// <summary>
+    /// What arrived so far: the head (null until it arrives), how many bytes, the text of the end (from the start of a line
+    /// when it is cut), and whether the body has been read (scripts may still run on it).
+    /// </summary>
+    public (ResponseSnapshot? Head, long Received, string Text, bool Cut, bool Ended) Read()
     {
         lock (_gate)
         {
@@ -108,7 +121,7 @@ internal sealed class LiveResponse : IStreamWatcher, IDisposable
                 }
             }
 
-            return (_head, _received, Encoding.UTF8.GetString(tail), cut);
+            return (_head, _received, Encoding.UTF8.GetString(tail), cut, _ended);
         }
     }
 

@@ -117,6 +117,53 @@ public class ExampleTests
     }
 
     [Fact]
+    public void A_copy_of_a_v3_example_stays_right_after_its_original()
+    {
+        var root = V3Fixture.Create();
+        var collection = OpenV3(root);
+        var list = collection.FindRequest("Widgets/List widgets")!;
+        var original = Assert.Single(collection.GetExamples(list));
+        collection.AddExample(list, new ExampleSpec { Name = "Not found", Request = list.ReadSpec(), Code = 404, Status = "Not Found", Language = "text" });
+        collection.Save();
+
+        collection.DuplicateExample(original);
+        collection.Save();
+
+        var reopened = OpenV3(root);
+        Assert.Equal(["200 OK", "200 OK Copy", "Not found"], reopened.GetExamples(reopened.FindRequest("Widgets/List widgets")!).Select(e => e.Name));
+    }
+
+    [Theory]
+    [InlineData("Widgets")] // its folder, as a git checkout may remove it
+    [InlineData("Widgets/List widgets.request.yaml")] // its own file
+    public void An_example_saved_for_a_request_whose_file_went_brings_the_request_back(string gone)
+    {
+        var root = V3Fixture.Create();
+        var collection = OpenV3(root);
+        var list = collection.FindRequest("Widgets/List widgets")!;
+        var example = Assert.Single(collection.GetExamples(list));
+        var spec = example.ReadSpec();
+        spec.Body = "[1]";
+        Assert.True(collection.UpdateExample(example, spec));
+        if (Directory.Exists(F(root, gone)))
+        {
+            Directory.Delete(F(root, gone), recursive: true);
+        }
+        else
+        {
+            File.Delete(F(root, gone));
+        }
+
+        collection.Save();
+
+        // The request and its folder as they were (the folder's auth and scripts too), not an example nothing shows.
+        Assert.True(File.Exists(F(root, "Widgets/List widgets.request.yaml")));
+        Assert.True(File.Exists(F(root, "Widgets/.resources/definition.yaml")));
+        var reopened = OpenV3(root);
+        Assert.Equal("[1]", Assert.Single(reopened.GetExamples(reopened.FindRequest("Widgets/List widgets")!)).ReadSpec().Body);
+    }
+
+    [Fact]
     public void A_v3_collection_exported_or_copied_takes_its_examples_along()
     {
         var root = V3Fixture.Create();

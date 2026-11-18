@@ -32,15 +32,17 @@ public sealed class ScriptRequestTests : IDisposable
         await using var plain = await EchoServer.StartAsync();
         var workspace = ApiWorkspace.Open(TestFiles.NewTempDirectory());
         workspace.Settings.CaBundle = _pki.CaPemPath;
+
+        // Its passphrase in a variable, as the README advises: replaced, though the script's own request replaces none.
         workspace.Certificates.Entries.Add(new CertificateEntry
         {
             Name = "client",
             Matches = [$"https://localhost:{secure.BaseUri.Port}/*"],
             Pfx = new FileSource { Src = _pki.ClientPfxPath },
-            Passphrase = TestPki.Passphrase,
+            Passphrase = "{{pfxPassphrase}}",
         });
         var collection = workspace.CreateCollection("API");
-        collection.SetVariables([new KeyValueEntry { Key = "secure", Value = secure.Url("echo") }]);
+        collection.SetVariables([new KeyValueEntry { Key = "secure", Value = secure.Url("echo") }, new KeyValueEntry { Key = "pfxPassphrase", Value = TestPki.Passphrase }]);
 
         // A POST with a header and a JSON body, then one with a {{variable}} that is sent as written, which fails.
         var script = language switch

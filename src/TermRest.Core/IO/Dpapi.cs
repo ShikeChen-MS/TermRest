@@ -21,8 +21,10 @@ internal static partial class Dpapi
 
     private static unsafe byte[] Transform(ReadOnlySpan<byte> data, ReadOnlySpan<byte> entropy, bool protect)
     {
-        fixed (byte* input = data)
-        fixed (byte* salt = entropy)
+        // An empty span is pinned as a null pointer, which DPAPI refuses: a byte stands in for it (the size stays 0).
+        ReadOnlySpan<byte> placeholder = [0];
+        fixed (byte* input = data.IsEmpty ? placeholder : data)
+        fixed (byte* salt = entropy.IsEmpty ? placeholder : entropy)
         {
             var inBlob = new Blob { Size = data.Length, Data = (IntPtr)input };
             var saltBlob = new Blob { Size = entropy.Length, Data = (IntPtr)salt };

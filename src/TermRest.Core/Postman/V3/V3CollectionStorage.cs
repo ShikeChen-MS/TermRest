@@ -367,6 +367,21 @@ internal sealed class V3CollectionStorage : ICollectionStorage
     }
 
     /// <summary>
+    /// Whether saving writes or deletes example files of a request: its examples were loaded, and some are new, edited,
+    /// renamed or deleted (see <see cref="SaveExamples"/>). The snapshot that tells whether a request changed leaves them out.
+    /// </summary>
+    private bool ExamplesChange(JsonObject item)
+    {
+        if (IsFolder(item) || !_examples.TryGetValue(item, out var loaded))
+        {
+            return false;
+        }
+
+        var examples = (item["response"] as JsonArray ?? []).OfType<JsonObject>().ToList();
+        return examples.Count != loaded.Count || examples.Any(e => !loaded.TryGetValue(e, out var origin) || !JsonNode.DeepEquals(e, origin.Baseline));
+    }
+
+    /// <summary>
     /// Writes a request's saved examples where they changed: new ones as new files named for them (a name a file can't have
     /// is kept in it, as Postman keeps it), edited ones in place (only the edited entries), renamed ones under their new
     /// name, and deleted ones removed. The examples of a request that were never loaded are as they were: nothing to write.
@@ -423,11 +438,14 @@ internal sealed class V3CollectionStorage : ICollectionStorage
         }
 
         var order = loaded.Values.Select(o => OrderValue(o.V3["order"])).Max() ?? 0;
-        foreach (var json in examples)
+        double? previous = null; // the order of the example before, as the request shows them
+        for (var index = 0; index < examples.Count; index++)
         {
+            var json = examples[index];
             var name = json["name"].GetString() is { Length: > 0 } given ? given : "Example";
             if (loaded.TryGetValue(json, out var origin))
             {
+                previous = OrderValue(origin.V3["order"]) ?? previous;
                 if (JsonNode.DeepEquals(json, origin.Baseline))
                 {
                     continue;
@@ -453,6 +471,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
                 if (path != origin.Path && File.Exists(origin.Path))
                 {
                     File.Move(origin.Path, path); // a new name, also one that differs in case only
+                    origin.Path = path; // where it is now, should writing it fail: the next save finds it there
                 }
 
                 CreateFolder(folder);
@@ -471,8 +490,26 @@ internal sealed class V3CollectionStorage : ICollectionStorage
                 taken.Add(stem);
                 var created = V3Convert.ExampleToV3(json);
                 NameExample(created, name, stem);
-                order = (Math.Floor(order / 1000) + 1) * 1000;
-                created["order"] = order < 1e15 ? JsonValue.Create((long)order) : JsonValue.Create(order);
+
+                // Where the request shows it (a copy right after its original): between its neighbors, after the last in steps of 1000.
+                var next = examples.Skip(index + 1).Select(e => loaded.TryGetValue(e, out var o) ? OrderValue(o.V3["order"]) : null).FirstOrDefault(v => v is not null);
+                double value;
+                if (next is { } high && (previous is null || high > previous))
+                {
+                    value = previous is { } low ? low + ((high - low) / 2) : high - 1000;
+                    if (previous is { } below && high - below >= 2)
+                    {
+                        value = Math.Floor(value);
+                    }
+                }
+                else
+                {
+                    order = (Math.Floor(order / 1000) + 1) * 1000;
+                    value = order;
+                }
+
+                previous = value;
+                created["order"] = value == Math.Floor(value) && Math.Abs(value) < 1e15 ? JsonValue.Create((long)value) : JsonValue.Create(value);
                 CreateFolder(folder);
                 var path = Path.Combine(folder, stem + V3Names.ExampleSuffix);
                 var (text, info) = YamlFile.WriteChecked(null, created, Style, path, NewFile, out var written);
@@ -642,8 +679,9 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             }
         }
 
-        // Whether this save writes the item or puts it in place: it is new, moved, reordered or edited. A folder without an order
-        // gets one whenever its siblings change: while it is gone (see below), that alone is no change (see step 4).
+        // Whether this save writes the item or puts it in place: it is new, moved, reordered or edited, or its examples are. A
+        // folder without an order gets one whenever its siblings change: while it is gone (see below), that alone is no change
+        // (see step 4).
         var changes = new Dictionary<JsonObject, bool>(ReferenceEqualityComparer.Instance);
         bool Changes(JsonObject item)
         {
@@ -651,6 +689,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             {
                 changed = !pinned.Contains(item)
                           && (!_origins.TryGetValue(item, out var origin) || Moved(item) || !JsonNode.DeepEquals(Snapshot(item), origin.Baseline)
+                              || ExamplesChange(item)
                               || (orders.ContainsKey(item) && (!IsFolder(item) || OrderValue(origin.Order) is not null || System.IO.Directory.Exists(current[item]))));
                 changes[item] = changed;
             }
@@ -915,6 +954,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
         var isFolder = IsFolder(item);
         var file = isFolder ? V3Names.DefinitionPath(path) : path;
         var snapshot = Snapshot(item);
+        var examplesChange = ExamplesChange(item); // before they are written
         JsonObject v3;
         if (origin is not null && JsonNode.DeepEquals(snapshot, origin.Baseline))
         {
@@ -960,10 +1000,12 @@ internal sealed class V3CollectionStorage : ICollectionStorage
         }
 
         // Folders get a definition file when they are new, have something to store or had one (also when it is gone: see
-        // WriteAnew); requests always have a file.
+        // WriteAnew); requests always have a file. A request whose file is gone stays gone, as a folder does, unless its
+        // examples are written: they belong to it, so it is written anew.
         var hadFile = origin?.File is not null;
         var needsFile = !isFolder || origin is null || origin.V3 is not null || v3.Count > 1;
-        if (needsFile && !(hadFile && JsonNode.DeepEquals(v3, origin!.V3)))
+        var writtenAnew = !isFolder && hadFile && examplesChange && !File.Exists(file);
+        if (needsFile && (writtenAnew || !(hadFile && JsonNode.DeepEquals(v3, origin!.V3))))
         {
             var existing = File.Exists(file);
             if (existing && origin?.ReadError is { } error)

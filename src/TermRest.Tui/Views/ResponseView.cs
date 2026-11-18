@@ -290,14 +290,17 @@ internal sealed class ResponseView : View
 
     /// <summary>
     /// Shows a response that streams while it arrives (see <see cref="LiveResponse"/>): its status, its headers, and the end of
-    /// its text, followed as it grows. Once it ends, or is stopped, <see cref="ShowExchange"/> shows it whole, with its events.
+    /// its text, followed as it grows. <paramref name="ended"/>: its body has been read, and scripts may still run on it. Once
+    /// the request is done, <see cref="ShowExchange"/> shows it whole, with its events.
     /// </summary>
-    public void ShowLive(ResponseSnapshot head, long received, string text, bool cut)
+    public void ShowLive(ResponseSnapshot head, long received, string text, bool cut, bool ended = false)
     {
         _exchange = null; // Copy, Save and Filter wait for the whole response
         _fromHistory = false;
         _saveExample.Visible = false;
-        _status.Text = $"{head.StatusCode} {head.ReasonPhrase} · streaming · {HttpExchange.FormatSize(received)} so far · Esc stops it";
+        _status.Text = ended
+            ? $"{head.StatusCode} {head.ReasonPhrase} · {HttpExchange.FormatSize(received)} received …  (Esc or Send to cancel)"
+            : $"{head.StatusCode} {head.ReasonPhrase} · streaming · {HttpExchange.FormatSize(received)} so far · Esc stops it";
         _status.SchemeName = null;
         if (!ReferenceEquals(_liveHead, head))
         {
