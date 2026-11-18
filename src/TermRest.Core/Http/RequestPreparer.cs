@@ -88,8 +88,14 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
         prepared.AuthDescription = auth.Description;
         prepared.Credential = auth.Credential;
         prepared.CredentialSchemes = auth.CredentialSchemes;
+        prepared.OAuth2 = auth.OAuth2;
         prepared.Warnings.AddRange(auth.Warnings);
         prepared.AddSecretValues(auth.Secrets);
+        if (auth.OAuth2 is { ClientAuthentication: OAuth2ClientAuthentication.PrivateKeyJwt } oauth)
+        {
+            LoadSigningCertificate(oauth, prepared);
+        }
+
         foreach (var (key, value) in auth.QueryParameters)
         {
             // As in Postman, the helper's parameter replaces one of the same name and is encoded: a & would otherwise end the
@@ -144,9 +150,9 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
         }
 
         // Credentials in the URL (https://user:password@host) go as Basic auth, as curl and Postman send them: .NET would
-        // leave them out. An Authorization header or an auth helper takes precedence.
+        // leave them out. An Authorization header or an auth helper takes precedence (an OAuth 2.0 token fetched later too).
         if (prepared.Uri is { UserInfo.Length: > 0 } withCredentials && prepared.GetHeader("Authorization") is null
-            && auth.Headers.Count == 0 && auth.QueryParameters.Count == 0 && auth.Credential is null)
+            && auth.Headers.Count == 0 && auth.QueryParameters.Count == 0 && auth.Credential is null && auth.OAuth2 is null)
         {
             AddUrlCredentials(prepared, withCredentials.UserInfo);
         }
@@ -266,6 +272,43 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
         }
 
         return Variables.Resolve(value);
+    }
+
+    /// <summary>
+    /// Loads the certificate that signs an OAuth 2.0 client assertion: the entry of the workspace's certificate registry of
+    /// that name (it need match no URL). One that can't be loaded is an error: the request is not sent.
+    /// </summary>
+    private void LoadSigningCertificate(OAuth2Settings settings, PreparedRequest prepared)
+    {
+        var name = settings.AssertionCertificate;
+        if (name.Length == 0)
+        {
+            prepared.Errors.Add("OAuth 2.0: choose the certificate that signs the client assertion (private_key_jwt).");
+            return;
+        }
+
+        var named = certificates?.Registry.Entries.Where(e => string.Equals(e.Name, name, StringComparison.OrdinalIgnoreCase)).ToList() ?? [];
+        if (named.FirstOrDefault(e => !e.Disabled) is not { } entry)
+        {
+            prepared.Errors.Add(named.Count > 0
+                ? $"OAuth 2.0: certificate '{name}', which signs the client assertion, is turned off in the workspace's client certificates."
+                : $"OAuth 2.0: the workspace has no client certificate named '{name}' to sign the client assertion with (Tools › Client certificates…).");
+            return;
+        }
+
+        try
+        {
+            var loaded = certificates!.Load(entry, certificates.Registry.BaseDirectory, ResolveSecret, defaults.FilesFolder);
+            settings.SigningCertificate = loaded;
+            if (loaded.Summary is { IsExpired: true } summary)
+            {
+                prepared.Warnings.Add($"Certificate '{entry.Name}', which signs the client assertion, expired on {summary.NotAfter:yyyy-MM-dd}.");
+            }
+        }
+        catch (CertificateLoadException ex)
+        {
+            prepared.Errors.Add($"OAuth 2.0: certificate '{entry.Name}', which signs the client assertion, could not be loaded: {ex.Message}");
+        }
     }
 
     private System.Security.Cryptography.X509Certificates.X509Certificate2Collection? LoadTrust(List<string> warnings)

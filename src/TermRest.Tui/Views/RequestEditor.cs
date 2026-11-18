@@ -192,6 +192,40 @@ internal sealed class RequestEditor : View
         set => _auth.DescribeInherited = value;
     }
 
+    /// <summary>What the OAuth 2.0 token of the request's auth is (supplied by the main window, which has the tokens).</summary>
+    public Func<string>? DescribeToken
+    {
+        get => _auth.DescribeToken;
+        set => _auth.DescribeToken = value;
+    }
+
+    /// <summary>The names of the workspace's client certificates, which can sign OAuth 2.0 client assertions.</summary>
+    public Func<IReadOnlyList<string>>? CertificateNames
+    {
+        get => _auth.CertificateNames;
+        set => _auth.CertificateNames = value;
+    }
+
+    /// <summary>The Auth tab's Get new token was pressed.</summary>
+    public event EventHandler? GetTokenRequested
+    {
+        add => _auth.GetTokenRequested += value;
+        remove => _auth.GetTokenRequested -= value;
+    }
+
+    /// <summary>The Auth tab's Forget token was pressed.</summary>
+    public event EventHandler? ForgetTokenRequested
+    {
+        add => _auth.ForgetTokenRequested += value;
+        remove => _auth.ForgetTokenRequested -= value;
+    }
+
+    /// <summary>What the Auth tab says of the OAuth 2.0 token (for tests).</summary>
+    internal string TokenStatus => _auth.TokenStatus;
+
+    /// <summary>Says again what the OAuth 2.0 token of the request's auth is (one was fetched or forgotten).</summary>
+    public void RefreshTokenStatus() => _auth.RefreshTokenStatus();
+
     /// <summary>Folder that the request's relative file paths start from (its collection's folder).</summary>
     public Func<string>? BaseDirectory
     {

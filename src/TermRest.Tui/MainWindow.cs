@@ -4,6 +4,7 @@ using Terminal.Gui.Drawing;
 using Terminal.Gui.Input;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
+using TermRest.Core.Auth;
 using TermRest.Core.History;
 using TermRest.Core.Http;
 using TermRest.Core.Import;
@@ -113,6 +114,10 @@ internal sealed class MainWindow : Runnable
         {
             DescribeCertificate = DescribeCertificate,
             DescribeInheritedAuth = DescribeInheritedAuth,
+            DescribeToken = DescribeToken,
+
+            // Any registered certificate can sign an OAuth 2.0 client assertion, also one that matches no URL.
+            CertificateNames = () => [.. _workspace.Certificates.Entries.Select(e => e.Name).Where(n => n.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase)],
 
             // Where a relative body file is looked for when sending: the folder of the collection sending it.
             BaseDirectory = () => (_collection ?? _scratch)?.BaseDirectory ?? Environment.CurrentDirectory,
@@ -195,9 +200,14 @@ internal sealed class MainWindow : Runnable
         _history.DeleteRequested += (_, entry) => DeleteHistoryEntry(entry);
         _editor.Modified += (_, _) => UpdateTitles();
         _editor.SendRequested += (_, _) => Send();
+        _editor.GetTokenRequested += (_, _) => GetNewToken();
+        _editor.ForgetTokenRequested += (_, _) => ForgetToken();
         _editor.ManageCertificatesRequested += (_, _) => ShowCertificates();
         _editor.CurlPasted += (_, command) => ImportCurl(command, intoCurrent: true);
         _response.Notice += (_, message) => Notify(message);
+
+        // The user signs in for an OAuth 2.0 authorization code in a dialog of this window, while it runs.
+        _runner.OAuth2Interaction = new SignInDialog(() => _closed ? null : App, ShowTokenProgress);
 
         var first = workspace.Collections.SelectMany(c => c.AllRequests()).FirstOrDefault();
         if (first is not null)
@@ -562,6 +572,7 @@ internal sealed class MainWindow : Runnable
         {
             _editor.SetSending(false);
             _response.ShowExchange(exchange);
+            _editor.RefreshTokenStatus(); // an OAuth 2.0 token may have been fetched for it
         }
 
         var recordedAs = recorder is not null && ReferenceEquals(recorder, _runner.Recorder) && recorder.Count > recordedBefore ? recorder.Count : (int?)null;
@@ -1366,6 +1377,114 @@ internal sealed class MainWindow : Runnable
         return "No folder or collection auth is set, so no auth is sent.";
     }
 
+    /// <summary>What the Auth tab says of the OAuth 2.0 token of the request's auth, as it is now (its settings may have changed).</summary>
+    private string DescribeToken()
+    {
+        var prepared = _runner.Prepare(_collection ?? (_scratch ??= PostmanCollection.Create("Scratch")), SendContext, _editor.Spec);
+        if (prepared.OAuth2 is not { } settings)
+        {
+            return "None is fetched until the URLs are set.";
+        }
+
+        if (prepared.Errors.FirstOrDefault(e => e.StartsWith("OAuth 2.0: ", StringComparison.Ordinal)) is { } problem)
+        {
+            return "⚠ " + problem["OAuth 2.0: ".Length..];
+        }
+
+        if (_runner.OAuth2Tokens.Find(settings) is not { } token)
+        {
+            return "None yet: fetched when sent.";
+        }
+
+        var now = _runner.OAuth2Tokens.Time.GetUtcNow();
+        var expiry = token.DescribeExpiry(now);
+        return token.IsFresh(now) ? $"Fetched {token.ObtainedAt.ToLocalTime():HH:mm:ss}, {expiry}."
+            : $"{char.ToUpperInvariant(expiry[0])}{expiry[1..]}: {(token.RefreshToken is null ? "a new one is fetched" : "refreshed")} when sent.";
+    }
+
+    /// <summary>
+    /// The Auth tab's Get new token: fetches a token for the request's OAuth 2.0 settings now, signing in if they say so.
+    /// No exception may leave this async void method (see <see cref="Send"/>).
+    /// </summary>
+    private async void GetNewToken()
+    {
+        try
+        {
+            var prepared = _runner.Prepare(_collection ?? (_scratch ??= PostmanCollection.Create("Scratch")), SendContext, _editor.Spec);
+            if (prepared.OAuth2 is not { } settings)
+            {
+                Ui.Error(App!, "Get new token", "No token can be fetched until the URLs are set: the token URL, and for an authorization code the auth URL.");
+                return;
+            }
+
+            if (prepared.Errors.FirstOrDefault(e => e.StartsWith("OAuth 2.0: ", StringComparison.Ordinal)) is { } problem)
+            {
+                Ui.Error(App!, "Get new token", problem);
+                return;
+            }
+
+            Notify($"Fetching an OAuth 2.0 token from {OAuth2Tokens.Display(settings.AccessTokenUrl)} …");
+            OAuth2Result result;
+            try
+            {
+                result = await _runner.GetTokenAsync(prepared, fetchNew: true, _closing.Token);
+            }
+            catch (OAuth2Exception ex)
+            {
+                if (!_closed)
+                {
+                    Notify("");
+                    Ui.Error(App!, "Get new token", ex.Message);
+                    _editor.RefreshTokenStatus();
+                }
+
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                return; // the window closed
+            }
+
+            if (!_closed)
+            {
+                Notify($"✓ New OAuth 2.0 token from {result.Endpoint} ({result.Exchange}), {result.Token.DescribeExpiry(_runner.OAuth2Tokens.Time.GetUtcNow())}");
+                _editor.RefreshTokenStatus();
+            }
+        }
+        catch (Exception ex)
+        {
+            TuiApp.ReportUnexpectedError(IsRunning ? App : null, ex);
+        }
+    }
+
+    /// <summary>The Auth tab's Forget token: the next request fetches a new one.</summary>
+    private void ForgetToken()
+    {
+        var prepared = _runner.Prepare(_collection ?? (_scratch ??= PostmanCollection.Create("Scratch")), SendContext, _editor.Spec);
+        Notify(prepared.OAuth2 is { } settings && _runner.OAuth2Tokens.Forget(settings)
+            ? "OAuth 2.0 token forgotten: the next request fetches a new one."
+            : "No OAuth 2.0 token was fetched for these settings.");
+        _editor.RefreshTokenStatus();
+    }
+
+    /// <summary>Says that an OAuth 2.0 token is being fetched: where the response goes while a request waits for it, else in the status bar.</summary>
+    private void ShowTokenProgress(string text)
+    {
+        if (_closed)
+        {
+            return;
+        }
+
+        if (_sending is not null)
+        {
+            _response.ShowProgress($"{text}  (Esc or Send to cancel)");
+        }
+        else
+        {
+            Notify(text);
+        }
+    }
+
     private string EnvironmentLabel() => $"Env: {(_workspace.ActiveEnvironment is { } active ? _workspace.DisplayName(active) : "none")}";
 
     // ----- workspace ---------------------------------------------------------------------------
@@ -1534,6 +1653,8 @@ internal sealed class MainWindow : Runnable
         string curl;
         try
         {
+            // Nothing is sent: an OAuth 2.0 token is the one fetched earlier, if there is one (a warning says so otherwise).
+            _runner.AddCachedToken(prepared);
             curl = CurlExporter.Export(prepared);
         }
         catch (NotSupportedException ex)

@@ -211,6 +211,7 @@ public sealed partial class RequestRunner
         if (plan.IsEmpty && plan.Error is null && plan.Notes.Count == 0)
         {
             var request = Prepare(environment, collection, node, spec, spec, null);
+            await AuthorizeAsync(request, cancellationToken).ConfigureAwait(true);
             prepared?.Invoke(request);
             return await SendAsync(environment, request, cancellationToken).ConfigureAwait(true);
         }
@@ -257,6 +258,7 @@ public sealed partial class RequestRunner
         }
 
         var ready = Prepare(environment, collection, node, working, source, local);
+        await AuthorizeAsync(ready, cancellationToken).ConfigureAwait(true);
         prepared?.Invoke(ready);
         var exchange = await Executor.SendAsync(ready, cancellationToken).ConfigureAwait(true);
         exchange.Scripts = results;

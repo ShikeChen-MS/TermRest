@@ -20,7 +20,7 @@ internal static class SendCommand
         var raw = new Option<bool>("--raw") { Description = "Print the body as received (no JSON/XML pretty printing); with --filter, the values on one line" };
         var filter = new Option<string?>("--filter") { Description = "Print only the values a JSONPath query (RFC 9535) selects in a JSON body, as an array: --filter '$.items[?@.price < 10].id'" };
         var fail = new Option<bool>("--fail", "-f") { Description = "Exit with code 22 when the HTTP status is 400 or higher" };
-        var curl = new Option<bool>("--curl") { Description = "Print the request as a cURL command instead of sending it (scripts do not run)" };
+        var curl = new Option<bool>("--curl") { Description = "Print the request as a cURL command instead of sending it (scripts do not run, no OAuth 2.0 token is fetched)" };
         var noHistory = new Option<bool>("--no-history") { Description = "Do not record this request in the workspace history" };
         var options = new RequestOptions();
         command.Arguments.Add(collection);
@@ -89,7 +89,9 @@ internal static class SendCommand
             var spec = match.Node.ReadSpec();
             if (parseResult.GetValue(curl))
             {
+                // Nothing is sent, so no OAuth 2.0 token is fetched: a warning says the command has none.
                 var prepared = runner.Prepare(match.Collection, match.Node, spec);
+                runner.AddCachedToken(prepared);
                 PrintWarnings(prepared);
                 if (prepared.Errors.Count > 0)
                 {

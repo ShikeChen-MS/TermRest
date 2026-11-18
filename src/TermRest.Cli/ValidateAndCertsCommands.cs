@@ -188,7 +188,7 @@ internal static class CertsCommand
             foreach (var entry in workspace.Certificates.Entries)
             {
                 Console.Out.WriteLine($"{entry.Name}{(entry.Disabled ? " (disabled)" : "")}");
-                Console.Out.WriteLine($"  matches: {string.Join(", ", entry.Matches)}");
+                Console.Out.WriteLine($"  matches: {(entry.Matches.Count == 0 ? "none (sent to no server; it can sign OAuth 2.0 client assertions)" : string.Join(", ", entry.Matches))}");
                 Console.Out.WriteLine($"  source:  {entry.DescribeSource()}");
                 try
                 {

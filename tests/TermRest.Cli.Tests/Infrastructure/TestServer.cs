@@ -9,8 +9,9 @@ namespace TermRest.Cli.Tests.Infrastructure;
 /// Minimal HTTP/1.1 server for the commands under test (plain sockets: no web framework next to termrest.dll, which
 /// must find its own dependencies). <c>/bytes</c> returns a binary body, <c>/octets</c> and <c>/protobuf</c> binary
 /// bodies without a NUL byte, <c>/xlsx</c> an Excel workbook, <c>/large</c> 1.5 MB of zeros, <c>/utf8</c>
-/// <see cref="Utf8Json"/>, <c>/token</c> a login response with <see cref="Token"/>, <c>/wait</c> no response until the
-/// server stops (see <see cref="Waiting"/>); any other path returns the request as JSON.
+/// <see cref="Utf8Json"/>, <c>/token</c> a login (or OAuth 2.0 token) response with <see cref="Token"/>, <c>/auth</c> the
+/// request's Authorization header, <c>/wait</c> no response until the server stops (see <see cref="Waiting"/>); any
+/// other path returns the request as JSON.
 /// </summary>
 internal sealed class TestServer : IAsyncDisposable
 {
@@ -97,11 +98,12 @@ internal sealed class TestServer : IAsyncDisposable
                 }
 
                 // The body too, which may come with the headers, so that the connection closes cleanly.
-                var length = Encoding.ASCII.GetString(received.GetBuffer(), 0, end).Split("\r\n")
-                    .Select(line => line.Split(':', 2))
-                    .Where(parts => parts.Length == 2 && parts[0].Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
-                    .Select(parts => long.Parse(parts[1].Trim(), System.Globalization.CultureInfo.InvariantCulture))
+                var head = Encoding.ASCII.GetString(received.GetBuffer(), 0, end).Split("\r\n");
+                string? Header(string name) => head.Skip(1).Select(line => line.Split(':', 2))
+                    .Where(parts => parts.Length == 2 && parts[0].Trim().Equals(name, StringComparison.OrdinalIgnoreCase))
+                    .Select(parts => parts[1].Trim())
                     .FirstOrDefault();
+                var length = long.Parse(Header("Content-Length") ?? "0", System.Globalization.CultureInfo.InvariantCulture);
                 while (received.Length < end + 4 + length)
                 {
                     var count = await stream.ReadAsync(buffer, _stop.Token);
@@ -114,7 +116,7 @@ internal sealed class TestServer : IAsyncDisposable
                 }
 
                 Interlocked.Increment(ref _requests);
-                var requestLine = Encoding.ASCII.GetString(received.ToArray()).Split("\r\n")[0].Split(' ');
+                var requestLine = head[0].Split(' ');
                 var path = requestLine[1].Split('?')[0];
                 if (path == "/wait")
                 {
@@ -131,10 +133,11 @@ internal sealed class TestServer : IAsyncDisposable
                     "/large" => (new byte[1536 * 1024], "application/octet-stream"),
                     "/utf8" => (Encoding.UTF8.GetBytes(Utf8Json), "application/json; charset=utf-8"),
                     "/token" => (Encoding.UTF8.GetBytes($"{{\"access_token\":\"{Token}\",\"token_type\":\"Bearer\",\"expires_in\":3600}}"), "application/json"),
+                    "/auth" => (Encoding.UTF8.GetBytes(new JsonObject { ["authorization"] = Header("Authorization") }.ToJsonString()), "application/json"),
                     _ => (Encoding.UTF8.GetBytes(new JsonObject { ["method"] = requestLine[0], ["path"] = path }.ToJsonString()), "application/json"),
                 };
-                var head = $"HTTP/1.1 200 OK\r\nContent-Type: {type}\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n";
-                await stream.WriteAsync(Encoding.ASCII.GetBytes(head), _stop.Token);
+                var status = $"HTTP/1.1 200 OK\r\nContent-Type: {type}\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n";
+                await stream.WriteAsync(Encoding.ASCII.GetBytes(status), _stop.Token);
                 await stream.WriteAsync(body, _stop.Token);
             }
             catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException)

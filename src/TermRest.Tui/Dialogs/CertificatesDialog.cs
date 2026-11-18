@@ -229,6 +229,8 @@ internal static class CertificateEntryDialog
         var matches = Ui.AddRow(dialog, "URL patterns", new TextField { Text = entry.Matches.Count > 0 ? string.Join(", ", entry.Matches) : suggestion }, y);
         y += 1;
         dialog.Add(new Label { Text = "Comma separated, e.g. https://*.contoso.com/*, https://api.contoso.com:8443/*", X = 20, Y = y });
+        y += 1;
+        dialog.Add(Ui.Hint("None: it goes to no server, and can sign OAuth 2.0 client assertions (as any can).", 20, y));
         y += 2;
 
         var kind = Ui.AddRow(dialog, "Source", new OptionSelector
@@ -320,11 +322,7 @@ internal static class CertificateEntryDialog
             return "Enter a name.";
         }
 
-        if (entry.Matches.Count == 0)
-        {
-            return "Enter at least one URL pattern (for example https://api.contoso.com/*).";
-        }
-
+        // Without URL patterns it is sent to no server: it signs OAuth 2.0 client assertions.
         var invalid = entry.Matches.FirstOrDefault(m => !UrlMatchPattern.TryParse(m, out _));
         if (invalid is not null)
         {
