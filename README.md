@@ -5,7 +5,7 @@ A small terminal REST client for development and testing. **It is not another Po
 **Small by design:**
 
 - One native executable of about 21 MB. Nothing else to install: no runtime, no browser engine.
-- The full-screen UI, with a workspace open, takes under 90 MB of memory and next to no CPU when idle (16 ms of CPU time in 10 idle seconds). A `termrest send` takes about 23 MB. *(Working set, measured on Windows x64.)*
+- The full-screen UI, with a workspace open, takes about 32 MB of memory and next to no CPU when idle (a few tens of milliseconds of CPU time in 10 idle seconds): once idle, it gives back the memory that starting and working left behind. A `termrest send` takes about 23 MB. *(Working set, measured on Windows x64.)*
 - No account, no cloud sync, no telemetry, no update checks, no background service: when you quit, nothing of it keeps running. Script runtimes start only for the scripts that need them, and stop when idle.
 - Collections stay Postman's own files, so Postman and Newman open them at any time, for the 20% that TermRest leaves out: mock servers, monitors, team workspaces, API design and documentation, and gRPC and WebSocket requests.
 
@@ -21,7 +21,7 @@ What it has:
 - **Large bodies from files.** Send a file as the body without loading it: it is streamed when the request is sent, and a JSON or XML file is checked first.
 - **Client certificates (mutual TLS)** are first-class: PEM (including encrypted keys and chains), PFX/PKCS#12, and OS certificate stores. That includes the Windows certificate store with non-exportable keys and the macOS keychain. Certificates bind to URL patterns via a Newman-compatible registry, and a TLS tab shows exactly what was negotiated and presented.
 - **OAuth 2.0 tokens fetched for you** from any standards-based authorization server: client credentials, password, and authorization code with or without PKCE (you sign in with your browser). The client authenticates with its secret, or with a JWT signed by one of your client certificates. Tokens are kept in memory only and refreshed when they expire. See [OAuth 2.0](#oauth-20).
-- **One native executable** per platform: Windows, macOS and Linux on x64 and ARM64. Built with .NET 10 Native AOT: about 20 MB, starts in about 50 ms, no runtime to install.
+- **One native executable** per platform: Windows, macOS and Linux on x64 and ARM64. Built with .NET 10 Native AOT: about 21 MB, starts in about 50 ms, no runtime to install.
 - **A headless CLI** (`send`, `run`, `validate`, `convert`, `history`, `import-curl`, `certs`) for scripts and CI, using the same engine.
 
 > Status: **first prototype** (v0.1). See [Roadmap](#roadmap) and the original [design proposal](docs/design-proposal.md).

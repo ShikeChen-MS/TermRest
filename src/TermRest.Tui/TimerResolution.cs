@@ -72,21 +72,31 @@ internal static partial class TimerResolution
 /// <see cref="TuiApp.IterationsPerSecond"/>, with 1 ms timer resolution (<see cref="TimerResolution"/>), from keyboard or
 /// mouse input until <see cref="ActiveFor"/> after the last one, and while a request is on its way; otherwise at
 /// Terminal.Gui's default rate (25 passes a second) and the system's timer resolution. The main loop reads the rate
-/// before each pass, so a change applies from the next one.
+/// before each pass, so a change applies from the next one. Once the UI is idle, after starting and after use, the memory
+/// that what it did left behind is given back (see <see cref="Trim"/>).
 /// </summary>
 internal sealed class UiPace : IDisposable
 {
+    /// <summary>
+    /// What must have been allocated since the last trim for the next one to run: below it there is little to give back,
+    /// and idling costs no collection.
+    /// </summary>
+    private const long TrimAfter = 8 * 1024 * 1024;
+
     private readonly IApplication _app;
     private readonly Func<bool> _busy;
     private readonly ushort _idleRate = Application.MaximumIterationsPerSecond;
     private IDisposable? _timerResolution;
     private long _activeUntil;
+    private long _trimAt; // when the UI, idle then, gives back memory (0: not due)
+    private long _allocatedAtTrim;
 
     /// <param name="busy">Whether a request is on its way: the UI stays quick until its response is shown.</param>
     public UiPace(IApplication app, Func<bool>? busy = null)
     {
         _app = app;
         _busy = busy ?? (() => false);
+        _trimAt = Environment.TickCount64 + 1000; // once the window is shown and the workspace read
         app.Keyboard.KeyDown += OnKeyDown;
         app.Mouse.MouseEvent += OnMouse;
         app.Iteration += OnIteration;
@@ -114,6 +124,12 @@ internal sealed class UiPace : IDisposable
     {
         if (_timerResolution is null)
         {
+            if (_trimAt != 0 && Environment.TickCount64 >= _trimAt && !_busy())
+            {
+                _trimAt = 0;
+                Trim();
+            }
+
             return;
         }
 
@@ -124,6 +140,7 @@ internal sealed class UiPace : IDisposable
         else if (Environment.TickCount64 >= _activeUntil)
         {
             Idle();
+            _trimAt = Environment.TickCount64; // the next pass, not when disposed
         }
     }
 
@@ -145,5 +162,22 @@ internal sealed class UiPace : IDisposable
             _timerResolution.Dispose();
             _timerResolution = null;
         }
+    }
+
+    /// <summary>
+    /// Gives back the memory the UI is not using: what it allocated meanwhile (reading the workspace, drawing, responses
+    /// shown) is garbage now, which the GC would keep until it next runs, as long as the UI stays idle. A full, compacting
+    /// collection takes a few milliseconds while nothing happens.
+    /// </summary>
+    private void Trim()
+    {
+        var allocated = GC.GetTotalAllocatedBytes();
+        if (allocated - _allocatedAtTrim < TrimAfter)
+        {
+            return;
+        }
+
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        _allocatedAtTrim = GC.GetTotalAllocatedBytes();
     }
 }

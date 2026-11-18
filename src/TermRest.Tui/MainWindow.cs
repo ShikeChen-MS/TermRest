@@ -35,7 +35,7 @@ internal sealed class MainWindow : Runnable
     private readonly HistoryView _history;
     private readonly RequestEditor _editor;
     private readonly ResponseView _response;
-    private readonly ExampleResponseEditor _exampleEditor;
+    private ExampleResponseEditor? _exampleEditor; // see ExampleEditor
     private readonly Shortcut _environmentShortcut;
     private readonly RecordingIndicator _recordIndicator;
     private readonly Shortcut _message;
@@ -146,8 +146,7 @@ internal sealed class MainWindow : Runnable
             Height = Dim.Fill(1),
         };
         _response = new ResponseView();
-        _exampleEditor = new ExampleResponseEditor { Visible = false };
-        _responseFrame.Add(_response, _exampleEditor);
+        _responseFrame.Add(_response);
 
         // Window shortcuts, not application-wide ones: they must not act behind an open dialog. Names and messages are
         // shown as written.
@@ -198,7 +197,7 @@ internal sealed class MainWindow : Runnable
             }
             else if (item is ExampleNode example && OpenExample(example))
             {
-                _exampleEditor.SetFocus();
+                ExampleEditor.SetFocus();
             }
         };
         _tree.ContextMenuRequested += (_, position) => ShowContextMenu(position);
@@ -213,7 +212,6 @@ internal sealed class MainWindow : Runnable
         _history.ContextMenuRequested += (_, position) => ShowHistoryContextMenu(position);
         _history.DeleteRequested += (_, entry) => DeleteHistoryEntry(entry);
         _editor.Modified += (_, _) => UpdateTitles();
-        _exampleEditor.Modified += (_, _) => UpdateTitles();
         _response.SaveAsExampleRequested += (_, _) => SaveResponseAsExample();
         _editor.SendRequested += (_, _) => Send();
         _editor.GetTokenRequested += (_, _) => GetNewToken();
@@ -292,8 +290,24 @@ internal sealed class MainWindow : Runnable
         }
     }
 
-    /// <summary>The editor of an example's response (for tests).</summary>
-    internal ExampleResponseEditor ExampleEditor => _exampleEditor;
+    /// <summary>
+    /// The editor of an example's response, in the response pane's place while an example is open. Made when the first one
+    /// is opened: most sessions open none, and need not build it when they start.
+    /// </summary>
+    internal ExampleResponseEditor ExampleEditor
+    {
+        get
+        {
+            if (_exampleEditor is null)
+            {
+                _exampleEditor = new ExampleResponseEditor { Visible = false };
+                _exampleEditor.Modified += (_, _) => UpdateTitles();
+                _responseFrame.Add(_exampleEditor);
+            }
+
+            return _exampleEditor;
+        }
+    }
 
     /// <summary>Selects and opens a saved example (for tests).</summary>
     internal void ShowExample(ExampleNode example)
@@ -429,9 +443,9 @@ internal sealed class MainWindow : Runnable
         var spec = example.ReadSpec();
         _editor.ExampleMode = true;
         _editor.Load(spec.Request);
-        _exampleEditor.Load(spec);
+        ExampleEditor.Load(spec);
         _response.Visible = false;
-        _exampleEditor.Visible = true;
+        ExampleEditor.Visible = true;
         _responseFrame.Title = "Example response";
         UpdateTitles();
         return true;
@@ -447,8 +461,12 @@ internal sealed class MainWindow : Runnable
 
         _example = null;
         _editor.ExampleMode = false;
-        _exampleEditor.MarkClean();
-        _exampleEditor.Visible = false;
+        if (_exampleEditor is { } exampleEditor)
+        {
+            exampleEditor.MarkClean();
+            exampleEditor.Visible = false;
+        }
+
         _response.Visible = true;
         SetResponseTitle(null);
     }
@@ -473,18 +491,18 @@ internal sealed class MainWindow : Runnable
     {
         if (_example is not null && _collection is not null)
         {
-            if (_editor.IsModified || _exampleEditor.IsModified)
+            if (_editor.IsModified || ExampleEditor.IsModified)
             {
                 var spec = _example.ReadSpec();
                 spec.Request = _editor.Spec;
-                _exampleEditor.ApplyTo(spec);
+                ExampleEditor.ApplyTo(spec);
                 if (_collection.UpdateExample(_example, spec))
                 {
                     _tree.RefreshItem(_collection);
                 }
 
                 _editor.MarkClean();
-                _exampleEditor.MarkClean();
+                ExampleEditor.MarkClean();
                 UpdateTitles();
             }
 
@@ -2474,7 +2492,7 @@ internal sealed class MainWindow : Runnable
 
     private void UpdateTitles()
     {
-        var dirty = _editor.IsModified || _exampleEditor.IsModified || _collection?.IsDirty == true ? " ●" : "";
+        var dirty = _editor.IsModified || _exampleEditor?.IsModified == true || _collection?.IsDirty == true ? " ●" : "";
         var title = _example is { } example
             ? $"Example — {_workspace.DisplayName(example.Collection)} / {example.Request.PathInCollection} / {example.Name}{dirty}"
             : _node is not null
