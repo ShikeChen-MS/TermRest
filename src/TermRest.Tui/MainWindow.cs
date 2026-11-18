@@ -35,6 +35,7 @@ internal sealed class MainWindow : Runnable
     private readonly HistoryView _history;
     private readonly RequestEditor _editor;
     private readonly ResponseView _response;
+    private readonly ExampleResponseEditor _exampleEditor;
     private readonly Shortcut _environmentShortcut;
     private readonly RecordingIndicator _recordIndicator;
     private readonly Shortcut _message;
@@ -44,6 +45,9 @@ internal sealed class MainWindow : Runnable
     private MenuItem? _recordMenuItem;
     private PostmanCollection? _collection;
     private RequestNode? _node;
+
+    /// <summary>The saved example shown (its request in the editor, its response in the example editor), if any.</summary>
+    private ExampleNode? _example;
     private PostmanCollection? _scratch;
     private CancellationTokenSource? _sending;
 
@@ -141,7 +145,8 @@ internal sealed class MainWindow : Runnable
             Height = Dim.Fill(1),
         };
         _response = new ResponseView();
-        _responseFrame.Add(_response);
+        _exampleEditor = new ExampleResponseEditor { Visible = false };
+        _responseFrame.Add(_response, _exampleEditor);
 
         // Window shortcuts, not application-wide ones: they must not act behind an open dialog. Names and messages are
         // shown as written.
@@ -173,6 +178,10 @@ internal sealed class MainWindow : Runnable
             {
                 OpenRequest(request);
             }
+            else if (item is ExampleNode example && example != _example)
+            {
+                OpenExample(example);
+            }
         };
         _tree.ItemActivated += (_, item) =>
         {
@@ -185,6 +194,10 @@ internal sealed class MainWindow : Runnable
                 }
 
                 _editor.FocusUrl();
+            }
+            else if (item is ExampleNode example && OpenExample(example))
+            {
+                _exampleEditor.SetFocus();
             }
         };
         _tree.ContextMenuRequested += (_, position) => ShowContextMenu(position);
@@ -199,6 +212,8 @@ internal sealed class MainWindow : Runnable
         _history.ContextMenuRequested += (_, position) => ShowHistoryContextMenu(position);
         _history.DeleteRequested += (_, entry) => DeleteHistoryEntry(entry);
         _editor.Modified += (_, _) => UpdateTitles();
+        _exampleEditor.Modified += (_, _) => UpdateTitles();
+        _response.SaveAsExampleRequested += (_, _) => SaveResponseAsExample();
         _editor.SendRequested += (_, _) => Send();
         _editor.GetTokenRequested += (_, _) => GetNewToken();
         _editor.ForgetTokenRequested += (_, _) => ForgetToken();
@@ -276,6 +291,18 @@ internal sealed class MainWindow : Runnable
         }
     }
 
+    /// <summary>The editor of an example's response (for tests).</summary>
+    internal ExampleResponseEditor ExampleEditor => _exampleEditor;
+
+    /// <summary>Selects and opens a saved example (for tests).</summary>
+    internal void ShowExample(ExampleNode example)
+    {
+        if (OpenExample(example))
+        {
+            _tree.Select(example);
+        }
+    }
+
     /// <summary>Sends the current request and shows the result without an event loop (used by snapshots).</summary>
     internal async Task SendAndShowAsync(CancellationToken cancellationToken = default)
     {
@@ -312,6 +339,7 @@ internal sealed class MainWindow : Runnable
             new MenuItem("De_lete…", "", () => DeleteItem(_tree.SelectedItem)),
             new Line(),
             new MenuItem("Copy as c_URL", "", CopyAsCurl),
+            new MenuItem("Save response as e_xample…", "", () => SaveResponseAsExample()),
             new MenuItem("_Import from cURL…", "", ShowCurlImport),
             new MenuItem("_History", Key.F9, ToggleHistory),
             new MenuItem("Focus _URL bar", Key.L.WithCtrl, () => _editor.FocusUrl()),
@@ -361,6 +389,7 @@ internal sealed class MainWindow : Runnable
             DetachSending();
         }
 
+        LeaveExample();
         _collection = node.Collection;
         _node = node;
         _historyEntry = null;
@@ -372,8 +401,60 @@ internal sealed class MainWindow : Runnable
         return true;
     }
 
+    /// <summary>
+    /// Opens a saved example: its request in the editor (without Send: an example is not sent) and its response in the
+    /// example editor, in the response pane's place. False when the user keeps the request shown (see <see cref="ConfirmDiscardRequest"/>).
+    /// </summary>
+    private bool OpenExample(ExampleNode example)
+    {
+        if (example == _example)
+        {
+            return true;
+        }
+
+        if (!ConfirmDiscardRequest())
+        {
+            return false;
+        }
+
+        CommitEditor();
+        DetachSending();
+        _collection = example.Collection;
+        _node = null;
+        _historyEntry = null;
+        _historyOrigin = null;
+        _detachedName = null;
+        _example = example;
+        var spec = example.ReadSpec();
+        _editor.ExampleMode = true;
+        _editor.Load(spec.Request);
+        _exampleEditor.Load(spec);
+        _response.Visible = false;
+        _exampleEditor.Visible = true;
+        _responseFrame.Title = "Example response";
+        UpdateTitles();
+        return true;
+    }
+
+    /// <summary>The editor goes back to requests (its changes to the example committed before), and the response pane with it.</summary>
+    private void LeaveExample()
+    {
+        if (_example is null && !_editor.ExampleMode)
+        {
+            return;
+        }
+
+        _example = null;
+        _editor.ExampleMode = false;
+        _exampleEditor.MarkClean();
+        _exampleEditor.Visible = false;
+        _response.Visible = true;
+        SetResponseTitle(null);
+    }
+
     private void StartScratchRequest()
     {
+        LeaveExample();
         _scratch ??= PostmanCollection.Create("Scratch");
         _collection = _scratch;
         _node = null;
@@ -389,6 +470,26 @@ internal sealed class MainWindow : Runnable
     /// <summary>Writes pending editor changes into the in-memory collection (not to disk).</summary>
     private void CommitEditor()
     {
+        if (_example is not null && _collection is not null)
+        {
+            if (_editor.IsModified || _exampleEditor.IsModified)
+            {
+                var spec = _example.ReadSpec();
+                spec.Request = _editor.Spec;
+                _exampleEditor.ApplyTo(spec);
+                if (_collection.UpdateExample(_example, spec))
+                {
+                    _tree.RefreshItem(_collection);
+                }
+
+                _editor.MarkClean();
+                _exampleEditor.MarkClean();
+                UpdateTitles();
+            }
+
+            return;
+        }
+
         if (_node is null || _collection is null || !_editor.IsModified)
         {
             return;
@@ -409,7 +510,7 @@ internal sealed class MainWindow : Runnable
     /// </summary>
     private bool ConfirmDiscardRequest()
     {
-        if (_node is not null || !_editor.IsModified)
+        if (_node is not null || _example is not null || !_editor.IsModified)
         {
             return true;
         }
@@ -473,6 +574,12 @@ internal sealed class MainWindow : Runnable
         if (_sending is not null)
         {
             _sending.Cancel();
+            return;
+        }
+
+        if (_example is not null)
+        {
+            Notify($"An example is not sent: open its request, '{_example.Request.Name}', to send it.");
             return;
         }
 
@@ -609,7 +716,7 @@ internal sealed class MainWindow : Runnable
         {
             Notify($"⚠ Not saved: {string.Join(", ", changed)} changed on disk.");
         }
-        else if (_node is null && _editor.IsModified)
+        else if (_node is null && _example is null && _editor.IsModified)
         {
             Notify("This request is not in a collection yet: press Ctrl+N (Request > New request) to add it to one.");
         }
@@ -653,13 +760,14 @@ internal sealed class MainWindow : Runnable
             PostmanCollection collection => collection.RootNode,
             FolderNode folder => folder,
             RequestNode request => request.Parent,
+            ExampleNode example => example.Request.Parent,
             _ => _workspace.Collections.FirstOrDefault()?.RootNode,
         };
     }
 
     private void NewRequest()
     {
-        var adopting = _node is null; // the request in the editor becomes the new one (see AddRequest)
+        var adopting = _node is null && _example is null; // the request in the editor becomes the new one (see AddRequest)
         if (AddRequest() is not { } node)
         {
             return;
@@ -712,7 +820,7 @@ internal sealed class MainWindow : Runnable
 
         CommitEditor();
         HttpRequestSpec? spec = null;
-        if (_node is null)
+        if (_node is null && _example is null)
         {
             // A scratch, imported or history request becomes the new request.
             spec = _editor.Spec.Clone();
@@ -776,6 +884,11 @@ internal sealed class MainWindow : Runnable
                 _tree.RefreshItem(node);
                 _tree.RefreshItem(node.Collection);
                 break;
+            case ExampleNode example when Ui.PromptText(App!, "Rename example", "Name", example.Name) is { Length: > 0 } name:
+                example.Collection.RenameExample(example, name.Trim());
+                _tree.RefreshItem(example);
+                _tree.RefreshItem(example.Collection);
+                break;
         }
 
         UpdateTitles();
@@ -783,6 +896,20 @@ internal sealed class MainWindow : Runnable
 
     private void DuplicateItem(object? item)
     {
+        if (item is ExampleNode example)
+        {
+            CommitEditor();
+            var copied = example.Collection.DuplicateExample(example);
+            _tree.RefreshItem(example.Request);
+            _tree.RefreshItem(example.Collection);
+            if (OpenExample(copied))
+            {
+                _tree.Select(copied);
+            }
+
+            return;
+        }
+
         if (item is not CollectionNode node || node.Parent is null)
         {
             return;
@@ -805,6 +932,32 @@ internal sealed class MainWindow : Runnable
             return;
         }
 
+        if (item is ExampleNode example)
+        {
+            if (!Ui.Confirm(App!, "Delete", $"Delete example '{example.Name}' of '{example.Request.Name}'? You can undo by not saving (Ctrl+S writes the change).", "Delete", "Cancel"))
+            {
+                return;
+            }
+
+            var wasOpen = example == _example;
+            if (wasOpen)
+            {
+                _example = null; // its edits go with it
+                _editor.MarkClean();
+            }
+
+            example.Collection.RemoveExample(example);
+            _tree.RefreshItem(example.Request);
+            _tree.RefreshItem(example.Collection);
+            if (wasOpen && OpenRequest(example.Request))
+            {
+                _tree.Select(example.Request);
+            }
+
+            UpdateTitles();
+            return;
+        }
+
         if (item is not CollectionNode node || node.Parent is not { } parent)
         {
             return;
@@ -816,11 +969,13 @@ internal sealed class MainWindow : Runnable
             return;
         }
 
-        // Only the request open in the editor makes way: one that is not in a collection stays.
-        var openDeleted = _node is not null && (_node == node || _node.Ancestors().Contains(node));
+        // Only the request open in the editor makes way (or the example of it open): one that is not in a collection stays.
+        var shown = _node ?? _example?.Request;
+        var openDeleted = shown is not null && (shown == node || shown.Ancestors().Contains(node));
         if (openDeleted)
         {
             _node = null;
+            _example = null;
             _editor.MarkClean();
         }
 
@@ -834,6 +989,7 @@ internal sealed class MainWindow : Runnable
         if (openDeleted)
         {
             DetachSending();
+            LeaveExample();
             _collection = null;
             _editor.Load(new HttpRequestSpec());
             ClearResponse();
@@ -861,10 +1017,15 @@ internal sealed class MainWindow : Runnable
         if (item is not null)
         {
             items.Add(new Line());
+            if (item is ExampleNode toOpen)
+            {
+                items.Add(new MenuItem("_Open", "", () => OpenExample(toOpen)));
+            }
+
             items.Add(new MenuItem("Re_name…", "", () => RenameItem(item)));
         }
 
-        if (item is CollectionNode)
+        if (item is CollectionNode or ExampleNode)
         {
             items.Add(new MenuItem("_Duplicate", "", () => DuplicateItem(item)));
             items.Add(new MenuItem("De_lete…", "", () => DeleteItem(item)));
@@ -1558,10 +1719,11 @@ internal sealed class MainWindow : Runnable
 
     private void ReloadCollection(PostmanCollection loaded)
     {
-        var reopen = _collection == loaded ? _node?.PathInCollection : null;
+        // An example shown makes way for its request in the reloaded collection.
+        var reopen = _collection == loaded ? (_node ?? _example?.Request)?.PathInCollection : null;
 
         // A request from history stays in the editor, with the reloaded collection's variables.
-        var fromHistory = _collection == loaded && _node is null;
+        var fromHistory = _collection == loaded && _node is null && _example is null;
 
         // Loaded first: a file that no longer loads throws, and the editor goes on editing its request.
         var reloaded = _workspace.ReloadCollection(loaded);
@@ -1572,6 +1734,7 @@ internal sealed class MainWindow : Runnable
             _node = null;
             _collection = null;
             _editor.MarkClean();
+            LeaveExample();
         }
 
         string? originGone = null;
@@ -1636,6 +1799,47 @@ internal sealed class MainWindow : Runnable
         {
             Ui.Error(App!, "Import failed", ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Saves the response shown as an example of its request (Postman's Save Response › Save as example): the request as the
+    /// editor has it, and the response's status, headers and text. Asks for its name (<paramref name="name"/>: for tests).
+    /// </summary>
+    internal void SaveResponseAsExample(string? name = null)
+    {
+        if (_example is not null || _response.Exchange?.Response is not { } response)
+        {
+            Notify("No response to save as an example: send the request first.");
+            return;
+        }
+
+        // A response of a request from the history goes to the request it was sent from, while that is still there.
+        if ((_node ?? _historyOrigin) is not { } request)
+        {
+            Notify("Examples belong to a request in a collection: add this one to a collection first (Ctrl+N).");
+            return;
+        }
+
+        if (name is null && response.Body.LongLength > ResponseView.MaxShownLength
+            && !Ui.Confirm(App!, "Save as example", $"The body is {HttpExchange.FormatSize(response.Body.LongLength)}: the collection grows by as much. Save it in the example anyway?", "Save", "Cancel"))
+        {
+            return;
+        }
+
+        name ??= Ui.PromptText(App!, "Save as example", $"Example name (of {request.Name})", $"{response.StatusCode} {response.ReasonPhrase}".Trim());
+        if (name?.Trim() is not { Length: > 0 } exampleName)
+        {
+            return;
+        }
+
+        CommitEditor();
+        var spec = ExampleMapper.FromResponse(exampleName, _editor.Spec, response, out var note);
+        var example = request.Collection.AddExample(request, spec);
+        _tree.RefreshItem(request);
+        _tree.ExpandItem(request);
+        _tree.RefreshItem(request.Collection);
+        UpdateTitles();
+        Notify($"Saved example '{example.Name}' of '{request.Name}'; Ctrl+S writes it{(note is null ? "." : $" · ⚠ {note}")}");
     }
 
     private void CopyAsCurl()
@@ -1738,6 +1942,7 @@ internal sealed class MainWindow : Runnable
         CommitEditor();
         DetachSending();
         _node = null;
+        LeaveExample();
 
         // Variables keep resolving against the request's collection while it is still in the workspace. When several have its
         // name and which one it was is not known, the request is sent on its own.
@@ -2033,6 +2238,7 @@ internal sealed class MainWindow : Runnable
             CommitEditor();
             DetachSending();
             _node = null;
+            LeaveExample();
             _historyEntry = null;
             _historyOrigin = null;
             _collection = _scratch ??= PostmanCollection.Create("Scratch");
@@ -2042,7 +2248,7 @@ internal sealed class MainWindow : Runnable
         }
 
         UpdateTitles();
-        var next = _node is null ? "Ctrl+N adds it to a collection." : "Ctrl+S saves it.";
+        var next = _node is null && _example is null ? "Ctrl+N adds it to a collection." : "Ctrl+S saves it.";
         if (imported.Warnings.Count == 0)
         {
             Notify($"Imported from cURL: {spec.Method} {spec.Url}. {next}");
@@ -2136,9 +2342,14 @@ internal sealed class MainWindow : Runnable
                    $"Proxy: {DescribeProxy()}\n" +
                    $"History: {(_runner.History is { } history ? history.Folder : "off")}\n" +
                    $"Recording: {(_runner.Recorder is { } recorder ? $"on since {recorder.StartedAt:HH:mm:ss}, {recorder.Count} request(s), temporary files in {recorder.TempDirectory}" : $"off (temporary files go to {RequestRecorder.DefaultTempRoot()})")}";
-        if (_workspace.LoadErrors.Count > 0)
+        // With what was found since (an example file that could not be read when its request was first expanded, say).
+        var problems = _workspace.LoadErrors
+            .Concat(_workspace.Collections.SelectMany(c => c.LoadWarnings.Select(w => $"{c.Name}: {w}")))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (problems.Count > 0)
         {
-            info += "\n\nProblems while loading:\n" + string.Join('\n', _workspace.LoadErrors);
+            info += "\n\nProblems while loading:\n" + string.Join('\n', problems);
         }
 
         Ui.ShowText(App!, "Workspace", info);
@@ -2197,8 +2408,10 @@ internal sealed class MainWindow : Runnable
 
     private void UpdateTitles()
     {
-        var dirty = _editor.IsModified || _collection?.IsDirty == true ? " ●" : "";
-        var title = _node is not null
+        var dirty = _editor.IsModified || _exampleEditor.IsModified || _collection?.IsDirty == true ? " ●" : "";
+        var title = _example is { } example
+            ? $"Example — {_workspace.DisplayName(example.Collection)} / {example.Request.PathInCollection} / {example.Name}{dirty}"
+            : _node is not null
             ? $"Request — {_workspace.DisplayName(_node.Collection)} / {_node.PathInCollection}{dirty}"
             : _historyEntry is { } entry
                 ? $"Request (from history · {entry.Time.ToLocalTime():yyyy-MM-dd HH:mm:ss}){dirty}"

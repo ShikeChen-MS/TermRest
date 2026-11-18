@@ -32,8 +32,10 @@ internal sealed class RequestEditor : View
     private readonly OptionSelector _followRedirects;
     private readonly Label _certificateInfo;
     private readonly TextArea _description;
+    private readonly View[] _exampleTabs;
     private bool _loading;
     private bool _syncing;
+    private bool _exampleMode;
 
     public RequestEditor()
     {
@@ -68,7 +70,7 @@ internal sealed class RequestEditor : View
         };
         _url.KeyDown += (_, key) =>
         {
-            if (key == Key.Enter)
+            if (key == Key.Enter && !_exampleMode)
             {
                 SendRequested?.Invoke(this, EventArgs.Empty);
                 key.Handled = true;
@@ -158,6 +160,7 @@ internal sealed class RequestEditor : View
             _description);
 
         _tabs.AddTabs(_paramsTab, headersTab, authTab, bodyTab, scriptsTab, settingsTab);
+        _exampleTabs = [_paramsTab, headersTab, bodyTab];
         _tabs.ValueChanged += (_, e) =>
         {
             if (e.NewValue == settingsTab)
@@ -173,6 +176,27 @@ internal sealed class RequestEditor : View
     public HttpRequestSpec Spec { get; private set; } = new();
 
     public bool IsModified { get; private set; }
+
+    /// <summary>
+    /// Edits the request of a saved example: its method, URL, parameters, headers and body, as Postman's example editor
+    /// does. An example is not sent: Send is hidden, and Enter in the URL bar does nothing.
+    /// </summary>
+    public bool ExampleMode
+    {
+        get => _exampleMode;
+        set
+        {
+            if (_exampleMode == value)
+            {
+                return;
+            }
+
+            _exampleMode = value;
+            _tabs.ShowOnly(value ? _exampleTabs : null);
+            _send.Visible = !value;
+            _url.Width = value ? Dim.Fill() : Dim.Fill(11);
+        }
+    }
 
     public event EventHandler? Modified;
 

@@ -6,6 +6,7 @@ namespace TermRest.Core.Postman.V3;
 internal static class V3Names
 {
     public const string RequestSuffix = ".request.yaml";
+    public const string ExampleSuffix = ".example.yaml";
     public const string ResourcesDirectory = ".resources";
     public const string DefinitionFile = "definition.yaml";
     public const string EnvironmentSuffix = ".environment.yaml";

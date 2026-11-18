@@ -136,4 +136,37 @@ public sealed class RequestNode : CollectionNode
     internal HttpRequestSpec Baseline => _baseline ??= PostmanRequestMapper.Read(Json, Collection.SchemaVersion);
 
     internal void ResetBaseline() => _baseline = null;
+
+    /// <summary>The nodes of the request's examples so far, by their JSON: each example keeps one node (see <see cref="PostmanCollection.GetExamples"/>).</summary>
+    internal Dictionary<JsonObject, ExampleNode> ExampleNodes { get; } = new(ReferenceEqualityComparer.Instance);
+}
+
+/// <summary>A saved example of a request (Postman's saved response). Wraps (and edits in place) its JSON in the request's <c>response</c> array.</summary>
+public sealed class ExampleNode
+{
+    private ExampleSpec? _baseline;
+
+    internal ExampleNode(RequestNode request, JsonObject json)
+    {
+        Request = request;
+        Json = json;
+    }
+
+    /// <summary>The request the example belongs to.</summary>
+    public RequestNode Request { get; }
+
+    public PostmanCollection Collection => Request.Collection;
+
+    public JsonObject Json { get; }
+
+    public string Name => Json["name"].GetString() is { Length: > 0 } name ? name : "(unnamed)";
+
+    /// <summary>The example as currently stored in the collection JSON (a fresh copy every call).</summary>
+    public ExampleSpec ReadSpec() => Baseline.Clone();
+
+    internal ExampleSpec Baseline => _baseline ??= ExampleMapper.Read(Json, Collection.SchemaVersion);
+
+    internal void ResetBaseline() => _baseline = null;
+
+    public override string ToString() => Name;
 }

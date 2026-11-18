@@ -161,7 +161,11 @@ public sealed class PostmanCollection
     /// Writes this collection (any format) as a new Postman v3 YAML collection folder and returns it. Long values are
     /// wrapped at <paramref name="lineWidth"/> (null or 0: not wrapped). On Unix it is as private as this collection's file.
     /// </summary>
-    public PostmanCollection ConvertToV3(string directory, int? lineWidth = null) => V3CollectionStorage.ConvertFrom(this, directory, lineWidth);
+    public PostmanCollection ConvertToV3(string directory, int? lineWidth = null)
+    {
+        LoadAllExamples();
+        return V3CollectionStorage.ConvertFrom(this, directory, lineWidth);
+    }
 
     /// <summary>
     /// The secret variables (of the collection and its folders) whose values <see cref="ConvertToV3"/> leaves out: Postman's
@@ -177,9 +181,10 @@ public sealed class PostmanCollection
         [.. Descendants().OfType<FolderNode>().Prepend(RootNode).Where(f => f.Json[V3Convert.AuthSetsProperty] is JsonArray)
             .Select(f => f is CollectionRootNode ? $"collection '{Name}'" : $"folder '{f.PathInCollection}'")];
 
-    /// <summary>The collection as a Postman v2.1 JSON document (for any source format).</summary>
+    /// <summary>The collection as a Postman v2.1 JSON document (for any source format), with its saved examples.</summary>
     public string ExportV21Json()
     {
+        LoadAllExamples();
         var copy = (JsonObject)Root.DeepClone();
         if (copy["info"] is JsonObject info)
         {
@@ -373,6 +378,135 @@ public sealed class PostmanCollection
         return true;
     }
 
+    // ----- saved examples --------------------------------------------------------------------
+
+    /// <summary>
+    /// Whether a request has saved examples, found without reading files: a v3 collection keeps them in files of their own,
+    /// read when <see cref="GetExamples"/> first needs them.
+    /// </summary>
+    public bool HasExamples(RequestNode node) =>
+        (node.Json["response"] is JsonArray responses && responses.Any(r => r is JsonObject)) || (_storage?.HasUnloadedExamples(node.Json) ?? false);
+
+    /// <summary>
+    /// The request's saved examples, in order. A v3 collection's are read from their files the first time; files that
+    /// cannot be read are left out (and alone), with a warning in <see cref="LoadWarnings"/>.
+    /// </summary>
+    public IReadOnlyList<ExampleNode> GetExamples(RequestNode node)
+    {
+        EnsureOwned(node);
+        LoadExamples(node);
+        var examples = new List<ExampleNode>();
+        var current = new HashSet<JsonObject>(ReferenceEqualityComparer.Instance);
+        foreach (var json in (node.Json["response"] as JsonArray ?? []).OfType<JsonObject>())
+        {
+            if (!node.ExampleNodes.TryGetValue(json, out var example))
+            {
+                example = new ExampleNode(node, json);
+                node.ExampleNodes[json] = example;
+            }
+
+            current.Add(json);
+            examples.Add(example);
+        }
+
+        foreach (var gone in node.ExampleNodes.Keys.Where(json => !current.Contains(json)).ToList())
+        {
+            node.ExampleNodes.Remove(gone);
+        }
+
+        return examples;
+    }
+
+    /// <summary>Adds a saved example to a request, after its others.</summary>
+    public ExampleNode AddExample(RequestNode node, ExampleSpec spec)
+    {
+        EnsureOwned(node);
+        LoadExamples(node);
+        if (node.Json["response"] is not JsonArray responses)
+        {
+            responses = [];
+            node.Json.SetOrdered("response", responses, PostmanRequestMapper.ItemOrder);
+        }
+
+        var json = ExampleMapper.Create(spec, SchemaVersion);
+        responses.Add((JsonNode)json);
+        MarkDirty();
+        return GetExamples(node).First(e => e.Json == json);
+    }
+
+    /// <summary>Writes the parts of <paramref name="spec"/> that changed back into the example's JSON.</summary>
+    public bool UpdateExample(ExampleNode example, ExampleSpec spec)
+    {
+        EnsureOwned(example.Request);
+        if (spec.ContentEquals(example.Baseline))
+        {
+            return false;
+        }
+
+        ExampleMapper.Apply(example.Json, spec, example.Baseline, SchemaVersion);
+        example.ResetBaseline();
+        MarkDirty();
+        return true;
+    }
+
+    public void RenameExample(ExampleNode example, string name)
+    {
+        var spec = example.ReadSpec();
+        spec.Name = name;
+        UpdateExample(example, spec);
+    }
+
+    public void RemoveExample(ExampleNode example)
+    {
+        EnsureOwned(example.Request);
+        (example.Request.Json["response"] as JsonArray)?.Remove(example.Json);
+        example.Request.ExampleNodes.Remove(example.Json);
+        MarkDirty();
+    }
+
+    /// <summary>Copies an example, right after it, as "&lt;name&gt; Copy".</summary>
+    public ExampleNode DuplicateExample(ExampleNode example)
+    {
+        EnsureOwned(example.Request);
+        var responses = (JsonArray)example.Request.Json["response"]!;
+        var clone = (JsonObject)example.Json.DeepClone();
+        clone.SetOrdered("name", $"{example.Name} Copy", ExampleMapper.ExampleOrder);
+        clone.Remove("id");
+        responses.Insert(responses.IndexOf(example.Json) + 1, clone);
+        MarkDirty();
+        return GetExamples(example.Request).First(e => e.Json == clone);
+    }
+
+    /// <summary>Loads the request's examples where they are files of their own (see <see cref="HasExamples"/>).</summary>
+    private void LoadExamples(RequestNode node)
+    {
+        if (_storage?.LoadExamples(node.Json) is { Count: > 0 } problems)
+        {
+            LoadWarnings.AddRange(problems);
+        }
+    }
+
+    /// <summary>Loads the examples of every request in <paramref name="node"/> (all when null), before they are copied whole.</summary>
+    private void LoadAllExamples(CollectionNode? node = null)
+    {
+        if (_storage is null)
+        {
+            return;
+        }
+
+        var requests = node switch
+        {
+            null => AllRequests(),
+            RequestNode request => [request],
+            FolderNode folder => Walk(folder).OfType<RequestNode>(),
+            _ => [],
+        };
+        foreach (var request in requests)
+        {
+            LoadExamples(request);
+        }
+    }
+
     public RequestNode AddRequest(FolderNode parent, string name, HttpRequestSpec? spec = null)
     {
         EnsureOwned(parent);
@@ -439,6 +573,7 @@ public sealed class PostmanCollection
             throw new InvalidOperationException("Duplicate the collection file instead.");
         }
 
+        LoadAllExamples(node); // the copy has them too
         var clone = (JsonObject)node.Json.DeepClone();
         clone["name"] = $"{node.Name} Copy";
         StripIds(clone);
@@ -526,6 +661,11 @@ public sealed class PostmanCollection
     {
         item.Remove("id");
         item.Remove("_postman_id");
+        foreach (var example in (item["response"] as JsonArray ?? []).OfType<JsonObject>())
+        {
+            example.Remove("id");
+        }
+
         if (item["item"] is JsonArray children)
         {
             foreach (var child in children.OfType<JsonObject>())

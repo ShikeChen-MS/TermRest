@@ -3015,6 +3015,82 @@ public sealed class MainWindowTests : IDisposable
     }
 
     [Fact]
+    public async Task Save_as_example_keeps_the_response_under_its_request_where_it_opens_for_editing()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo");
+        var offered = false;
+        var screens = Drive(ui, () => ui.App.InjectKey(Key.F5),
+            ("200 OK", () =>
+            {
+                offered = ui.Window.ResponsePane.OffersSaveAsExample;
+                ui.Window.SaveResponseAsExample("Echoed");
+                ui.App.InjectKey(Key.S.WithCtrl); // saved: stopping asks nothing
+                ui.App.RequestStop();
+            }));
+        Assert.Single(screens);
+        Assert.True(offered);
+        OnScreen("Save as example", screens[0]);
+
+        var collection = ui.Workspace.Collections[0];
+        var request = collection.FindRequest("Basics/GET with query")!;
+        var example = Assert.Single(collection.GetExamples(request));
+        var spec = example.ReadSpec();
+        Assert.Equal(("Echoed", 200, "OK", "json"), (spec.Name, spec.Code, spec.Status, spec.Language));
+        Assert.Contains("/echo/get", spec.Body, StringComparison.Ordinal);
+        Assert.Equal("{{baseUrl}}/get?foo=bar&source=termrest", spec.Request.Url);
+
+        var token = ui.App.Begin(ui.Window);
+        ui.Click("e.g. Echoed");
+        var screen = ui.Screen();
+        OnScreen("Example — TermRest Demo / Basics/GET with query / Echoed", screen);
+        OnScreen("│Params│Headers│Body│", screen);
+        OnScreen("Example response", screen);
+        Assert.True(ui.Window.Editor.ExampleMode);
+
+        ui.Window.ExampleEditor.CodeField.Text = "201";
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        var saved = PostmanCollection.Load(collection.FilePath!);
+        var written = Assert.Single(saved.GetExamples(saved.FindRequest("Basics/GET with query")!)).ReadSpec();
+        Assert.Equal(("Echoed", 201, "OK"), (written.Name, written.Code, written.Status));
+        Assert.Equal(spec.Body, written.Body);
+    }
+
+    [Fact]
+    public void An_example_is_not_sent_and_its_edits_are_saved_until_a_request_is_opened()
+    {
+        var file = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        var demo = PostmanCollection.Load(file);
+        var post = demo.FindRequest("Basics/POST JSON")!;
+        demo.AddExample(post, new ExampleSpec { Name = "Created", Request = post.ReadSpec(), Code = 201, Status = "Created", Body = "{}", Language = "json" });
+        demo.Save();
+
+        using var ui = new Harness(_directory);
+        var collection = ui.Workspace.Collections[0];
+        var request = collection.FindRequest("Basics/POST JSON")!;
+        var token = ui.App.Begin(ui.Window);
+        ui.Window.ShowExample(Assert.Single(collection.GetExamples(request)));
+
+        ui.App.InjectKey(Key.F5);
+        var notice = ui.Window.StatusMessage;
+        ui.Window.ExampleEditor.BodyArea.SetFocus();
+        ui.Type("[");
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.Window.ShowRequest(request);
+        var screen = ui.Screen();
+        ui.App.End(token!);
+
+        Assert.Contains("An example is not sent", notice, StringComparison.Ordinal);
+        Assert.False(ui.Window.Editor.ExampleMode);
+        OnScreen("│Params│Headers│Auth│Body│Scripts│Settings│", screen);
+        OnScreen("Request — TermRest Demo / Basics/POST JSON", screen);
+        var saved = PostmanCollection.Load(file);
+        Assert.Equal("[{}", Assert.Single(saved.GetExamples(saved.FindRequest("Basics/POST JSON")!)).ReadSpec().Body);
+    }
+
+    [Fact]
     public void Space_and_clicking_the_checkbox_column_turn_table_rows_on_and_off()
     {
         using var ui = new Harness(_directory);

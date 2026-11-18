@@ -39,6 +39,7 @@ internal sealed class ResponseView : View
     private const int MinValueColumns = 10;
 
     private readonly Label _status;
+    private readonly Button _saveExample;
     private readonly TabPanel _tabs;
     private readonly View _bodyTab;
     private readonly TextArea _body;
@@ -73,7 +74,11 @@ internal sealed class ResponseView : View
         Width = Dim.Fill();
         Height = Dim.Fill();
 
-        _status = new Label { HotKeySpecifier = Ui.NoHotKey, X = 0, Y = 0, Width = Dim.Fill(), Text = "No response yet. Press F5 (or Enter in the URL bar) to send." };
+        _status = new Label { HotKeySpecifier = Ui.NoHotKey, X = 0, Y = 0, Width = Dim.Fill(17), Text = "No response yet. Press F5 (or Enter in the URL bar) to send." };
+
+        // Saves the response shown as an example of its request (Postman's Save Response › Save as example).
+        _saveExample = new Button { Text = "Save as example", X = Pos.AnchorEnd(15), Y = 0, NoDecorations = true, ShadowStyle = null, Visible = false };
+        _saveExample.Accepted += (_, _) => SaveAsExampleRequested?.Invoke(this, EventArgs.Empty);
 
         _tabs = new TabPanel { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill() };
 
@@ -181,7 +186,7 @@ internal sealed class ResponseView : View
             };
         }
 
-        Add(_status, _tabs, _findBar);
+        Add(_status, _saveExample, _tabs, _findBar);
         SetHeaders([]);
         _scripts.SetText(NoScripts);
     }
@@ -196,6 +201,12 @@ internal sealed class ResponseView : View
 
     /// <summary>Raised with short user-facing notices (copied, saved, …).</summary>
     public event EventHandler<string>? Notice;
+
+    /// <summary>Save as example was pressed (shown while a response is).</summary>
+    public event EventHandler? SaveAsExampleRequested;
+
+    /// <summary>Whether Save as example is offered (for tests).</summary>
+    internal bool OffersSaveAsExample => _saveExample.Visible;
 
     public HttpExchange? Exchange => _exchange;
 
@@ -226,6 +237,7 @@ internal sealed class ResponseView : View
     {
         _exchange = null;
         _fromHistory = false;
+        _saveExample.Visible = false;
         _status.Text = "No response yet. Press F5 (or Enter in the URL bar) to send.";
         _status.SchemeName = null;
         ShowBody("");
@@ -244,12 +256,14 @@ internal sealed class ResponseView : View
     {
         _status.Text = text;
         _status.SchemeName = null;
+        _saveExample.Visible = false;
     }
 
     public void ShowSending(PreparedRequest request)
     {
         _status.Text = $"Sending {request.Method} {request.Url} …  (Esc or Send to cancel)";
         _status.SchemeName = null;
+        _saveExample.Visible = false;
         _timeline.SetText(DescribeRequest(request, null));
     }
 
@@ -264,6 +278,7 @@ internal sealed class ResponseView : View
         _exchange = exchange;
         var response = exchange.Response;
         var scripts = exchange.Scripts;
+        _saveExample.Visible = response is not null;
         if (response is null)
         {
             _status.Text = exchange.Cancelled ? "Request cancelled." : $"Error: {exchange.ErrorMessage}";
