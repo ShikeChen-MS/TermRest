@@ -138,16 +138,23 @@ public sealed class HttpExecutor
                 request.Warnings.Add(ProxySignInHint);
             }
 
-            var (body, truncated, received, warning) = await ReadBodyAsync(response, request.MaxResponseBytes, linked.Token).ConfigureAwait(false);
-            exchange.Response = Snapshot(response, body, truncated, received);
-            if (warning is not null)
+            if (Streams(response))
             {
-                request.Warnings.Add(warning);
+                await ReadStreamAsync(exchange, response, timeoutSource, cancellationToken).ConfigureAwait(false);
             }
-
-            if (truncated)
+            else
             {
-                request.Warnings.Add($"The response body was truncated at {HttpExchange.FormatSize(request.MaxResponseBytes)}.");
+                var (body, truncated, received, warning) = await ReadBodyAsync(response, request.MaxResponseBytes, linked.Token).ConfigureAwait(false);
+                exchange.Response = Snapshot(response, body, truncated, received);
+                if (warning is not null)
+                {
+                    request.Warnings.Add(warning);
+                }
+
+                if (truncated)
+                {
+                    request.Warnings.Add($"The response body was truncated at {HttpExchange.FormatSize(request.MaxResponseBytes)}.");
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -554,6 +561,152 @@ public sealed class HttpExecutor
         return (body, cut, received.Length, null);
     }
 
+    /// <summary>Whether the response's body streams (see <see cref="ResponseStreams"/>); HEAD, 204 and 304 responses have none.</summary>
+    private static bool Streams(HttpResponseMessage response) =>
+        response.RequestMessage?.Method != HttpMethod.Head && response.StatusCode is not (HttpStatusCode.NoContent or HttpStatusCode.NotModified)
+        && ResponseStreams.Streams(response.Content.Headers.ContentType?.MediaType ?? RawContentType(response.Content.Headers));
+
+    /// <summary>
+    /// Reads a body that streams as it arrives, part by part, removing its content codings on the way, and gives each part
+    /// to the request's watcher. The watcher's stop and the request timeout end it, keeping what arrived, and so does a
+    /// connection that ends before the stream does; at most the maximum response size is kept (decoded). Cancelling the
+    /// request discards it, as it does any response.
+    /// </summary>
+    private static async Task ReadStreamAsync(HttpExchange exchange, HttpResponseMessage response, CancellationTokenSource? timeout,
+        CancellationToken cancellationToken)
+    {
+        var request = exchange.Request;
+        var watcher = request.StreamWatcher;
+        watcher?.Started(Snapshot(response, [], truncated: false, received: 0));
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(watcher?.Stopping ?? CancellationToken.None, timeout?.Token ?? CancellationToken.None);
+        using var reading = CancellationTokenSource.CreateLinkedTokenSource(stop.Token, cancellationToken);
+        var codings = ContentCodings(response.Content.Headers);
+        string? warning = null;
+        if (codings.Find(c => c is not ("gzip" or "x-gzip" or "deflate" or "br")) is { } unknown)
+        {
+            warning = $"The body is kept as received: TermRest cannot decode Content-Encoding '{unknown}'.";
+            codings.Clear();
+        }
+
+        var wire = new CountingStream(await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false));
+        Stream source = wire;
+        for (var i = codings.Count - 1; i >= 0; i--)
+        {
+            source = codings[i] switch
+            {
+                "br" => new BrotliStream(source, CompressionMode.Decompress),
+                "deflate" => new ZLibStream(source, CompressionMode.Decompress),
+                _ => new GZipStream(source, CompressionMode.Decompress),
+            };
+        }
+
+        using var body = new MemoryStream();
+        var chunk = ArrayPool<byte>.Shared.Rent(16 * 1024);
+        var (truncated, stopped) = (false, false);
+        try
+        {
+            int read;
+            while ((read = await source.ReadAsync(chunk.AsMemory(), reading.Token).ConfigureAwait(false)) > 0)
+            {
+                var count = (int)Math.Clamp(request.MaxResponseBytes - body.Length, 0, read);
+                body.Write(chunk, 0, count);
+                watcher?.Received(chunk.AsSpan(0, count));
+                if (count < read)
+                {
+                    (truncated, stopped) = (true, true);
+                    warning ??= $"The stream was stopped at the maximum response size, {HttpExchange.FormatSize(request.MaxResponseBytes)}: its body is what arrived until then.";
+                    break;
+                }
+            }
+        }
+        catch (Exception ex) when ((ex is OperationCanceledException or IOException or HttpRequestException) && stop.IsCancellationRequested
+                                   && !cancellationToken.IsCancellationRequested)
+        {
+            stopped = true;
+            warning ??= watcher?.Stopping.IsCancellationRequested != true && timeout?.IsCancellationRequested == true
+                ? $"The stream was stopped at the request timeout ({HttpExchange.Format(request.Timeout)}): its body is what arrived until then."
+                : "The stream was stopped: its body is what arrived until then.";
+        }
+        catch (Exception ex) when ((ex is IOException or HttpRequestException or InvalidDataException) && !cancellationToken.IsCancellationRequested)
+        {
+            stopped = true;
+            warning ??= ex is InvalidDataException
+                ? $"The rest of the stream could not be decoded (Content-Encoding: {string.Join(", ", codings)}): its body is what was decoded until then."
+                : $"The connection ended before the stream did ({ex.Message}): its body is what arrived until then.";
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(chunk);
+            await source.DisposeAsync().ConfigureAwait(false);
+        }
+
+        exchange.Response = Snapshot(response, ToArray(body), truncated, wire.Count, stopped);
+        if (warning is not null)
+        {
+            request.Warnings.Add(warning);
+        }
+    }
+
+    /// <summary>Counts what is read through it: the size of a streamed body as received, before its content codings are removed.</summary>
+    private sealed class CountingStream(Stream inner) : Stream
+    {
+        public long Count { get; private set; }
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => Counted(inner.Read(buffer, offset, count));
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            Counted(await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false));
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override void Flush()
+        {
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask DisposeAsync()
+        {
+            await inner.DisposeAsync().ConfigureAwait(false);
+            await base.DisposeAsync().ConfigureAwait(false);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+
+        private int Counted(int read)
+        {
+            Count += read;
+            return read;
+        }
+    }
+
     /// <summary>A body's content codings in the order they were applied, leaving out identity (and "none", which some servers send).</summary>
     private static List<string> ContentCodings(HttpContentHeaders headers)
     {
@@ -629,7 +782,7 @@ public sealed class HttpExecutor
     /// <summary>The buffer itself when the content fills it exactly, otherwise a copy of the content.</summary>
     private static byte[] ToArray(MemoryStream buffer) => buffer.Length == buffer.Capacity ? buffer.GetBuffer() : buffer.ToArray();
 
-    private static ResponseSnapshot Snapshot(HttpResponseMessage response, byte[] body, bool truncated, long received)
+    private static ResponseSnapshot Snapshot(HttpResponseMessage response, byte[] body, bool truncated, long received, bool stopped = false)
     {
         var headers = new List<KeyValuePair<string, string>>();
         void AddAll(HttpHeaders source)
@@ -655,6 +808,7 @@ public sealed class HttpExecutor
             Body = body,
             ReceivedBodySize = received,
             BodyTruncated = truncated,
+            Stopped = stopped,
             // .NET reads no type from a Content-Type it can't parse (a trailing ";", an empty charset …), which servers send:
             // the header as the server sent it then, as Postman reads it (the charset and media type are read leniently).
             ContentType = response.Content.Headers.ContentType?.ToString() ?? RawContentType(response.Content.Headers),

@@ -110,6 +110,44 @@ public sealed class EchoServer : IAsyncDisposable
             ctx.Response.ContentType = ctx.Request.ContentType;
             await ctx.Request.Body.CopyToAsync(ctx.Response.Body);
         });
+
+        // A stream: server-sent events, or JSON lines with ?ndjson; ?count= of them (0: until the client goes), ?delay= ms
+        // apart, gzip-compressed (flushed after each) with ?gzip. Also /events/{count}/{delay}/…, for a URL that goes on.
+        async Task Events(HttpContext ctx, int count, int delay)
+        {
+            var ndjson = ctx.Request.Query.ContainsKey("ndjson");
+            ctx.Response.ContentType = ndjson ? "application/x-ndjson" : "text/event-stream; charset=utf-8";
+            var gzip = ctx.Request.Query.ContainsKey("gzip");
+            if (gzip)
+            {
+                ctx.Response.Headers.ContentEncoding = "gzip";
+            }
+
+            await using var body = gzip ? new System.IO.Compression.GZipStream(ctx.Response.Body, System.IO.Compression.CompressionLevel.Fastest, leaveOpen: true) : null;
+            var output = body ?? ctx.Response.Body;
+            try
+            {
+                for (var i = 1; count == 0 || i <= count; i++)
+                {
+                    var text = ndjson ? $"{{\"n\":{i}}}\n" : $"id: {i}\nevent: tick\ndata: {{\"n\":{i}}}\n\n";
+                    await output.WriteAsync(Encoding.UTF8.GetBytes(text), ctx.RequestAborted);
+                    await output.FlushAsync(ctx.RequestAborted);
+                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                    if (delay > 0)
+                    {
+                        await Task.Delay(delay, ctx.RequestAborted);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // the client went
+            }
+        }
+
+        app.Map("/events", (HttpContext ctx) => Events(
+            ctx, int.TryParse(ctx.Request.Query["count"], out var count) ? count : 3, int.TryParse(ctx.Request.Query["delay"], out var delay) ? delay : 0));
+        app.Map("/events/{count:int}/{delay:int}/{**rest}", (HttpContext ctx, int count, int delay) => Events(ctx, count, delay));
         app.MapGet("/redirect", () => Results.Redirect("/echo?redirected=true"));
 
         // Any method: redirects to ?url= with ?status= (302 by default), setting the cookie in ?cookie= if given.

@@ -347,9 +347,10 @@ internal sealed class RequestEditor : View
         MarkModified();
     }
 
-    public void SetSending(bool sending)
+    /// <param name="streaming">The response streams: the button stops it, keeping what arrived.</param>
+    public void SetSending(bool sending, bool streaming = false)
     {
-        _send.Text = sending ? "Cancel" : "Send";
+        _send.Text = !sending ? "Send" : streaming ? "Stop" : "Cancel";
         SetNeedsDraw();
     }
 

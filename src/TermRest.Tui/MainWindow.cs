@@ -50,6 +50,7 @@ internal sealed class MainWindow : Runnable
     private ExampleNode? _example;
     private PostmanCollection? _scratch;
     private CancellationTokenSource? _sending;
+    private LiveResponse? _live; // the response of the request on its way, while it streams
 
     /// <summary>Counts the requests shown in the editor, so that a response arriving for an earlier one is not shown under another.</summary>
     private int _opened;
@@ -569,11 +570,50 @@ internal sealed class MainWindow : Runnable
         }
     }
 
+    /// <summary>
+    /// While a request is on its way, shows its response a few times a second once it streams (server-sent events, JSON
+    /// lines), as long as its request is the one open; the pane is drawn again only when more arrived.
+    /// </summary>
+    private void WatchLive(LiveResponse live, int opened)
+    {
+        var shown = 0;
+        App?.AddTimeout(TimeSpan.FromMilliseconds(250), () =>
+        {
+            if (_live != live || _closed)
+            {
+                return false;
+            }
+
+            var version = live.Version;
+            if (version != shown && opened == _opened)
+            {
+                var (head, received, text, cut) = live.Read();
+                if (head is not null)
+                {
+                    shown = version;
+                    _response.ShowLive(head, received, text, cut);
+                    _editor.SetSending(true, streaming: true);
+                }
+            }
+
+            return true;
+        });
+    }
+
     private async Task SendAsync()
     {
         if (_sending is not null)
         {
-            _sending.Cancel();
+            // A response that streams is stopped, keeping what arrived; anything else is cancelled.
+            if (_live is { Streaming: true } streaming)
+            {
+                streaming.Stop();
+            }
+            else
+            {
+                _sending.Cancel();
+            }
+
             return;
         }
 
@@ -607,6 +647,9 @@ internal sealed class MainWindow : Runnable
         _editor.SetSending(true);
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_closing.Token);
         _sending = cancellation;
+        using var live = new LiveResponse();
+        _live = live;
+        WatchLive(live, opened);
         var recorder = _runner.Recorder;
         var recordedBefore = recorder?.Count ?? 0;
         HttpExchange exchange;
@@ -616,6 +659,7 @@ internal sealed class MainWindow : Runnable
             exchange = await _runner.SendAsync(collection, SendContext, _editor.Spec, ready =>
             {
                 prepared = ready;
+                ready.StreamWatcher = live;
                 if (opened == _opened)
                 {
                     _response.ShowSending(ready);
@@ -664,6 +708,11 @@ internal sealed class MainWindow : Runnable
             if (_sending == cancellation)
             {
                 _sending = null;
+            }
+
+            if (_live == live)
+            {
+                _live = null;
             }
         }
 
@@ -2281,7 +2330,7 @@ internal sealed class MainWindow : Runnable
     private static readonly (string Keys, string Action)[] Shortcuts =
     [
         ("F5, Ctrl+Enter", "Send (again to cancel)"),
-        ("Esc", "Cancel a running request"),
+        ("Esc", "Cancel a request, stop a stream"),
         ("Ctrl+S", "Save all changes"),
         ("Ctrl+N", "New request"),
         ("F2", "Rename tree item"),
@@ -2500,10 +2549,19 @@ internal sealed class MainWindow : Runnable
 
     protected override bool OnKeyDown(Key key)
     {
-        // Esc is Terminal.Gui's default Quit key; in the main window it cancels a running request instead.
+        // Esc is Terminal.Gui's default Quit key; in the main window it cancels a running request instead, or stops a
+        // response that streams, keeping what arrived.
         if (key == Key.Esc)
         {
-            _sending?.Cancel();
+            if (_live is { Streaming: true } live)
+            {
+                live.Stop();
+            }
+            else
+            {
+                _sending?.Cancel();
+            }
+
             return true;
         }
 

@@ -572,6 +572,69 @@ public sealed class MainWindowTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task A_stream_is_shown_as_it_arrives_and_esc_stops_it_keeping_its_events()
+    {
+        await using var server = await TermRest.Core.Tests.Infrastructure.EchoServer.StartAsync();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.Url("events/0/20"));
+        var (live, stopped, events) = ("", "", "");
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            ui.App.InjectKey(Key.F5);
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            var screen = ui.Screen();
+            if (DateTime.UtcNow > deadline)
+            {
+                (live, stopped, events) = (live.Length > 0 ? live : screen, stopped.Length > 0 ? stopped : screen, screen);
+                ui.App.RequestStop();
+                return false;
+            }
+
+            if (live.Length == 0)
+            {
+                if (screen.Contains("200 OK · streaming ·", StringComparison.Ordinal) && screen.Contains("data: {\"n\":", StringComparison.Ordinal))
+                {
+                    live = screen;
+                    ui.App.InjectKey(Key.Esc);
+                }
+            }
+            else if (stopped.Length == 0)
+            {
+                if (screen.Contains("stream stopped", StringComparison.Ordinal))
+                {
+                    stopped = screen;
+                    var tab = ui.Find("│Events (");
+                    ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(tab.X + 2, tab.Y)));
+                }
+            }
+            else
+            {
+                events = screen;
+                ui.App.RequestStop();
+                return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("200 OK · streaming ·", live);
+        OnScreen("so far · Esc stops it", live);
+        OnScreen("⟦ Stop ⟧", live);
+        OnScreen("· stream stopped", stopped);
+        OnScreen("Event", events);
+        OnScreen("tick", events);
+        OnScreen("{\"n\":1}", events);
+        var response = ui.Window.ResponsePane.Exchange!.Response!;
+        Assert.True(response.Stopped);
+        Assert.StartsWith("id: 1\nevent: tick\ndata: {\"n\":1}\n\n", System.Text.Encoding.UTF8.GetString(response.Body), StringComparison.Ordinal);
+    }
+
     /// <summary>A screen's text with its lines joined and its box-drawing characters left out, so a check doesn't depend on where a dialog wraps.</summary>
     private static string Unwrapped(string screen) => System.Text.RegularExpressions.Regex.Replace(screen, @"[\s\u2500-\u259F]+", " ");
 
@@ -1894,7 +1957,7 @@ public sealed class MainWindowTests : IDisposable
         // Each column starts at the same place on every row (a message box would center every line on its own).
         int Column(params string[] texts) => Assert.Single(texts.Select(t => At(screen, t).X).Distinct());
         var keys = Column("F5, Ctrl+Enter", "Esc ", "F2 ", "Insert ", "F8 ", "F9 ");
-        var actions = Column("Send (again to cancel)", "Cancel a running request", "Rename tree item", "Add a table row", "Client certificates", "Collections ⇄ History");
+        var actions = Column("Send (again to cancel)", "Cancel a request, stop a stream", "Rename tree item", "Add a table row", "Client certificates", "Collections ⇄ History");
         var moreKeys = Column("F12  ", "Tab, Shift+Tab", "←, → (tab row)", "Shift+F10", "Ctrl+L", "Ctrl+F ", "F3, Shift+F3");
         var moreActions = Column("Start / stop recording", "Next / previous field", "Previous / next tab", "Focus the URL bar", "Find in the response", "Next / previous match");
         Assert.True(keys < actions && actions < moreKeys && moreKeys < moreActions, screen);

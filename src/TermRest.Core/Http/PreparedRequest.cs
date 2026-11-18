@@ -314,6 +314,12 @@ public sealed class PreparedRequest
 
     public long MaxResponseBytes { get; set; } = 50L * 1024 * 1024;
 
+    /// <summary>
+    /// Sees the response arrive when it streams (server-sent events, JSON lines), and can stop it, keeping what arrived; see
+    /// <see cref="IStreamWatcher"/>. Null: such a response is read whole, until the server ends it or the timeout stops it.
+    /// </summary>
+    public IStreamWatcher? StreamWatcher { get; set; }
+
     public List<string> Warnings { get; } = [];
 
     /// <summary>Problems that prevent sending (invalid URL, missing body file, ...).</summary>

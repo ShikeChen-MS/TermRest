@@ -814,6 +814,46 @@ public sealed class CommandLineTests
     }
 
     [Fact]
+    public async Task Send_prints_a_stream_as_it_arrives_once()
+    {
+        await using var server = await TestServer.StartAsync();
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Events", "GET", server.BaseUrl + "/events")]);
+
+        var result = await Termrest.RunAsync(["send", collection, "Events", "-i", "--no-history"]);
+
+        Assert.True(result.ExitCode == 0, result.ToString());
+        var events = string.Concat(Enumerable.Range(1, 3).Select(n => $"id: {n}\ndata: {{\"n\":{n}}}\n\n"));
+        var text = result.Text.ReplaceLineEndings("\n");
+        Assert.StartsWith("HTTP/1.1 200 OK\n", text, StringComparison.Ordinal);
+        Assert.EndsWith("Content-Type: text/event-stream\n\n" + events, text, StringComparison.Ordinal); // its headers, then its events, once
+        Assert.Contains("200 OK · streaming (Ctrl+C stops it, keeping what arrived)", result.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Ctrl_c_stops_a_stream_that_send_prints_keeping_what_arrived()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Skip("Signals a process: Unix only (Ctrl+C needs a console on Windows).");
+        }
+
+        await using var server = await TestServer.StartAsync();
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Events", "GET", server.BaseUrl + "/events?count=0")]);
+
+        var result = await Termrest.RunAsync(["send", collection, "Events", "--no-history"], whileRunning: async process =>
+        {
+            await server.Waiting.WaitAsync(TimeSpan.FromMinutes(1), TestContext.Current.CancellationToken);
+            await Task.Delay(200, TestContext.Current.CancellationToken);
+            using var interrupt = Process.Start("kill", ["-INT", process.Id.ToString(CultureInfo.InvariantCulture)])!;
+            await interrupt.WaitForExitAsync(TestContext.Current.CancellationToken);
+        });
+
+        Assert.True(result.ExitCode == 0, result.ToString());
+        Assert.StartsWith("id: 1\ndata: {\"n\":1}\n\nid: 2\n", result.Text, StringComparison.Ordinal);
+        Assert.Contains("warning: The stream was stopped: its body is what arrived until then.", result.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Send_filter_prints_the_values_a_jsonpath_query_selects()
     {
         await using var server = await TestServer.StartAsync();

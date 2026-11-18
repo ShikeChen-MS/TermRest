@@ -125,13 +125,23 @@ internal static class SendCommand
             }
 
             var printed = 0;
-            var exchange = await runner.SendAsync(match.Collection, match.Node, spec, prepared =>
+            HttpExchange exchange;
+            bool streamed;
+
+            // A response that streams is printed as it arrives, unless it goes to a file or a filter; Ctrl+C stops it.
+            using (var stream = new ConsoleStream(print: query is null && parseResult.GetValue(output) is null, parseResult.GetValue(include)))
             {
-                PrintWarnings(prepared);
-                printed = prepared.Warnings.Count;
-            }, cancellationToken);
+                exchange = await runner.SendAsync(match.Collection, match.Node, spec, prepared =>
+                {
+                    PrintWarnings(prepared);
+                    printed = prepared.Warnings.Count;
+                    prepared.StreamWatcher = stream;
+                }, cancellationToken);
+                streamed = stream.Printed;
+            }
+
             var recorded = options.SaveRecording(parseResult, runner, recorder, cancellationToken.IsCancellationRequested);
-            var code = await ReportAsync(parseResult, exchange, query, verbose, include, output, raw, fail, cancellationToken);
+            var code = await ReportAsync(parseResult, exchange, query, verbose, include, output, raw, fail, streamed, cancellationToken);
 
             // Those raised while it was sent: a redirect not followed, a header left out, a body cut short …
             PrintWarnings(exchange.Request, printed);
@@ -185,9 +195,10 @@ internal static class SendCommand
         return [];
     }
 
+    /// <param name="streamed">The body went to standard output as it arrived (a response that streams; see <see cref="ConsoleStream"/>).</param>
     private static async Task<int> ReportAsync(
         ParseResult parseResult, HttpExchange exchange, JsonPath? query, Option<bool> verbose, Option<bool> include, Option<string?> output, Option<bool> raw,
-        Option<bool> fail, CancellationToken cancellationToken)
+        Option<bool> fail, bool streamed, CancellationToken cancellationToken)
     {
         if (parseResult.GetValue(verbose))
         {
@@ -201,7 +212,7 @@ internal static class SendCommand
         }
 
         Output.Status($"{response.StatusCode} {response.ReasonPhrase} · {HttpExchange.Format(exchange.Timing.Total)} · {HttpExchange.FormatSize(response.Body.LongLength)}", response.StatusCode < 400);
-        if (parseResult.GetValue(include))
+        if (parseResult.GetValue(include) && !streamed)
         {
             Console.Out.WriteLine($"HTTP/{response.Version} {response.StatusCode} {response.ReasonPhrase}");
             foreach (var (key, value) in response.Headers)
@@ -232,6 +243,10 @@ internal static class SendCommand
             }
 
             Output.Info($"Saved {HttpExchange.FormatSize(response.Body.LongLength)} to {file}");
+        }
+        else if (streamed)
+        {
+            // printed as it arrived
         }
         else if (Console.IsOutputRedirected
                      ? parseResult.GetValue(raw) || BodyFormatter.IsBinary(response.Body, response.ContentType)
@@ -317,6 +332,87 @@ internal static class SendCommand
             foreach (var line in tls.Describe().Split('\n'))
             {
                 Output.Info("* " + line);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A response that streams (server-sent events, JSON lines): its body printed to standard output as it arrives (with -i,
+    /// after its headers), unless <c>print</c> is off (-o, --filter: they get it whole). The first Ctrl+C stops it, keeping
+    /// what arrived, which is then reported as the response.
+    /// </summary>
+    private sealed class ConsoleStream(bool print, bool include) : IStreamWatcher, IDisposable
+    {
+        private readonly CancellationTokenSource _stop = new();
+        private Stream? _stdout;
+
+        public CancellationToken Stopping => _stop.Token;
+
+        /// <summary>Whether the body went to standard output as it arrived.</summary>
+        public bool Printed { get; private set; }
+
+        public void Started(ResponseSnapshot head)
+        {
+            CliApp.Interrupt = Stop;
+            Output.Info($"{head.StatusCode} {head.ReasonPhrase} · streaming (Ctrl+C stops it, keeping what arrived)");
+            if (!print)
+            {
+                return;
+            }
+
+            if (include)
+            {
+                Console.Out.WriteLine($"HTTP/{head.Version} {head.StatusCode} {head.ReasonPhrase}");
+                foreach (var (key, value) in head.Headers)
+                {
+                    Console.Out.WriteLine($"{key}: {value}");
+                }
+
+                Console.Out.WriteLine();
+                Console.Out.Flush();
+            }
+
+            _stdout = Console.OpenStandardOutput();
+            Printed = true;
+        }
+
+        public void Received(ReadOnlySpan<byte> data)
+        {
+            if (_stdout is null || data.IsEmpty)
+            {
+                return;
+            }
+
+            try
+            {
+                _stdout.Write(data);
+                _stdout.Flush();
+            }
+            catch (IOException)
+            {
+                // What reads the output went (| head -n 5): the stream is stopped, as nothing reads it any more.
+                _stdout = null;
+                Stop();
+            }
+        }
+
+        /// <summary>The request ended: Ctrl+C stops the command again.</summary>
+        public void Dispose()
+        {
+            CliApp.Interrupt = null;
+            _stdout?.Dispose();
+            _stop.Dispose();
+        }
+
+        private void Stop()
+        {
+            try
+            {
+                _stop.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // it ended meanwhile
             }
         }
     }
