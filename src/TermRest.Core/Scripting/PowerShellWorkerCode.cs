@@ -45,6 +45,9 @@ internal static class PowerShellWorkerCode
             [System.Text.UTF8Encoding]::new($false))
         $TrMarker = [string][char]0x1E + 'TR '
 
+        # Requests that scripts send ($tr.SendRequest) go out as a line after the marker; TermRest answers each with a line of input.
+        $TrSends = @{ Sending = $false; Sent = 0; In = $Reader; Out = $TrOut; Marker = $TrMarker }
+
         # What scripts write to the console ([Console]::WriteLine, Out-Host…), kept until the running script's output takes it
         # (Receive-TrConsole): a .NET writer of its own, locked, as a PowerShell class's methods run only in this runspace, and a
         # write from another one (ForEach-Object -Parallel, a thread job) would wait for it forever. Up to 4 million characters
@@ -675,6 +678,13 @@ internal static class PowerShellWorkerCode
             [TrResponse] $Response
             [TrInfo] $Info
             hidden [System.Collections.Generic.List[object]] $Tests = [System.Collections.Generic.List[object]]::new()
+            hidden [hashtable] $Sends
+
+            # Sends a request through TermRest, with its certificates, proxy and settings, and returns its response (as $tr.Response
+            # has it); throws when it can't be sent. A URL, or as Postman's pm.sendRequest takes it: @{ url; method; header; body;
+            # auth }, where header may be a hashtable of names to values, and body text (raw), JSON (a hashtable without mode) or
+            # @{ mode = 'raw'; raw = … }. Its {{variables}} are sent as written: $tr.Variables.ReplaceIn replaces them.
+            [TrResponse] SendRequest([object] $request) { return Send-TrRequest $request $this.Sends }
 
             # Records a test, which fails when its script block throws ($tr.Assert, $tr.AssertEqual, throw…).
             [void] Test([string] $name, [scriptblock] $test) {
@@ -833,6 +843,26 @@ internal static class PowerShellWorkerCode
             $Items.Dropped += $dropped
         }
 
+        # $tr.SendRequest: asks TermRest to send the request (a line of output) and reads its answer (a line of input).
+        function Send-TrRequest([object] $Request, [hashtable] $Sends) {
+            if (-not $Sends.Sending) { throw [System.InvalidOperationException]::new('The scripts already finished: TermRest sends no more requests for them.') }
+            $Sends.Sent++
+            $json = ConvertTo-Json -InputObject $Request -Depth 20 -Compress
+            $Sends.Out.Write($Sends.Marker + '{"send":{"id":' + $Sends.Sent + ',"request":' + $json + '}}' + "`n")
+            $Sends.Out.Flush()
+            $line = $Sends.In.ReadLine()
+            $answer = $null
+            if ($null -ne $line) {
+                $document = [System.Text.Json.JsonDocument]::Parse($line)
+                try { $answer = (ConvertFrom-TrJson $document.RootElement)['sent'] } finally { $document.Dispose() }
+            }
+
+            if ($null -eq $answer) { $answer = @{ error = 'TermRest did not answer.' } }
+            if ($answer['log']) { [Console]::WriteLine([string] $answer['log']) }
+            if ($null -ne $answer['error']) { throw [System.Net.Http.HttpRequestException]::new([string] $answer['error']) }
+            return [TrResponse]::new($answer['response'])
+        }
+
         function Invoke-TrMessage([string] $Line) {
             $document = [System.Text.Json.JsonDocument]::Parse($Line)
             try {
@@ -878,6 +908,7 @@ internal static class PowerShellWorkerCode
             $tr.Request = [TrRequest]::new($message['request'], $phase -eq 'prerequest')
             if ($null -ne $message['response']) { $tr.Response = [TrResponse]::new($message['response']) }
             $tr.Info = $info
+            $tr.Sends = $TrSends
             $logs = [System.Collections.Generic.List[object]]::new()
             $dropped = 0
             $failure = $null
@@ -978,12 +1009,15 @@ internal static class PowerShellWorkerCode
         while ($true) {
             $line = $Reader.ReadLine()
             if ($null -eq $line) { break }
+            $TrSends.Sending = $true
             try {
                 $reply = Invoke-TrMessage $line
             }
             catch {
                 $reply = @{ fatal = ($_ | Out-String) + $_.ScriptStackTrace }
             }
+
+            $TrSends.Sending = $false
 
             $TrOut.Write($TrMarker + (ConvertTo-Json -InputObject $reply -Depth 10 -Compress) + "`n")
             $TrOut.Flush()

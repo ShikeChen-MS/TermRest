@@ -109,9 +109,15 @@ public sealed partial class ScriptWorker : IDisposable
     /// Scripts that may run next, in the same language (C#: the collection's, built into the same program so that its
     /// other requests need no new build).
     /// </param>
+    /// <param name="send">
+    /// Sends a request that the scripts send through TermRest (pm.sendRequest, tr.send_request …), given as they gave it, and
+    /// returns what they get: <c>{"response": …}</c> or <c>{"error": "…"}</c>, with a <c>"log"</c> line for their output.
+    /// Requests are sent while the scripts wait for them, several at a time when they send several; those still running
+    /// when the scripts end are cancelled. Null: the scripts get an error.
+    /// </param>
     /// <exception cref="ScriptException">The runtime could not start, stopped, or did not answer within <paramref name="timeout"/>.</exception>
     public async Task<JsonObject> RunAsync(JsonObject message, TimeSpan timeout, IEnumerable<ScriptCode>? related = null,
-        CancellationToken cancellationToken = default)
+        Func<JsonNode?, CancellationToken, Task<JsonObject>>? send = null, CancellationToken cancellationToken = default)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -133,7 +139,17 @@ public sealed partial class ScriptWorker : IDisposable
                 }
 
                 await WriteAsync(process.StandardInput.BaseStream, message, limit.Token).ConfigureAwait(false);
-                var line = await ReadReplyAsync(process, limit.Token).ConfigureAwait(false);
+                var sends = new ScriptSends(process.StandardInput.BaseStream, send, limit.Token);
+                string? line = null;
+                try
+                {
+                    line = await ReadReplyAsync(process, sends, limit.Token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    await sends.EndAsync(answered: line is not null).ConfigureAwait(false);
+                }
+
                 if (line is null)
                 {
                     ObjectDisposedException.ThrowIf(_disposed, this); // stopped while the scripts ran
@@ -314,24 +330,35 @@ public sealed partial class ScriptWorker : IDisposable
         }
     }
 
-    /// <summary>The reply line; with a reply marker, other lines (output of programs that scripts started) are skipped.</summary>
-    private async Task<string?> ReadReplyAsync(Process process, CancellationToken cancellationToken)
+    /// <summary>
+    /// The reply line; with a reply marker, other lines (output of programs that scripts started) are skipped. Lines that
+    /// send a request (see <see cref="ScriptSends"/>) start it, and reading goes on.
+    /// </summary>
+    private async Task<string?> ReadReplyAsync(Process process, ScriptSends sends, CancellationToken cancellationToken)
     {
         while (await process.StandardOutput.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
         {
-            if (_replyMarker is null)
+            var payload = line;
+            if (_replyMarker is not null)
             {
-                return line;
+                var at = line.IndexOf(_replyMarker, StringComparison.Ordinal);
+                if (at < 0)
+                {
+                    Remember(line);
+                    Remember("\n");
+                    continue;
+                }
+
+                payload = line[(at + _replyMarker.Length)..];
             }
 
-            var at = line.IndexOf(_replyMarker, StringComparison.Ordinal);
-            if (at >= 0)
+            if (!payload.StartsWith(ScriptSends.Prefix, StringComparison.Ordinal))
             {
-                return line[(at + _replyMarker.Length)..];
+                return payload;
             }
 
-            Remember(line);
-            Remember("\n");
+            sends.Start(JsonNode.Parse(WellFormed(payload))?["send"] as JsonObject
+                ?? throw new JsonException($"{Name} sent a request that is not an object."));
         }
 
         return null;
@@ -544,6 +571,129 @@ public sealed partial class ScriptWorker : IDisposable
         finally
         {
             process.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The requests a run's scripts send through TermRest. The runtime writes a line <c>{"send":{"id":n,"request":…}}</c> (after
+    /// its reply marker) and waits; each is sent at once, while the reading goes on, and answered with a line of input
+    /// <c>{"sent":{"id":n,"response"|"error":…,"log":"…"}}</c>, under a lock, as several may end together. None is answered
+    /// once the scripts' reply came: it would be read as the next message.
+    /// </summary>
+    private sealed class ScriptSends(Stream input, Func<JsonNode?, CancellationToken, Task<JsonObject>>? send, CancellationToken cancellationToken)
+        : IDisposable
+    {
+        public const string Prefix = "{\"send\":";
+
+        /// <summary>How many are sent at once, at most: a script that starts thousands waits for its turn, without as many connections.</summary>
+        private const int AtOnce = 6;
+
+        private readonly SemaphoreSlim _write = new(1, 1);
+        private readonly SemaphoreSlim _slots = new(AtOnce, AtOnce);
+        private readonly CancellationTokenSource _cancel = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        private readonly List<Task> _running = [];
+        private volatile bool _ended;
+
+        public void Start(JsonObject request)
+        {
+            _running.RemoveAll(task => task.IsCompleted);
+            _running.Add(AnswerAsync(request));
+        }
+
+        /// <param name="answered">
+        /// Whether the scripts replied: requests still running are cancelled once the answer being written is whole. Else the
+        /// runtime is stopped: they are cancelled at once and not waited for (a write to a runtime that reads no more never ends).
+        /// </param>
+        public async Task EndAsync(bool answered)
+        {
+            if (_running.Count == 0)
+            {
+                Dispose();
+                return;
+            }
+
+            if (answered)
+            {
+                await _write.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                _ended = true;
+                _write.Release();
+            }
+
+            _ended = true;
+            await _cancel.CancelAsync().ConfigureAwait(false);
+            if (answered)
+            {
+                await Task.WhenAll(_running).ConfigureAwait(false); // they end at once: they catch everything
+                Dispose();
+            }
+        }
+
+        /// <summary>Once no request runs: those of a stopped runtime may still (they end soon, and are left to the collector).</summary>
+        public void Dispose()
+        {
+            _cancel.Dispose();
+            _write.Dispose();
+            _slots.Dispose();
+        }
+
+        private async Task AnswerAsync(JsonObject request)
+        {
+            await Task.Yield(); // the reading goes on meanwhile
+            var id = request["id"]?.DeepClone();
+            JsonObject answer;
+            try
+            {
+                if (send is null)
+                {
+                    answer = new JsonObject { ["error"] = "TermRest sends no requests for these scripts." };
+                }
+                else
+                {
+                    await _slots.WaitAsync(_cancel.Token).ConfigureAwait(false);
+                    try
+                    {
+                        answer = await send(request["request"], _cancel.Token).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        _slots.Release();
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (_cancel.IsCancellationRequested)
+            {
+                return; // the scripts ended, or were stopped
+            }
+            catch (Exception ex)
+            {
+                answer = new JsonObject { ["error"] = ex.Message };
+            }
+
+            answer["id"] = id;
+            try
+            {
+                await _write.WaitAsync(_cancel.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            try
+            {
+                if (!_ended)
+                {
+                    await WriteAsync(input, new JsonObject { ["sent"] = answer }, _cancel.Token).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)
+            {
+                // the runtime stopped, or the scripts were: the run says so
+            }
+            finally
+            {
+                _write.Release();
+            }
         }
     }
 

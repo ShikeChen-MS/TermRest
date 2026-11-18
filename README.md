@@ -223,6 +223,7 @@ A runtime answers in about a millisecond once started; starting takes 0.1–0.3 
 - **Order:** each phase runs the scripts of the collection, then the folders (outermost first), then the request, one at a time: each script sees the variables and request changes of the ones before it.
 - **A failing pre-request script stops the request.** This covers an exception, a syntax or compile error, and a timeout. The request is not sent, nor added to the history or a recording, and the error is shown with the script's line.
 - **Time limit:** each phase may take 30 seconds (building C# scripts does not count); the runtime is then stopped and started again for the next script. *Tools › Scripts › Stop scripts* stops a script that runs at once; its request says it was stopped (`Python was stopped while the scripts ran.`).
+- **Requests that scripts send** (`pm.sendRequest`, `tr.send_request`, `tr.SendRequest`, `$tr.SendRequest`) go through TermRest, as its own requests do: with the workspace's client certificates (matched by URL), CA bundle and SSL verification, proxy and its sign-in, timeout, redirects and response size limit, and the session's cookies. They take a URL, or a request as Postman's `pm.sendRequest` takes it: `url`, `method`, `header` (Postman's list, or a map of names to values), `body` (text, Postman's `{mode, raw …}`, or any other JSON, sent as JSON) and `auth` (their own: none is inherited). As in Postman, `{{variables}}` in them are sent as written: replace them first (`replaceIn`, `replace_in`). Each one adds a line to the script's output, without the URL's query (`POST https://api.example.com/login → 200 OK (85 ms)`); they are recorded while you record, and not kept in the history. They count towards the phase's time limit, and those still running when the scripts end are cancelled. JavaScript scripts can send several at a time (six at once, the others wait their turn), the other languages one at a time.
 - **Working folder:** the runtimes run in the workspace folder, so scripts can import your own modules from it (`import helpers`, `require('./helpers')`, `Import-Module ./Helpers.psm1`) and read its files. Python and PowerShell modules load once per process; *Tools › Scripts › Stop scripts* reloads them.
 - **Values are text:** a variable or header set to `42` reads back as `"42"` in the next request or phase; a date or time as ISO 8601 text (`2024-01-02T03:04:05+00:00`, `2024-01-02`), and a GUID, URL or decimal as its text; lists and objects as JSON.
 
@@ -244,6 +245,7 @@ A collection, a folder and a request can each have a pre-request and a post-resp
 | `tr.iteration_data` | The data of the run's current iteration, a row of its data file (`termrest run --iteration-data`; see [Command line](#command-line)): `.get(name)` …, values with their JSON types. Empty without one. |
 | `tr.request` | `.method`, `.url`, `.headers` (`.get`, `.get_all`, `.set`, `.add`, `.remove`, `.items()`; as with requests, a dict, another mapping or a list of pairs can replace them), `.body` (raw bodies; bytes are sent as their UTF-8 text, a dict, list, tuple or bool as JSON). Pre-request scripts can change them; `{{variables}}` they contain are replaced afterwards. A request they leave in a state that can't be sent isn't sent, and what they printed, tested and set is kept. Test scripts see the request as it was sent. |
 | `tr.response` | In test scripts: `.status` (or `.code`), `.reason`, `.headers`, `.time` (ms), `.size`, `.text()`, `.json()`, `.content` (bytes). |
+| `tr.send_request(request, **fields)` | Sends a request through TermRest (see *Requests that scripts send* above) and returns its response, as `tr.response` has it: a URL, or a dict (`{"url": …, "method": "POST", "headers": {…}, "body": {…}}`), to which fields given by name are added: `tr.send_request(url, method="POST", body={"name": "Ada"})`. Raises `ConnectionError` when it can't be sent. |
 | `tr.test(name, fn)`, `@tr.test(name)` | Records a test that fails when `fn` raises, as `assert` does. |
 | `tr.info` | `.phase` (`prerequest` or `test`), `.script`, `.request_name`, `.collection`, `.environment`, `.iteration` (from 0) and `.iteration_count` of the run. |
 | `print(…)` | Goes to the response's *Scripts* tab, and to stderr on the command line. So does `logging`, also through a handler an earlier script set up (`logging.basicConfig()`). |
@@ -254,7 +256,7 @@ A collection, a folder and a request can each have a pre-request and a post-resp
 | `pm.request` | `.method`, `.url` (`.query.add`, `.toString()`, `.getHost()` …; as in Postman, its `host` and `path` may be set as text), `.headers` (`.add`, `.upsert`, `.remove`, `.get`, `.has`, `.each` …), `.body.raw`. Pre-request scripts can change them, as with `tr.request`; a request they leave in a state that can't be sent (a `query` that is no longer a list) isn't sent, and what they printed, tested and set is kept. |
 | `pm.response` | `.code`, `.status`, `.headers`, `.responseTime`, `.responseSize`, `.json()`, `.text()`, `.stream`, `.cookies`, and Postman's assertions: `.to.have.status(…)`, `.to.have.header(…)`, `.to.have.body(…)`, `.to.have.jsonBody(…)`, `.to.be.ok`, `.success`, `.clientError`, `.withoutContent`, `.json` …, and `.to.have.jsonSchema(schema)` (with `ajv` installed in the workspace: ajv 6, Postman's, checks formats such as `email` or `date-time` itself; ajv 8 needs `ajv-formats` for them, and a format it doesn't know fails the test, saying so), which also checks any value: `pm.expect(data.items[0]).to.have.jsonSchema(itemSchema)`. |
 | `pm.test(name, fn)`, `pm.expect(value)` | Tests (also asynchronous: `async` functions, or a `done` callback) and chai's assertions: `equal`, `eql`, `include`, `a`/`an`, `property`, `lengthOf`, `above`/`below`, `oneOf`, `members`, `keys`, `match`, `throw`, `not`, `deep`, `nested` …, with chai's messages. As in Postman, a property no assertion has, such as a misspelled `.to.be.ture`, fails the test (`Invalid Chai property: ture. Did you mean "true"?`) instead of checking nothing. |
-| `pm.sendRequest(request, callback)` | With a callback, or `await` it. It uses the runtime's own `fetch`: TermRest's certificates and proxy settings do not apply. |
+| `pm.sendRequest(request, callback)` | With a callback, or `await` it; sent through TermRest (see *Requests that scripts send* above), several at a time if you like (`Promise.all`). `fetch` sends requests of the script's own, without TermRest's certificates and proxy settings. |
 | `pm.info`, `pm.cookies`, `console.log` … | As in Postman; `console` output goes where `print` does, that of the modules and packages scripts `require` too (Node.js's own warnings included). |
 | The API from before `pm` | `tests["name"] = …`, `postman.setEnvironmentVariable(…)`, `responseBody`, `responseCode`, `responseHeaders`, `responseTime`. |
 | `require(…)` | Node.js modules, your own files, and the packages installed in the workspace (`npm install lodash crypto-js moment`). Postman's globals `_`, `CryptoJS`, `cheerio` and `tv4` load those packages when first used; `xml2Json` uses `xml2js`. Bun installs packages it cannot find by itself. |
@@ -274,10 +276,11 @@ A collection, a folder and a request can each have a pre-request and a post-resp
 | `tr.IterationData` | The data of the run's current iteration (`termrest run --iteration-data`), as text: `.Get(name)` …. Empty without one. |
 | `tr.Request` | `.Method`, `.Url`, `.Headers` (`["name"]`, `.Get`, `.GetAll`, `.Set`, `.Add`, `.Remove`, `.Has`), `.Body` (raw bodies). Pre-request scripts can change them. |
 | `tr.Response` | In test scripts: `.Status` (or `.Code`), `.Reason`, `.Headers`, `.Time` (ms), `.Size`, `.Text()`, `.Json()` (a `JsonNode`: `json["name"]`, `(int)json["id"]`), `.Content` (bytes). |
+| `tr.SendRequest(request)`, `await tr.SendRequestAsync(request)` | Sends a request through TermRest (see *Requests that scripts send* above) and returns its response, as `tr.Response` has it: a URL, or `new { url, method = "POST", header = new Dictionary<string, string> { … }, body = new { name = "Ada" } }`. Throws `HttpRequestException` when it can't be sent. |
 | `tr.Test(name, () => …)` | Records a test that fails when it throws; `async () => …` tests are awaited. Assertion libraries from NuGet work too. |
 | `tr.Assert(condition)`, `tr.AssertEqual(expected, actual)` | Fail with the code that failed: `assertion failed: tr.Response.Status == 201`, `tr.Response.Code: expected 201, got 200`. `AssertEqual` compares numbers as numbers and JSON as JSON: `tr.AssertEqual("Ada", json["name"])`. |
 | `tr.Info` | `.Phase`, `.Script`, `.RequestName`, `.Collection`, `.Environment`, `.Iteration` (from 0) and `.IterationCount` of the run. |
-| `Console.WriteLine(…)` | Goes where `print` does. `HttpClient` sends requests of the script's own (TermRest's certificates and proxy settings do not apply). |
+| `Console.WriteLine(…)` | Goes where `print` does. `HttpClient` sends requests of the script's own, without TermRest's certificates and proxy settings. |
 
 **PowerShell scripts**
 
@@ -295,20 +298,18 @@ A collection, a folder and a request can each have a pre-request and a post-resp
 | `$tr.IterationData` | The data of the run's current iteration (`termrest run --iteration-data`), as text: `.Get(name)` …. Empty without one. |
 | `$tr.Request` | `.Method`, `.Url`, `.Headers` (`.Get`, `.GetAll`, `.Set`, `.Add`, `.Remove`, `.Has`, `.Items()`, `.Count`), `.Body` (raw bodies; `$null` for others; bytes are sent as UTF-8 text, a hashtable or object as JSON). Pre-request scripts can change them; a request they leave in a state that can't be sent (`.Headers` set to `$null`) isn't sent, and what they printed, tested and set is kept. |
 | `$tr.Response` | In test scripts: `.Status` (or `.Code`), `.Reason`, `.Headers`, `.Time` (ms), `.Size`, `.Text()`, `.Json()` (`ConvertFrom-Json`: `$json.name`), `.Content()` (bytes). |
+| `$tr.SendRequest(request)` | Sends a request through TermRest (see *Requests that scripts send* above) and returns its response, as `$tr.Response` has it: a URL, or `@{ url = …; method = 'POST'; header = @{ … }; body = @{ name = 'Ada' } }`. Throws `HttpRequestException` when it can't be sent. |
 | `$tr.Test(name, { … })` | Records a test that fails when the block throws or a command in it fails. |
 | `$tr.Assert(condition)`, `$tr.AssertEqual(expected, actual)` | Fail with the code that failed: `assertion failed: $tr.Response.Status -eq 201`, `$tr.Response.Code: expected 201, got 200`. `AssertEqual` compares numbers as numbers, text exactly (case included, unlike `-eq`), and JSON objects and hashtables by their members. |
 | `$tr.Info` | `.Phase`, `.Script`, `.RequestName`, `.Collection`, `.Environment`, `.Iteration` (from 0) and `.IterationCount` of the run. |
-| `Write-Host …` | Goes where `print` does. `Invoke-RestMethod` sends requests of the script's own (TermRest's certificates and proxy settings do not apply). |
+| `Write-Host …` | Goes where `print` does. `Invoke-RestMethod` sends requests of the script's own, without TermRest's certificates and proxy settings. |
 
 ```python
 # Python: a collection pre-request script that logs in once, then sends the token with every request
-import json, urllib.request
-
 if not tr.environment.get("token"):
-    body = json.dumps({"user": tr.environment.get("user"), "password": tr.environment.get("password")}).encode()
-    login = urllib.request.Request(tr.variables.replace_in("{{base}}/login"), body, {"Content-Type": "application/json"})
-    with urllib.request.urlopen(login) as reply:
-        tr.environment.set("token", json.load(reply)["token"])
+    login = tr.send_request(tr.variables.replace_in("{{base}}/login"), method="POST",
+                            body={"user": tr.environment.get("user"), "password": tr.environment.get("password")})
+    tr.environment.set("token", login.json()["token"])
 tr.request.headers.set("Authorization", "Bearer " + tr.environment.get("token"))
 ```
 
@@ -370,7 +371,7 @@ TermRest runs scripts the way a terminal runs commands: it starts the runtime yo
 **What a script can do, with nothing to stop it**
 
 - Read, change, delete or upload any file you can: source code, SSH keys, cloud credentials (`~/.azure`, `~/.aws`, `~/.kube`), browser profiles.
-- See every variable, secret ones included, the requests with their `Authorization` headers, the responses, and TermRest's environment variables (tokens, in CI). It can send them anywhere: `fetch`, `HttpClient`, `urllib`, `Invoke-RestMethod` and `pm.sendRequest` do not go through TermRest.
+- See every variable, secret ones included, the requests with their `Authorization` headers, the responses, and TermRest's environment variables (tokens, in CI). It can send them anywhere: with its runtime's own HTTP clients (`fetch`, `HttpClient`, `urllib`, `Invoke-RestMethod`), or through TermRest (`pm.sendRequest`, `tr.send_request` …), with the client certificates and proxy sign-in you set up for the URLs it picks, as the collection's own requests can.
 - Start programs, which may keep running after TermRest stops the runtime, install software, and change your system's settings.
 - Run code it brings in:
   - **C#:** `#:package` restores NuGet packages, and their build steps (MSBuild targets, analyzers) run while the scripts are built, before any script does. `#:sdk`, `#:project` and `#:include` bring in more.

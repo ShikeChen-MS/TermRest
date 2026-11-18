@@ -287,6 +287,23 @@ internal static partial class CSharpWorkerCode
 
                 public void Test(string name, Func<Task> test) => Record(name, test);
 
+                /// <summary>
+                /// Sends a request through TermRest, with its certificates, proxy and settings, and returns its response (as
+                /// tr.Response has it); throws HttpRequestException when it can't be sent. The request is a URL, or as Postman's
+                /// pm.sendRequest takes it: new { url, method, header, body, auth }, where header may be a dictionary of names to
+                /// values, and body text (raw), JSON (any object without a mode) or Postman's { mode, raw … }. Its {{variables}}
+                /// are sent as written: tr.Variables.ReplaceIn replaces them.
+                /// </summary>
+                public Response SendRequest(object request) => Host.Send(request switch
+                {
+                    string url => JsonValue.Create(url),
+                    JsonNode node => node.DeepClone(),
+                    null => throw new ArgumentNullException(nameof(request)),
+                    _ => JsonSerializer.SerializeToNode(request, request.GetType()),
+                });
+
+                public Task<Response> SendRequestAsync(object request) => Task.Run(() => SendRequest(request));
+
                 public void Assert(bool condition, string message = null, [CallerArgumentExpression(nameof(condition))] string expression = null)
                 {
                     if (!condition)
@@ -696,7 +713,12 @@ internal static partial class CSharpWorkerCode
                 private static readonly JsonSerializerOptions Options = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
                 private static readonly UTF8Encoding Utf8 = new(false);
                 private static readonly Capture Output = new();
+                private static readonly object SendLock = new();
                 private static FileStream _nothing;
+                private static TextReader _input;
+                private static TextWriter _output;
+                private static bool _sending;
+                private static int _sent;
 
                 private static int Main(string[] args)
                 {
@@ -708,6 +730,7 @@ internal static partial class CSharpWorkerCode
                     }
 
                     var (input, output) = Channel();
+                    (_input, _output) = (input, output);
                     Console.SetIn(TextReader.Null);
                     Console.SetOut(Output);
                     Console.SetError(Output);
@@ -715,6 +738,11 @@ internal static partial class CSharpWorkerCode
                     while ((line = input.ReadLine()) is not null)
                     {
                         JsonObject reply;
+                        lock (SendLock)
+                        {
+                            _sending = true;
+                        }
+
                         try
                         {
                             reply = Run(JsonNode.Parse(line).AsObject());
@@ -724,11 +752,51 @@ internal static partial class CSharpWorkerCode
                             reply = new JsonObject { ["fatal"] = error.ToString() };
                         }
 
+                        // After a request a task still waits for: its answer comes before the next message.
+                        lock (SendLock)
+                        {
+                            _sending = false;
+                        }
+
                         output.Write(Marker + reply.ToJsonString(Options) + "\n");
                         output.Flush();
                     }
 
                     return 0;
+                }
+
+                /// <summary>
+                /// tr.SendRequest: asks TermRest to send the request, with a line of output, and reads its answer, a line of
+                /// input; one at a time, as only the thread that asked may read it.
+                /// </summary>
+                internal static Response Send(JsonNode request)
+                {
+                    string line;
+                    lock (SendLock)
+                    {
+                        if (!_sending)
+                        {
+                            throw new InvalidOperationException("The scripts already finished: TermRest sends no more requests for them.");
+                        }
+
+                        var send = new JsonObject { ["send"] = new JsonObject { ["id"] = ++_sent, ["request"] = request } };
+                        _output.Write(Marker + send.ToJsonString(Options) + "\n");
+                        _output.Flush();
+                        line = _input.ReadLine();
+                    }
+
+                    var answer = (line is null ? null : JsonNode.Parse(line)?["sent"] as JsonObject) ?? new JsonObject { ["error"] = "TermRest did not answer." };
+                    if (AsText(answer["log"]) is { } log)
+                    {
+                        Output.Write(log + "\n");
+                    }
+
+                    if (answer["error"] is not null)
+                    {
+                        throw new System.Net.Http.HttpRequestException(AsText(answer["error"]));
+                    }
+
+                    return new Response(answer["response"] as JsonObject ?? new JsonObject());
                 }
 
                 /// <summary>

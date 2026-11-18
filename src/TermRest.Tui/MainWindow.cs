@@ -1214,6 +1214,8 @@ internal sealed class MainWindow : Runnable
           tr.iteration_data  the run's current row of its data file (termrest run -d users.csv): .get(name) ….
           tr.request     .method, .url, .headers (.get .set .add .remove), .body: change them before sending.
           tr.response    .status (or .code), .reason, .headers, .time (ms), .size, .text(), .json(), .content (bytes).
+          tr.send_request(url or {"url": …, "method": …, "headers": {…}, "body": …}, method="POST", …)
+                       sends a request through TermRest, with its certificates and proxy, and returns its response.
           tr.test(name, fn)  records a test that fails when fn raises (assert …); also @tr.test("name") on a function.
           tr.info        .phase ("prerequest" or "test"), .script, .request_name, .collection, .environment, .iteration,
                        .iteration_count.
@@ -1230,6 +1232,7 @@ internal sealed class MainWindow : Runnable
           pm.request     .method, .url (.query, .toString()), .headers (.add .upsert .remove .get), .body.raw
           pm.response    .code, .status, .headers, .responseTime, .json(), .text(), .to.have.status(200), .to.be.ok …
           pm.test(name, fn), pm.expect(value).to.equal(…) (chai's assertions), pm.sendRequest(…), pm.info, console.log
+          pm.sendRequest goes through TermRest, with its certificates and proxy; {{variables}} in it are sent as written.
           The old API works too: tests["name"] = …, postman.setEnvironmentVariable(…), responseBody, responseCode.
           require() loads Node.js modules and the packages installed in the workspace (npm install lodash crypto-js …);
           _, CryptoJS, cheerio and tv4 load those packages when first used, as Postman's globals.
@@ -1251,6 +1254,7 @@ internal sealed class MainWindow : Runnable
           tr.IterationData  the run's current row of its data file, as text: .Get(name) ….
           tr.Request     .Method, .Url, .Headers (.Get .Set .Add .Remove, ["name"]), .Body: change them before sending.
           tr.Response    .Status (or .Code), .Reason, .Headers, .Time (ms), .Size, .Text(), .Json() (a JsonNode), .Content.
+          tr.SendRequest(url or new { url, method, header, body }), await tr.SendRequestAsync(…): through TermRest.
           tr.Test(name, () => …) (async too), tr.Assert(condition), tr.AssertEqual(expected, actual), tr.Info.
           Console.WriteLine(…) output goes to the Scripts tab.
 
@@ -1267,6 +1271,7 @@ internal sealed class MainWindow : Runnable
           $tr.Request    .Method, .Url, .Headers (.Get .Set .Add .Remove .Items()), .Body: change them before sending.
           $tr.Response   .Status (or .Code), .Reason, .Headers, .Time (ms), .Size, .Text(), .Json() (ConvertFrom-Json),
                        .Content().
+          $tr.SendRequest(url or @{ url = …; method = …; header = @{…}; body = … }): through TermRest.
           $tr.Test(name, { … }), $tr.Assert(condition), $tr.AssertEqual(expected, actual), $tr.Info.
           Output, Write-Host and warnings go to the Scripts tab (output inside $tr.Test blocks is dropped: use Write-Host
           there). Errors stop the script ($ErrorActionPreference is Stop). Your profile is not loaded; modules load as

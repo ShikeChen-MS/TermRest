@@ -88,6 +88,7 @@ public sealed partial class VariableResolver
 
     private readonly IReadOnlyList<IVariableScope> _scopes;
     private readonly TimeProvider _time;
+    private readonly bool _literal;
 
     public VariableResolver(IEnumerable<IVariableScope> scopesHighestPrecedenceFirst, TimeProvider? time = null)
     {
@@ -95,7 +96,16 @@ public sealed partial class VariableResolver
         _time = time ?? TimeProvider.System;
     }
 
+    private VariableResolver(bool literal)
+        : this([]) => _literal = literal;
+
     public static VariableResolver Empty { get; } = new([]);
+
+    /// <summary>
+    /// Replaces nothing, not even dynamic variables ({{$guid}}): what a request that a script sends gets, as in Postman, whose
+    /// pm.sendRequest sends {{references}} as written (scripts replace them with replaceIn). They count as unresolved.
+    /// </summary>
+    public static VariableResolver Literal { get; } = new(literal: true);
 
     public IReadOnlyList<IVariableScope> Scopes => _scopes;
 
@@ -136,6 +146,19 @@ public sealed partial class VariableResolver
         if (string.IsNullOrEmpty(text) || !text.Contains("{{", StringComparison.Ordinal))
         {
             return text ?? "";
+        }
+
+        if (_literal)
+        {
+            if (unresolved is not null)
+            {
+                foreach (var name in FindReferences(text))
+                {
+                    unresolved.Add(name);
+                }
+            }
+
+            return text;
         }
 
         var limit = (long)text.Length + MaxGrowth;
@@ -200,6 +223,12 @@ public sealed partial class VariableResolver
     /// </summary>
     public bool TryResolve(string name, out string? value, out string? scopeName)
     {
+        if (_literal)
+        {
+            (value, scopeName) = (null, null);
+            return false;
+        }
+
         foreach (var scope in _scopes)
         {
             if (scope.TryGetValue(name, out value))

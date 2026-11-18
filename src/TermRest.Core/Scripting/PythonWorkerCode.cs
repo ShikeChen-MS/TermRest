@@ -6,7 +6,8 @@ namespace TermRest.Core.Scripting;
 /// The Python side of <see cref="ScriptWorker"/>. No file is written: the command line (<c>-c</c>) holds a short bootstrap
 /// (<see cref="Bootstrap"/>) that reads the worker's code, hex-encoded, from the first line of input (<see cref="Preamble"/>)
 /// and runs it. It reads one JSON message per line, runs the scripts in it with the <c>tr</c> object, and writes one JSON
-/// line back. Whatever scripts print is captured, so it cannot corrupt the protocol.
+/// line back. Whatever scripts print is captured, so it cannot corrupt the protocol. A request a script sends
+/// (tr.send_request) goes out as a line of its own, and its answer comes in as a line of input.
 /// </summary>
 internal static class PythonWorkerCode
 {
@@ -30,7 +31,7 @@ internal static class PythonWorkerCode
         # With -c, Python looks for modules in the current folder (the workspace) first. The worker's own modules come from
         # Python itself (a types.py in the workspace must not replace them); the scripts then import the workspace's.
         _workspace = sys.path.pop(0) if sys.path and sys.path[0] == "" else None
-        import base64, datetime, decimal, io, json, linecache, os, re, secrets, traceback, types, uuid
+        import base64, datetime, decimal, io, json, linecache, os, re, secrets, threading, traceback, types, uuid
         if _workspace is not None:
             sys.path.insert(0, _workspace)
 
@@ -380,6 +381,42 @@ internal static class PythonWorkerCode
                 return f"<{self.status} {self.reason}>"
 
 
+        _send_lock = threading.Lock()
+        _sending = False  # while a message's scripts run: the requests they send go through TermRest then
+        _sent = 0
+
+
+        def _json_default(value):
+            if isinstance(value, (bytes, bytearray)):
+                return bytes(value).decode("utf-8", "replace")
+            if isinstance(value, Headers):
+                return value.items()
+            return _text(value)
+
+
+        def _send_request(request, **fields):
+            # tr.send_request: a request that TermRest sends, with its certificates, proxy and settings. As Postman's pm.sendRequest
+            # takes it: a URL, or a dict with url, method, header (or headers), body and auth; fields given by name are added. Its
+            # {{variables}} are sent as written (tr.variables.replace_in replaces them). One at a time: TermRest answers each with a
+            # line of input, which only the thread that asked reads.
+            global _sent
+            data = {"url": request} if isinstance(request, str) else dict(request or {})
+            data.update(fields)
+            with _send_lock:
+                if not _sending:
+                    raise RuntimeError("the scripts already finished: TermRest sends no more requests for them")
+                _sent += 1
+                _out.write(json.dumps({"send": {"id": _sent, "request": data}}, default=_json_default, separators=(",", ":")) + "\n")
+                _out.flush()
+                line = _in.readline()
+            answer = (json.loads(line) if line else {}).get("sent") or {"error": "TermRest did not answer"}
+            if answer.get("log"):
+                _capture.write(answer["log"] + "\n")
+            if "error" in answer:
+                raise ConnectionError(answer["error"])
+            return Response(answer.get("response") or {})
+
+
         def _failure(error):
             message = _message(error)
             if isinstance(error, AssertionError):
@@ -452,6 +489,7 @@ internal static class PythonWorkerCode
                 request=request,
                 response=Response(message["response"]) if message.get("response") else None,
                 info=info,
+                send_request=_send_request,
             )
             tr.test = _tests(tests, info)
             error = None
@@ -502,10 +540,13 @@ internal static class PythonWorkerCode
 
 
         for _line in _in:
+            _sending = True
             try:
                 _result = _run(json.loads(_line))
             except Exception as _error:
                 _result = {"fatal": "".join(traceback.format_exception(type(_error), _error, _error.__traceback__))}
+            with _send_lock:  # after a request a thread still waits for: its answer comes before the next message
+                _sending = False
             _out.write(json.dumps(_result) + "\n")
             _out.flush()
         """;
