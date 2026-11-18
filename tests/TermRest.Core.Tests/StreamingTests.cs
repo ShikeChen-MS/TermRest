@@ -107,9 +107,12 @@ public class StreamingTests
     {
         await using var server = await EchoServer.StartAsync();
 
-        // A new server's first answer can take a while on a busy machine (CI), longer than the timeout would leave the stream.
-        await new HttpExecutor().SendAsync(Prepare(server.Url("events?count=1")), _ct);
-        var request = Prepare(server.Url("events?count=0&delay=20"), timeout: TimeSpan.FromSeconds(2));
+        // 127.0.0.1, where the server listens: localhost can resolve to ::1 first (Windows runners), and Windows takes 2 s to
+        // give up on it. A new server's first answer can take a while on a busy machine (CI) too, longer than the timeout
+        // would leave the stream.
+        string Url(string path) => server.Url(path).Replace("localhost", "127.0.0.1", StringComparison.Ordinal);
+        await new HttpExecutor().SendAsync(Prepare(Url("events?count=1")), _ct);
+        var request = Prepare(Url("events?count=0&delay=20"), timeout: TimeSpan.FromSeconds(2));
 
         var exchange = await new HttpExecutor().SendAsync(request, _ct);
 
