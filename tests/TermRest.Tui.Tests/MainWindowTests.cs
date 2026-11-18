@@ -1444,6 +1444,68 @@ public sealed class MainWindowTests : IDisposable
         Assert.Equal("s3cret-pw", file.Find("http://new-proxy:3128")?.Password);
     }
 
+    [Fact]
+    public void The_settings_show_a_sign_in_another_termrest_saved_since_and_saving_them_keeps_it()
+    {
+        var userDirectory = TestFiles.NewTempDirectory();
+        using var ui = new Harness(_directory, runner => runner.ConfigureProxy(userDirectory));
+
+        // Another TermRest saves a sign-in for the system's proxy, which every workspace without a proxy of its own uses.
+        var other = ProxyCredentialStore.Load(userDirectory);
+        other.Set("system", "CONTOSO\\ada", "s3cret-pw");
+        other.Save(userDirectory);
+
+        var saved = false;
+        var screens = Drive(ui, () =>
+            {
+                SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out saved, userDirectory);
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () => ui.Click("► Save ◄")));
+
+        Assert.Contains("CONTOSO\\ada", Assert.Single(screens), StringComparison.Ordinal);
+        Assert.True(saved);
+        Assert.Equal("s3cret-pw", ProxyCredentialStore.Load(userDirectory).Find(null)?.Password);
+        Assert.Equal("ada", ui.Runner.CreateDefaults().ProxyCredential?.UserName); // for this session too
+    }
+
+    [Fact]
+    public void Naming_a_proxy_while_no_sign_in_is_shown_keeps_the_one_kept_for_that_proxy()
+    {
+        var userDirectory = TestFiles.NewTempDirectory();
+        var kept = ProxyCredentialStore.Load(userDirectory);
+        kept.Set("http://corp-proxy:3128", "bob", "hunter2-pw"); // saved with another workspace
+        kept.Save(userDirectory);
+        using var ui = new Harness(_directory, runner => runner.ConfigureProxy(userDirectory));
+
+        var saved = false;
+        var screens = Drive(ui, () =>
+            {
+                SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out saved, userDirectory);
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () =>
+            {
+                // That proxy in place of the system's, for which no sign-in is kept: the sign-in fields stay empty.
+                var label = ui.Find("Proxy ");
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 23, label.Y)));
+                ui.App.InjectKey(Key.End);
+                foreach (var _ in "system")
+                {
+                    ui.App.InjectKey(Key.Backspace);
+                }
+
+                ui.Type("http://corp-proxy:3128");
+                ui.Click("► Save ◄");
+            }));
+
+        Assert.Single(screens);
+        Assert.True(saved);
+        Assert.Equal("hunter2-pw", ProxyCredentialStore.Load(userDirectory).Find("http://corp-proxy:3128")?.Password);
+        var credential = ui.Runner.CreateDefaults().ProxyCredential;
+        Assert.Equal(("http://corp-proxy:3128", "bob", "hunter2-pw"), (ui.Workspace.Settings.Proxy, credential?.UserName, credential?.Password));
+    }
+
     [Theory]
     [InlineData("http://ada:***@proxy:3128", "http://ada:s3cret@proxy:3128")] // left as shown
     [InlineData("http://ada:***@proxy:8080", "http://ada:s3cret@proxy:8080")] // only the port changed

@@ -66,10 +66,12 @@ internal static class SettingsDialog
         dialog.Add(proxyHint);
         y += 1;
 
-        // Kept for the proxy in the user's private credentials file, never in the workspace; a password left masked stays.
+        // Kept for the proxy in the user's private credentials file, never in the workspace; a password left masked stays. The
+        // file is read now, as it is the user's, for every workspace: another TermRest may have saved to it since this one started.
         const string keptPassword = "********";
         var originalProxy = settings.Proxy;
-        var (keptUser, hasPassword) = runner.ProxyCredentials.Describe(settings.Proxy);
+        var onDisk = ProxyCredentialStore.Load(userDirectory);
+        var (keptUser, hasPassword) = (onDisk.LoadError is null ? onDisk : runner.ProxyCredentials).Describe(settings.Proxy);
         var proxyUser = Ui.AddRow(dialog, "Proxy sign-in", new TextField { Text = keptUser, Width = 22 }, y, 22);
         var proxyPassword = new TextField { X = Pos.Right(proxyUser) + 11, Y = y, Width = 16, Secret = true, Text = hasPassword ? keptPassword : "" };
         dialog.Add(new Label { Text = "password", X = Pos.Right(proxyUser) + 2, Y = y }, proxyPassword);
@@ -184,21 +186,29 @@ internal static class SettingsDialog
             saved &= SaveApprovals(app, workspace, runner, outsideFiles.Value == CheckState.Checked, userDirectory);
 
             // The sign-in goes with the proxy the settings now name (the system's, or a URL), for this session and in the
-            // user's credentials file, read again first: another TermRest may have saved sign-ins to it since (it is the
-            // user's, for every workspace). A password left masked is the one shown: that of the proxy named before.
-            var credentials = ProxyCredentialStore.Load(userDirectory);
-            var password = proxyPassword.Text == keptPassword && hasPassword ? null : proxyPassword.Text;
-            try
+            // user's credentials file, read again first (another TermRest may have saved to it meanwhile): when it was
+            // edited, or when the proxy changed and one was shown, which moves to it (its password left masked too).
+            // Otherwise the file's stay as they are. A file that cannot be read is not saved over: the sign-in then applies
+            // to this session only, and saving it says why.
+            var fresh = ProxyCredentialStore.Load(userDirectory);
+            var credentials = fresh.LoadError is null ? fresh : runner.ProxyCredentials;
+            var edited = proxyUser.Text.Trim() != keptUser || proxyPassword.Text != (hasPassword ? keptPassword : "");
+            var moved = keptUser.Length > 0 && ProxyCredentialStore.KeyOf(settings.Proxy) != ProxyCredentialStore.KeyOf(originalProxy);
+            if (edited || moved)
             {
-                if (credentials.Set(settings.Proxy, proxyUser.Text, password, keptFrom: originalProxy ?? ProxyCredentialStore.SystemProxy))
+                var password = proxyPassword.Text == keptPassword && hasPassword ? null : proxyPassword.Text;
+                try
                 {
-                    saved &= Ui.TrySave(app, () => credentials.Save(userDirectory));
+                    if (credentials.Set(settings.Proxy, proxyUser.Text, password, keptFrom: originalProxy ?? ProxyCredentialStore.SystemProxy))
+                    {
+                        saved &= Ui.TrySave(app, () => fresh.Save(userDirectory));
+                    }
                 }
-            }
-            catch (CryptographicException ex)
-            {
-                Ui.Error(app, "Proxy sign-in", $"The password could not be encrypted for your account, so the sign-in was not kept: {ex.Message}");
-                saved = false;
+                catch (CryptographicException ex)
+                {
+                    Ui.Error(app, "Proxy sign-in", $"The password could not be encrypted for your account, so the sign-in was not kept: {ex.Message}");
+                    saved = false;
+                }
             }
 
             runner.ProxyCredentials = credentials;
