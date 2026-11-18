@@ -112,5 +112,6 @@ public sealed class WorkspaceSettings
 [JsonSerializable(typeof(WorkspaceSettings))]
 [JsonSerializable(typeof(UserSettings))]
 [JsonSerializable(typeof(ProxyCredentialFile))]
+[JsonSerializable(typeof(System.Text.Json.JsonElement))]
 [JsonSerializable(typeof(List<CertificateEntry>))]
 internal sealed partial class CoreJsonContext : JsonSerializerContext;

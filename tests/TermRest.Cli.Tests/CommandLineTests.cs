@@ -1116,6 +1116,36 @@ public sealed class CommandLineTests
     }
 
     [Fact]
+    public async Task Run_sends_the_requests_once_for_each_row_of_a_data_file()
+    {
+        await using var server = await TestServer.StartAsync();
+        var directory = TestFiles.NewTempDirectory();
+        var collection = WriteCollection(directory, "Api", [("Greet", "GET", server.BaseUrl + "/echo/{{name}}?n={{n}}")]);
+        var data = Path.Combine(directory, "people.csv");
+        File.WriteAllText(data, "name,n\nada,1\n\"grace\",2\n");
+        var report = Path.Combine(directory, "report.json");
+
+        var rows = await Termrest.RunAsync(["run", collection, "-d", data, "--report-json", report]);
+        var more = await Termrest.RunAsync(["run", collection, "--iteration-data", data, "-n", "3"]); // past the last row: that row again
+        var missing = await Termrest.RunAsync(["run", collection, "-d", Path.Combine(directory, "missing.csv")]);
+
+        Assert.True(rows.ExitCode == 0, rows.ToString());
+        Assert.Contains("Running 1 request(s) × 2 iterations from 'Api', data from people.csv (2 row(s))", rows.ToString(), StringComparison.Ordinal);
+        Assert.Contains("Iteration 2/2", rows.ToString(), StringComparison.Ordinal);
+        var json = JsonNode.Parse(File.ReadAllText(report))!;
+        Assert.Equal(2, (int)json["iterations"]!);
+        Assert.Equal(
+            [(1, server.BaseUrl + "/echo/ada?n=1"), (2, server.BaseUrl + "/echo/grace?n=2")],
+            ((JsonArray)json["results"]!).Select(r => ((int)r!["iteration"]!, (string)r["url"]!)));
+        Assert.True(more.ExitCode == 0, more.ToString());
+        Assert.Contains("Iteration 3/3", more.ToString(), StringComparison.Ordinal);
+        Assert.Contains("3 passed, 0 failed", more.ToString(), StringComparison.Ordinal);
+        Assert.Equal(5, server.Requests);
+        Assert.Equal(2, missing.ExitCode);
+        Assert.Contains("--iteration-data:", missing.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Send_signs_in_to_a_proxy_with_proxy_user_and_says_what_a_proxy_that_wants_a_sign_in_needs()
     {
         await using var proxy = new SignInProxy("ada", "s3cret");

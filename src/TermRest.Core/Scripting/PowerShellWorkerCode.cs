@@ -657,6 +657,9 @@ internal static class PowerShellWorkerCode
             [object] $RequestName
             [object] $Collection
             [object] $Environment
+            # The run's current iteration, from 0, and the number of its iterations.
+            [int] $Iteration
+            [int] $IterationCount = 1
         }
 
         # What scripts get as $tr: the request, the response, variables, tests.
@@ -665,6 +668,8 @@ internal static class PowerShellWorkerCode
             [TrScope] $CollectionVariables
             [TrScope] $Globals
             [TrVariables] $Variables
+            # The data of the run's current iteration, a row of its data file (termrest run --iteration-data); empty without one.
+            [TrScope] $IterationData
             [TrRequest] $Request
             # The response; $null in pre-request scripts.
             [TrResponse] $Response
@@ -848,6 +853,11 @@ internal static class PowerShellWorkerCode
             $collection = Get-TrValues $variables 'collection'
             $globals = Get-TrValues $variables 'globals'
             $local = Get-TrValues $variables 'local'
+            $iterationData = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+            if ($null -ne $variables -and $null -ne $variables['data']) {
+                foreach ($pair in $variables['data'].GetEnumerator()) { $iterationData[$pair.Key] = [TrText]::Of($pair.Value) }
+            }
+
             $data = $message['info']
             $info = [TrInfo]::new()
             $info.Phase = $phase
@@ -855,13 +865,16 @@ internal static class PowerShellWorkerCode
                 $info.RequestName = $data['request_name']
                 $info.Collection = $data['collection']
                 $info.Environment = $data['environment']
+                if ($null -ne $data['iteration']) { $info.Iteration = [int] $data['iteration'] }
+                if ($null -ne $data['iteration_count']) { $info.IterationCount = [int] $data['iteration_count'] }
             }
 
             $tr = [Tr]::new()
             $tr.Environment = [TrScope]::new($environment, $changes['environment'])
             $tr.CollectionVariables = [TrScope]::new($collection, $changes['collection'])
             $tr.Globals = [TrScope]::new($globals, $changes['globals'])
-            $tr.Variables = [TrVariables]::new($local, $changes['local'], @($local, $environment, $collection, $globals), $message['dynamic'])
+            $tr.Variables = [TrVariables]::new($local, $changes['local'], @($local, $iterationData, $environment, $collection, $globals), $message['dynamic'])
+            $tr.IterationData = [TrScope]::new($iterationData, [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal))
             $tr.Request = [TrRequest]::new($message['request'], $phase -eq 'prerequest')
             if ($null -ne $message['response']) { $tr.Response = [TrResponse]::new($message['response']) }
             $tr.Info = $info

@@ -1209,12 +1209,14 @@ internal sealed class MainWindow : Runnable
         Python: the tr object
           tr.environment, tr.collection_variables, tr.globals
                        .get(name), .set(name, value), .unset(name), .has(name), .to_dict(), and tr.environment["name"].
-          tr.variables   reads every scope (this request, environment, collection, globals); .set() is for this
-                       request only; .replace_in("{{base}}/x") replaces {{variables}} in a text.
+          tr.variables   reads every scope (this request, the run's iteration data, environment, collection, globals); .set()
+                       is for this request only; .replace_in("{{base}}/x") replaces {{variables}} in a text.
+          tr.iteration_data  the run's current row of its data file (termrest run -d users.csv): .get(name) ….
           tr.request     .method, .url, .headers (.get .set .add .remove), .body: change them before sending.
           tr.response    .status (or .code), .reason, .headers, .time (ms), .size, .text(), .json(), .content (bytes).
           tr.test(name, fn)  records a test that fails when fn raises (assert …); also @tr.test("name") on a function.
-          tr.info        .phase ("prerequest" or "test"), .script, .request_name, .collection, .environment.
+          tr.info        .phase ("prerequest" or "test"), .script, .request_name, .collection, .environment, .iteration,
+                       .iteration_count.
           print(…)       output goes to the response's Scripts tab, with the tests and errors.
 
           @tr.test("returns the new item")
@@ -1223,7 +1225,8 @@ internal sealed class MainWindow : Runnable
               assert tr.response.json()["name"] == "Ada"
 
         JavaScript: Postman's pm object
-          pm.environment, pm.collectionVariables, pm.globals, pm.variables   .get .set .unset .has .toObject .replaceIn
+          pm.environment, pm.collectionVariables, pm.globals, pm.variables, pm.iterationData (the run's data row)
+                       .get .set .unset .has .toObject .replaceIn
           pm.request     .method, .url (.query, .toString()), .headers (.add .upsert .remove .get), .body.raw
           pm.response    .code, .status, .headers, .responseTime, .json(), .text(), .to.have.status(200), .to.be.ok …
           pm.test(name, fn), pm.expect(value).to.equal(…) (chai's assertions), pm.sendRequest(…), pm.info, console.log
@@ -1245,6 +1248,7 @@ internal sealed class MainWindow : Runnable
           stops it.
           tr.Environment, tr.CollectionVariables, tr.Globals   ["name"], .Get .Set .Unset .Has .ToDictionary
           tr.Variables   reads every scope; .Set() is for this request only; .ReplaceIn("{{base}}/x").
+          tr.IterationData  the run's current row of its data file, as text: .Get(name) ….
           tr.Request     .Method, .Url, .Headers (.Get .Set .Add .Remove, ["name"]), .Body: change them before sending.
           tr.Response    .Status (or .Code), .Reason, .Headers, .Time (ms), .Size, .Text(), .Json() (a JsonNode), .Content.
           tr.Test(name, () => …) (async too), tr.Assert(condition), tr.AssertEqual(expected, actual), tr.Info.
@@ -1259,6 +1263,7 @@ internal sealed class MainWindow : Runnable
         PowerShell: the $tr object, as in C#
           $tr.Environment, $tr.CollectionVariables, $tr.Globals   .Get(name) .Set(name, value) .Unset .Has .ToHashtable
           $tr.Variables  reads every scope; .Set() is for this request only; .ReplaceIn('{{base}}/x').
+          $tr.IterationData  the run's current row of its data file, as text: .Get(name) ….
           $tr.Request    .Method, .Url, .Headers (.Get .Set .Add .Remove .Items()), .Body: change them before sending.
           $tr.Response   .Status (or .Code), .Reason, .Headers, .Time (ms), .Size, .Text(), .Json() (ConvertFrom-Json),
                        .Content().

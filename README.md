@@ -127,7 +127,7 @@ Without any, a proxy that asks for NTLM or Negotiate, as corporate proxies do, g
 
 Requests send body and form-data files only from the workspace folder, also once links are resolved: a collection that comes with a repository could otherwise send any file you can read (SSH keys, cloud credentials) to a server of its choosing, with no script needed. A file outside the folder (an absolute path, a `../` path, or a link in the repository that leads out) stops its request with an error that names it; a path outside the folder as written is not even looked at, by the request or by its Body tab, so a Windows `\\server\share` path doesn't reach that server. For the same reason, on Windows, client certificates and the CA bundle (named by a request, `.termrest/certificates.json` or `.termrest/settings.json`) are not opened from a network share outside the folder, nor through a link that leads there: the request is sent without them, with a warning. To send such files and use such certificates, check *Outside files: Allow files from outside this folder* in *Tools › Settings* (kept per workspace folder in your user settings, `outsideFilesAllowed`), or pass `--allow-outside-files` to `send`, `run` or `certs list`.
 
-Variables resolve Postman-style. The highest precedence comes first: `--var`/local, then environment, then collection, then globals. Values may reference other variables, and Postman dynamic variables work, with a new value each time: `{{$guid}}` (also `$randomUUID`), `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$randomInt}}` (0 to 1000), `$randomBoolean`, `$randomAlphaNumeric` and `$randomHexadecimal` (one character), `$randomFirstName`, `$randomLastName`, `$randomFullName`, `$randomUserName`, `$randomEmail`, `$randomWord` and `$randomPassword`. Scripts resolve them too (`.replaceIn`, `.replace_in`, `.ReplaceIn`): `pm.environment.set('email', pm.variables.replaceIn('{{$randomEmail}}'))` keeps one address for the requests that use `{{email}}`. A variable of the same name takes the place of a dynamic one (`$timestamp` set by a script, say), in requests and scripts alike, as in Postman. Unresolved `{{names}}` are kept and reported as warnings. Replacing variables adds at most 4,194,304 characters to a text: a reference whose value would go past that (a value that references itself several times, say) stays unresolved and is reported.
+Variables resolve Postman-style. The highest precedence comes first: `--var`/local, then the run's iteration data (`run --iteration-data`), then environment, then collection, then globals. Values may reference other variables, and Postman dynamic variables work, with a new value each time: `{{$guid}}` (also `$randomUUID`), `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$randomInt}}` (0 to 1000), `$randomBoolean`, `$randomAlphaNumeric` and `$randomHexadecimal` (one character), `$randomFirstName`, `$randomLastName`, `$randomFullName`, `$randomUserName`, `$randomEmail`, `$randomWord` and `$randomPassword`. Scripts resolve them too (`.replaceIn`, `.replace_in`, `.ReplaceIn`): `pm.environment.set('email', pm.variables.replaceIn('{{$randomEmail}}'))` keeps one address for the requests that use `{{email}}`. A variable of the same name takes the place of a dynamic one (`$timestamp` set by a script, say), in requests and scripts alike, as in Postman. Unresolved `{{names}}` are kept and reported as warnings. Replacing variables adds at most 4,194,304 characters to a text: a reference whose value would go past that (a value that references itself several times, say) stays unresolved and is reported.
 
 ## Using the UI
 
@@ -240,16 +240,17 @@ A collection, a folder and a request can each have a pre-request and a post-resp
 | Python: the `tr` object | |
 |---|---|
 | `tr.environment`, `tr.collection_variables`, `tr.globals` | `.get(name, default)`, `.set(name, value)`, `.unset(name)`, `.has(name)`, `.clear()`, `.to_dict()`, and `tr.environment["name"]`. Values set are kept in memory until TermRest closes (Postman's "current values"); files are never changed. *Tools › Scripts* shows how many there are and clears them. |
-| `tr.variables` | Reads every scope (this request, the environment, the collection, the globals: the first that has it). `.set()` is for this request only. `.replace_in("{{base}}/x")` replaces `{{variables}}` and dynamic variables (`{{$guid}}` …) in a text. |
+| `tr.variables` | Reads every scope (this request, the run's iteration data, the environment, the collection, the globals: the first that has it). `.set()` is for this request only. `.replace_in("{{base}}/x")` replaces `{{variables}}` and dynamic variables (`{{$guid}}` …) in a text. |
+| `tr.iteration_data` | The data of the run's current iteration, a row of its data file (`termrest run --iteration-data`; see [Command line](#command-line)): `.get(name)` …, values with their JSON types. Empty without one. |
 | `tr.request` | `.method`, `.url`, `.headers` (`.get`, `.get_all`, `.set`, `.add`, `.remove`, `.items()`; as with requests, a dict, another mapping or a list of pairs can replace them), `.body` (raw bodies; bytes are sent as their UTF-8 text, a dict, list, tuple or bool as JSON). Pre-request scripts can change them; `{{variables}}` they contain are replaced afterwards. A request they leave in a state that can't be sent isn't sent, and what they printed, tested and set is kept. Test scripts see the request as it was sent. |
 | `tr.response` | In test scripts: `.status` (or `.code`), `.reason`, `.headers`, `.time` (ms), `.size`, `.text()`, `.json()`, `.content` (bytes). |
 | `tr.test(name, fn)`, `@tr.test(name)` | Records a test that fails when `fn` raises, as `assert` does. |
-| `tr.info` | `.phase` (`prerequest` or `test`), `.script`, `.request_name`, `.collection`, `.environment`. |
+| `tr.info` | `.phase` (`prerequest` or `test`), `.script`, `.request_name`, `.collection`, `.environment`, `.iteration` (from 0) and `.iteration_count` of the run. |
 | `print(…)` | Goes to the response's *Scripts* tab, and to stderr on the command line. So does `logging`, also through a handler an earlier script set up (`logging.basicConfig()`). |
 
 | JavaScript: Postman's `pm` object | |
 |---|---|
-| `pm.environment`, `pm.collectionVariables`, `pm.globals`, `pm.variables`, `pm.iterationData` | `.get`, `.set`, `.unset`, `.has`, `.clear`, `.toObject`, `.replaceIn`, as in Postman. |
+| `pm.environment`, `pm.collectionVariables`, `pm.globals`, `pm.variables`, `pm.iterationData` | `.get`, `.set`, `.unset`, `.has`, `.clear`, `.toObject`, `.replaceIn`, as in Postman. `pm.iterationData` holds the run's current row of its data file (`termrest run --iteration-data`), with the values' JSON types; `pm.info.iteration` and `pm.info.iterationCount` say which iteration it is. |
 | `pm.request` | `.method`, `.url` (`.query.add`, `.toString()`, `.getHost()` …; as in Postman, its `host` and `path` may be set as text), `.headers` (`.add`, `.upsert`, `.remove`, `.get`, `.has`, `.each` …), `.body.raw`. Pre-request scripts can change them, as with `tr.request`; a request they leave in a state that can't be sent (a `query` that is no longer a list) isn't sent, and what they printed, tested and set is kept. |
 | `pm.response` | `.code`, `.status`, `.headers`, `.responseTime`, `.responseSize`, `.json()`, `.text()`, `.stream`, `.cookies`, and Postman's assertions: `.to.have.status(…)`, `.to.have.header(…)`, `.to.have.body(…)`, `.to.have.jsonBody(…)`, `.to.be.ok`, `.success`, `.clientError`, `.withoutContent`, `.json` …, and `.to.have.jsonSchema(schema)` (with `ajv` installed in the workspace: ajv 6, Postman's, checks formats such as `email` or `date-time` itself; ajv 8 needs `ajv-formats` for them, and a format it doesn't know fails the test, saying so), which also checks any value: `pm.expect(data.items[0]).to.have.jsonSchema(itemSchema)`. |
 | `pm.test(name, fn)`, `pm.expect(value)` | Tests (also asynchronous: `async` functions, or a `done` callback) and chai's assertions: `equal`, `eql`, `include`, `a`/`an`, `property`, `lengthOf`, `above`/`below`, `oneOf`, `members`, `keys`, `match`, `throw`, `not`, `deep`, `nested` …, with chai's messages. As in Postman, a property no assertion has, such as a misspelled `.to.be.ture`, fails the test (`Invalid Chai property: ture. Did you mean "true"?`) instead of checking nothing. |
@@ -269,12 +270,13 @@ A collection, a folder and a request can each have a pre-request and a post-resp
 | C#: the `tr` object | |
 |---|---|
 | `tr.Environment`, `tr.CollectionVariables`, `tr.Globals` | `["name"]` (null when not set; setting null unsets), `.Get(name, fallback)`, `.Set(name, value)`, `.Unset(name)`, `.Has(name)`, `.Clear()`, `.ToDictionary()`. Kept as in Python. |
-| `tr.Variables` | Reads every scope (this request, the environment, the collection, the globals). `.Set()` is for this request only. `.ReplaceIn("{{base}}/x")` replaces `{{variables}}` and dynamic variables (`{{$guid}}` …) in a text. |
+| `tr.Variables` | Reads every scope (this request, the run's iteration data, the environment, the collection, the globals). `.Set()` is for this request only. `.ReplaceIn("{{base}}/x")` replaces `{{variables}}` and dynamic variables (`{{$guid}}` …) in a text. |
+| `tr.IterationData` | The data of the run's current iteration (`termrest run --iteration-data`), as text: `.Get(name)` …. Empty without one. |
 | `tr.Request` | `.Method`, `.Url`, `.Headers` (`["name"]`, `.Get`, `.GetAll`, `.Set`, `.Add`, `.Remove`, `.Has`), `.Body` (raw bodies). Pre-request scripts can change them. |
 | `tr.Response` | In test scripts: `.Status` (or `.Code`), `.Reason`, `.Headers`, `.Time` (ms), `.Size`, `.Text()`, `.Json()` (a `JsonNode`: `json["name"]`, `(int)json["id"]`), `.Content` (bytes). |
 | `tr.Test(name, () => …)` | Records a test that fails when it throws; `async () => …` tests are awaited. Assertion libraries from NuGet work too. |
 | `tr.Assert(condition)`, `tr.AssertEqual(expected, actual)` | Fail with the code that failed: `assertion failed: tr.Response.Status == 201`, `tr.Response.Code: expected 201, got 200`. `AssertEqual` compares numbers as numbers and JSON as JSON: `tr.AssertEqual("Ada", json["name"])`. |
-| `tr.Info` | `.Phase`, `.Script`, `.RequestName`, `.Collection`, `.Environment`. |
+| `tr.Info` | `.Phase`, `.Script`, `.RequestName`, `.Collection`, `.Environment`, `.Iteration` (from 0) and `.IterationCount` of the run. |
 | `Console.WriteLine(…)` | Goes where `print` does. `HttpClient` sends requests of the script's own (TermRest's certificates and proxy settings do not apply). |
 
 **PowerShell scripts**
@@ -289,12 +291,13 @@ A collection, a folder and a request can each have a pre-request and a post-resp
 | PowerShell: the `$tr` object | |
 |---|---|
 | `$tr.Environment`, `$tr.CollectionVariables`, `$tr.Globals` | `.Get(name)`, `.Get(name, default)`, `.Set(name, value)`, `.Unset(name)`, `.Has(name)`, `.Clear()`, `.ToHashtable()`. Names are case-sensitive, as in Postman. Kept as in Python. |
-| `$tr.Variables` | Reads every scope (this request, the environment, the collection, the globals). `.Set()` is for this request only. `.ReplaceIn('{{base}}/x')` replaces `{{variables}}` and dynamic variables (`{{$guid}}` …) in a text. |
+| `$tr.Variables` | Reads every scope (this request, the run's iteration data, the environment, the collection, the globals). `.Set()` is for this request only. `.ReplaceIn('{{base}}/x')` replaces `{{variables}}` and dynamic variables (`{{$guid}}` …) in a text. |
+| `$tr.IterationData` | The data of the run's current iteration (`termrest run --iteration-data`), as text: `.Get(name)` …. Empty without one. |
 | `$tr.Request` | `.Method`, `.Url`, `.Headers` (`.Get`, `.GetAll`, `.Set`, `.Add`, `.Remove`, `.Has`, `.Items()`, `.Count`), `.Body` (raw bodies; `$null` for others; bytes are sent as UTF-8 text, a hashtable or object as JSON). Pre-request scripts can change them; a request they leave in a state that can't be sent (`.Headers` set to `$null`) isn't sent, and what they printed, tested and set is kept. |
 | `$tr.Response` | In test scripts: `.Status` (or `.Code`), `.Reason`, `.Headers`, `.Time` (ms), `.Size`, `.Text()`, `.Json()` (`ConvertFrom-Json`: `$json.name`), `.Content()` (bytes). |
 | `$tr.Test(name, { … })` | Records a test that fails when the block throws or a command in it fails. |
 | `$tr.Assert(condition)`, `$tr.AssertEqual(expected, actual)` | Fail with the code that failed: `assertion failed: $tr.Response.Status -eq 201`, `$tr.Response.Code: expected 201, got 200`. `AssertEqual` compares numbers as numbers, text exactly (case included, unlike `-eq`), and JSON objects and hashtables by their members. |
-| `$tr.Info` | `.Phase`, `.Script`, `.RequestName`, `.Collection`, `.Environment`. |
+| `$tr.Info` | `.Phase`, `.Script`, `.RequestName`, `.Collection`, `.Environment`, `.Iteration` (from 0) and `.IterationCount` of the run. |
 | `Write-Host …` | Goes where `print` does. `Invoke-RestMethod` sends requests of the script's own (TermRest's certificates and proxy settings do not apply). |
 
 ```python
@@ -721,7 +724,7 @@ common options:      -e/--env <name|file>  --var key=value  --timeout <ms>  -k/-
                      --python <path>  --javascript <path>  --csharp <path>  --powershell <path>
                      --script-order <languages>  --no-scripts  --allow-outside-files
 send options:        -i/--include  -v/--verbose  -o/--output <file>  --raw  --filter <jsonpath>  -f/--fail  --curl  --no-history
-run options:         --bail  --allow-http-errors  --report-json <file>
+run options:         --bail  --allow-http-errors  --report-json <file>  -d/--iteration-data <file.csv|file.json>  -n/--iteration-count <n>
 history options:     -n/--limit <n>  --show <id>  --json  --clear
 import-curl options: --folder <path>  --name <name>  --dry-run
 certs list options:  --allow-outside-files
@@ -732,6 +735,7 @@ snapshot options:    --send  --request <path>  --width <n>  --height <n>  --them
 
 ```sh
 termrest run "samples/TermRest Demo.postman_collection.json" -e "Postman Echo" --report-json report.json
+termrest run api.postman_collection.json -d users.csv                 # once for each row of users.csv: {{name}}, pm.iterationData.get('name')
 termrest send api.postman_collection.json "Users/Get user" --var userId=42 -i
 termrest send api.postman_collection.json "Users/Get user" --curl     # print an equivalent curl command (scripts do not run, no OAuth 2.0 token is fetched; none, and exit code 2, if it can't be sent or curl can't send it the same way)
 termrest send api.postman_collection.json "Users/List users" --filter '$.users[?@.active].email'
@@ -747,6 +751,8 @@ termrest run api.postman_collection.json --powershell pwsh --javascript node --s
 Paths on the command line are relative to the current folder, those of `--python`, `--javascript`, `--csharp` and `--powershell` included (a name without a folder, such as `node`, is looked up on PATH); runtimes chosen in the UI (*Tools › Scripts…*) are relative to the workspace.
 
 The `--report-json` report redacts secrets the way [recordings](#recording-requests) do, test names and errors included. Missing folders are created; on Unix only you can read it.
+
+**Data-driven runs.** `run -d <file>` (`--iteration-data`, as in Newman) runs the requests once for each row of a data file, each run an iteration: a CSV file with a header row that names the values (values with commas, quotes or line breaks in double quotes, a quote in one written `""`; empty lines are skipped), or JSON, an array of objects (`[{"name": "Ada", "id": 7}, …]`). A row's values are data variables: `{{name}}` in requests, between `--var` and the environment's (above), and `pm.iterationData` in scripts (`tr.iteration_data`, `tr.IterationData`, `$tr.IterationData`), JSON values with their types for JavaScript and Python. `-n <count>` (`--iteration-count`) runs that many iterations, with or without data; past a data file's last row, that row is used again, as in Postman. Variables that scripts set in the environment, the collection and the globals carry over to the next iteration. The file is read through once before anything is sent, so that a row that isn't valid stops the run at once (exit code 2), and then one row at a time: a large file takes no more memory than a row. The report has the number of `iterations`, and the `iteration` (from 1) of each result.
 
 `send --filter <query>` prints only the values a JSONPath query ([RFC 9535](https://www.rfc-editor.org/rfc/rfc9535), as in the UI's Filter) selects in a JSON body, as a JSON array: two-space indented, or on one line with `--raw`; with `-o`, it writes them to the file instead of the body. A query that isn't valid JSONPath is a usage error, reported with where it goes wrong before anything is sent; a body that isn't JSON (or binary, or empty) makes `send` exit with code 1.
 

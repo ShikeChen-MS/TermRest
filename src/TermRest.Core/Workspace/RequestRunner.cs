@@ -33,6 +33,35 @@ public sealed partial class RequestRunner : IDisposable
     /// <summary>Highest-precedence variables (CLI <c>--var</c>, values captured during a run).</summary>
     public Dictionary<string, string> LocalVariables { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// The data of the run's current iteration (a row of its data file, see <see cref="IterationDataFile"/>): data variables,
+    /// below this request's variables and above the environment's, as in Postman. Scripts get its values with their JSON
+    /// types (<c>pm.iterationData</c>); requests get them as text (numbers and true as written, objects as JSON). Null: none.
+    /// </summary>
+    public System.Text.Json.Nodes.JsonObject? IterationData
+    {
+        get => _iterationData;
+        set
+        {
+            _iterationData = value;
+            _iterationText = value?.ToDictionary(p => p.Key, p => p.Value switch
+            {
+                null => "null",
+                System.Text.Json.Nodes.JsonValue text when text.TryGetValue<string>(out var s) => s,
+                var other => other.ToJsonString(),
+            }, StringComparer.Ordinal);
+        }
+    }
+
+    /// <summary>The run's current iteration, from 0 (<c>pm.info.iteration</c>).</summary>
+    public int Iteration { get; set; }
+
+    /// <summary>The number of iterations of the run (<c>pm.info.iterationCount</c>).</summary>
+    public int IterationCount { get; set; } = 1;
+
+    private System.Text.Json.Nodes.JsonObject? _iterationData;
+    private Dictionary<string, string>? _iterationText;
+
     /// <summary>Overrides the workspace's active environment (e.g. CLI <c>--env file.json</c>).</summary>
     public PostmanEnvironment? EnvironmentOverride { get; set; }
 
@@ -145,6 +174,11 @@ public sealed partial class RequestRunner : IDisposable
         if (LocalVariables.Count > 0 || requestVariables is { Count: > 0 })
         {
             scopes.Add(new OverlayScope(new DictionaryScope("local", LocalVariables), requestVariables));
+        }
+
+        if (_iterationText is { Count: > 0 } data)
+        {
+            scopes.Add(new DictionaryScope($"data (iteration {Iteration + 1})", data));
         }
 
         if (environment is not null)

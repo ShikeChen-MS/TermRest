@@ -1417,8 +1417,8 @@ internal static class JavaScriptWorkerCode
           const pm = {
             info: {
               eventName: phase === 'prerequest' ? 'prerequest' : 'test',
-              iteration: 0,
-              iterationCount: 1,
+              iteration: typeof info.iteration === 'number' ? info.iteration : 0,
+              iterationCount: typeof info.iteration_count === 'number' ? info.iteration_count : 1,
               requestName: info.request_name === null ? undefined : info.request_name,
               requestId: host.uuid(),
             },
@@ -1532,8 +1532,8 @@ internal static class JavaScriptWorkerCode
             xml2Json,
             environment: pm.environment.toObject(),
             globals: pm.globals.toObject(),
-            data: {},
-            iteration: 0,
+            data: pm.iterationData.toObject(),
+            iteration: pm.info.iteration,
             request: { url: String(pm.request.url), method: pm.request.method, headers: pm.request.headers.toObject(true, true), data: pm.request.body.raw, name: pm.info.requestName },
           });
 

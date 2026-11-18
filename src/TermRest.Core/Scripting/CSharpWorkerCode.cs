@@ -244,12 +244,13 @@ internal static partial class CSharpWorkerCode
             {
                 private readonly JsonArray _tests;
 
-                internal Tr(Scope environment, Scope collectionVariables, Scope globals, Variables variables, Request request, Response response, Info info, JsonArray tests)
+                internal Tr(Scope environment, Scope collectionVariables, Scope globals, Variables variables, Scope iterationData, Request request, Response response, Info info, JsonArray tests)
                 {
                     Environment = environment;
                     CollectionVariables = collectionVariables;
                     Globals = globals;
                     Variables = variables;
+                    IterationData = iterationData;
                     Request = request;
                     Response = response;
                     Info = info;
@@ -263,8 +264,11 @@ internal static partial class CSharpWorkerCode
 
                 public Scope Globals { get; }
 
-                /// <summary>Reads every scope (this request, environment, collection, globals); Set is for this request only.</summary>
+                /// <summary>Reads every scope (this request, the run's iteration data, environment, collection, globals); Set is for this request only.</summary>
                 public Variables Variables { get; }
+
+                /// <summary>The data of the run's current iteration, a row of its data file (termrest run --iteration-data); empty without one.</summary>
+                public Scope IterationData { get; }
 
                 /// <summary>The request: change it in pre-request scripts ({{variables}} are not replaced yet).</summary>
                 public Request Request { get; }
@@ -652,6 +656,8 @@ internal static partial class CSharpWorkerCode
                     RequestName = Host.AsText(data?["request_name"]);
                     Collection = Host.AsText(data?["collection"]);
                     Environment = Host.AsText(data?["environment"]);
+                    Iteration = data?["iteration"] is JsonValue iteration && iteration.TryGetValue<int>(out var number) ? number : 0;
+                    IterationCount = data?["iteration_count"] is JsonValue count && count.TryGetValue<int>(out var total) ? total : 1;
                 }
 
                 /// <summary>"prerequest" or "test".</summary>
@@ -665,6 +671,12 @@ internal static partial class CSharpWorkerCode
                 public string Collection { get; }
 
                 public string Environment { get; }
+
+                /// <summary>The run's current iteration, from 0.</summary>
+                public int Iteration { get; }
+
+                /// <summary>The number of iterations of the run.</summary>
+                public int IterationCount { get; }
             }
 
             /// <summary>A failed tr.Assert or tr.AssertEqual: a test shows its message alone.</summary>
@@ -801,7 +813,7 @@ internal static partial class CSharpWorkerCode
                         return values;
                     }
 
-                    Dictionary<string, string> environment = Values("environment"), collection = Values("collection"), globals = Values("globals"), local = Values("local");
+                    Dictionary<string, string> environment = Values("environment"), collection = Values("collection"), globals = Values("globals"), local = Values("local"), data = Values("data");
                     var info = new Info(phase, message["info"] as JsonObject);
                     var tests = new JsonArray();
                     var logs = new JsonArray();
@@ -810,7 +822,8 @@ internal static partial class CSharpWorkerCode
                         new Scope(environment, changes["environment"].AsObject()),
                         new Scope(collection, changes["collection"].AsObject()),
                         new Scope(globals, changes["globals"].AsObject()),
-                        new Variables(local, changes["local"].AsObject(), new[] { local, environment, collection, globals }, message["dynamic"] as JsonObject),
+                        new Variables(local, changes["local"].AsObject(), new[] { local, data, environment, collection, globals }, message["dynamic"] as JsonObject),
+                        new Scope(data, new JsonObject()),
                         request,
                         message["response"] is JsonObject response ? new Response(response) : null,
                         info,

@@ -18,6 +18,15 @@ internal static class RunCommand
         var bail = new Option<bool>("--bail") { Description = "Stop at the first failure" };
         var allowHttpErrors = new Option<bool>("--allow-http-errors") { Description = "Do not treat HTTP 4xx/5xx responses as failures" };
         var json = new Option<string?>("--report-json") { Description = "Also write a JSON report to this file" };
+        var iterationData = new Option<string?>("--iteration-data", "-d")
+        {
+            Description = "Run the requests once for each row of this data file: CSV with a header row, or JSON (an array of objects); " +
+                          "its values are data variables ({{name}}, pm.iterationData)",
+        };
+        var iterationCount = new Option<int?>("--iteration-count", "-n")
+        {
+            Description = "Run the requests this many times (default: once, or once for each row of --iteration-data; past its last row, that row is used again)",
+        };
         var options = new RequestOptions();
         command.Arguments.Add(collection);
         command.Options.Add(folder);
@@ -25,6 +34,8 @@ internal static class RunCommand
         command.Options.Add(bail);
         command.Options.Add(allowHttpErrors);
         command.Options.Add(json);
+        command.Options.Add(iterationData);
+        command.Options.Add(iterationCount);
 
         command.SetAction(async (parseResult, cancellationToken) =>
         {
@@ -68,57 +79,121 @@ internal static class RunCommand
             var requests = root is CollectionRootNode
                 ? target.AllRequests().ToList()
                 : target.AllRequests().Where(r => r.Ancestors().Contains(root)).ToList();
+
+            // The data file is read through once first: a row that isn't valid stops the run before anything is sent.
+            IterationDataFile? data = null;
+            var rows = 0;
+            if (parseResult.GetValue(iterationData) is { } dataPath)
+            {
+                try
+                {
+                    data = IterationDataFile.Open(dataPath);
+                    rows = await data.CountAsync(cancellationToken);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException)
+                {
+                    Output.Error($"--iteration-data: {ex.Message}");
+                    return 2;
+                }
+
+                if (rows == 0)
+                {
+                    Output.Error($"--iteration-data: {dataPath} has no rows{(data.IsJson ? "" : " (the first row of a CSV file names the values)")}.");
+                    return 2;
+                }
+            }
+
+            var iterations = parseResult.GetValue(iterationCount) ?? Math.Max(1, rows);
+            if (iterations < 1)
+            {
+                Output.Error("--iteration-count: give 1 or more.");
+                return 2;
+            }
+
             if (!options.StartRecording(parseResult, opened.Workspace, runner, out var recorder))
             {
                 return 2;
             }
 
-            Output.Info($"Running {requests.Count} request(s) from '{target.Name}'{(root is CollectionRootNode ? "" : " / " + root.PathInCollection)}" +
-                        $"{(runner.Environment is { } env ? $" with environment '{env.Name}'" : "")}\n");
+            Output.Info($"Running {requests.Count} request(s){(iterations > 1 ? $" × {iterations} iterations" : "")} from '{target.Name}'" +
+                        $"{(root is CollectionRootNode ? "" : " / " + root.PathInCollection)}" +
+                        $"{(runner.Environment is { } env ? $" with environment '{env.Name}'" : "")}" +
+                        $"{(data is null ? "" : $", data from {Path.GetFileName(data.Path)} ({rows} row(s))")}\n");
 
             var reportPath = parseResult.GetValue(json);
             var results = new RunResults(reportPath is null ? null : new Redactor(opened.Workspace.Settings.RecordingRedact));
             var notesShown = new HashSet<string>(StringComparer.Ordinal);
             var cancelled = false;
-            foreach (var node in requests)
+            var stopped = false;
+            var dataFailed = false;
+            await using var dataRows = data?.ReadAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
+            System.Text.Json.Nodes.JsonObject? row = null;
+            runner.IterationCount = iterations;
+            for (var iteration = 0; iteration < iterations && !stopped; iteration++)
             {
-                var exchange = await SendSafelyAsync(runner, target, node, cancellationToken);
-                if (exchange.Cancelled || cancellationToken.IsCancellationRequested)
+                try
                 {
-                    cancelled = true;
+                    // Past the last row, that row again, as in Postman.
+                    if (dataRows is not null && await dataRows.MoveNextAsync())
+                    {
+                        row = dataRows.Current;
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException)
+                {
+                    Output.Error($"--iteration-data: {ex.Message}");
+                    dataFailed = true;
                     break;
                 }
 
-                // Passing means a response (not an HTTP error, unless allowed), passing tests and no script errors.
-                var passed = exchange.Response is { } r && (parseResult.GetValue(allowHttpErrors) || r.StatusCode < 400) && exchange.Scripts?.Succeeded != false;
-                var status = exchange.Response is { } response ? response.StatusCode.ToString(System.Globalization.CultureInfo.InvariantCulture) : "ERR";
-                Output.Status($"{(passed ? "✓" : "✗")} {status,-4} {HttpExchange.Format(exchange.Timing.Total),9}  {exchange.Request.Method,-7} {node.PathInCollection}", passed);
-                if (exchange.Response is null)
+                runner.Iteration = iteration;
+                runner.IterationData = row;
+                if (iterations > 1)
                 {
-                    Output.Info($"      {exchange.ErrorMessage}");
+                    Output.Info($"{(iteration > 0 ? "\n" : "")}Iteration {iteration + 1}/{iterations}");
                 }
 
-                foreach (var warning in exchange.Request.Warnings)
+                foreach (var node in requests)
                 {
-                    Output.Warning($"  {warning}");
-                }
+                    var exchange = await SendSafelyAsync(runner, target, node, cancellationToken);
+                    if (exchange.Cancelled || cancellationToken.IsCancellationRequested)
+                    {
+                        cancelled = stopped = true;
+                        break;
+                    }
 
-                ScriptOutput.Print(exchange, "      ", notesShown);
-                results.Add(node, exchange, passed);
-                if (!passed && parseResult.GetValue(bail))
-                {
-                    break;
+                    // Passing means a response (not an HTTP error, unless allowed), passing tests and no script errors.
+                    var passed = exchange.Response is { } r && (parseResult.GetValue(allowHttpErrors) || r.StatusCode < 400) && exchange.Scripts?.Succeeded != false;
+                    var status = exchange.Response is { } response ? response.StatusCode.ToString(System.Globalization.CultureInfo.InvariantCulture) : "ERR";
+                    Output.Status($"{(passed ? "✓" : "✗")} {status,-4} {HttpExchange.Format(exchange.Timing.Total),9}  {exchange.Request.Method,-7} {node.PathInCollection}", passed);
+                    if (exchange.Response is null)
+                    {
+                        Output.Info($"      {exchange.ErrorMessage}");
+                    }
+
+                    foreach (var warning in exchange.Request.Warnings)
+                    {
+                        Output.Warning($"  {warning}");
+                    }
+
+                    ScriptOutput.Print(exchange, "      ", notesShown);
+                    results.Add(node, exchange, passed, iteration + 1);
+                    if (!passed && parseResult.GetValue(bail))
+                    {
+                        stopped = true;
+                        break;
+                    }
                 }
             }
 
             var testSummary = results.TestsPassed + results.TestsFailed == 0 ? "" : $" (tests: {results.TestsPassed} passed, {results.TestsFailed} failed)";
-            Output.Info($"\n{(cancelled ? "Run cancelled. " : "")}{results.Count - results.Failed} passed, {results.Failed} failed, {requests.Count - results.Count} skipped{testSummary}");
+            Output.Info($"\n{(cancelled ? "Run cancelled. " : "")}{results.Count - results.Failed} passed, {results.Failed} failed, {(requests.Count * iterations) - results.Count} skipped{testSummary}");
             var unreadable = RequestOptions.ReportUnreadableFiles(target);
 
             // A cancelled run still saves what it recorded, and reports what it did (not tied to the cancellation token).
             var recorded = options.SaveRecording(parseResult, runner, recorder, cancellationToken.IsCancellationRequested);
-            var reported = reportPath is null || await WriteReportAsync(reportPath, results.ToJson(target));
-            return cancelled ? 130 : results.Failed == 0 && recorded && reported && !unreadable ? 0 : 1;
+            var reported = reportPath is null || await WriteReportAsync(reportPath, results.ToJson(target, iterations));
+            return cancelled ? 130 : results.Failed == 0 && recorded && reported && !unreadable && !dataFailed ? 0 : 1;
         });
 
         return command;
@@ -161,7 +236,7 @@ internal static class RunCommand
 
         public int TestsFailed { get; private set; }
 
-        public void Add(RequestNode node, HttpExchange exchange, bool passed)
+        public void Add(RequestNode node, HttpExchange exchange, bool passed, int iteration)
         {
             Count++;
             Failed += passed ? 0 : 1;
@@ -180,6 +255,7 @@ internal static class RunCommand
             var scripts = exchange.Scripts;
             _entries.Add(new ReportEntry(
                 node.PathInCollection,
+                iteration,
                 exchange.Request.Method,
                 redact.Url(exchange.Request.Url, "url"),
                 passed,
@@ -192,7 +268,7 @@ internal static class RunCommand
         }
 
         /// <summary>The JSON report (UTF-8).</summary>
-        public byte[] ToJson(PostmanCollection collection)
+        public byte[] ToJson(PostmanCollection collection, int iterations)
         {
             using var stream = new MemoryStream();
             using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
@@ -200,6 +276,7 @@ internal static class RunCommand
                 writer.WriteStartObject();
                 writer.WriteString("collection", collection.Name);
                 writer.WriteString("finishedAt", DateTimeOffset.Now);
+                writer.WriteNumber("iterations", iterations);
                 writer.WriteNumber("passed", Count - Failed);
                 writer.WriteNumber("failed", Failed);
                 writer.WriteStartArray("results");
@@ -207,6 +284,7 @@ internal static class RunCommand
                 {
                     writer.WriteStartObject();
                     writer.WriteString("request", entry.Request);
+                    writer.WriteNumber("iteration", entry.Iteration);
                     writer.WriteString("method", entry.Method);
                     writer.WriteString("url", entry.Url);
                     writer.WriteBoolean("passed", entry.Passed);
@@ -255,9 +333,9 @@ internal static class RunCommand
         }
     }
 
-    /// <summary>What the report says of one request, redacted. <see cref="Status"/> is null when there was no response (see <see cref="Error"/>).</summary>
+    /// <summary>What the report says of one request in one iteration (from 1), redacted. <see cref="Status"/> is null when there was no response (see <see cref="Error"/>).</summary>
     private sealed record ReportEntry(
-        string Request, string Method, string Url, bool Passed, int? Status, long Bytes, string? Error, List<ReportTest>? Tests, string? ScriptError, double TotalMs);
+        string Request, int Iteration, string Method, string Url, bool Passed, int? Status, long Bytes, string? Error, List<ReportTest>? Tests, string? ScriptError, double TotalMs);
 
     private sealed record ReportTest(string Name, bool Passed, string? Error);
 

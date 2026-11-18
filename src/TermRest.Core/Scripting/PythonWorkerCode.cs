@@ -216,7 +216,7 @@ internal static class PythonWorkerCode
 
 
         class Variables(Scope):
-            # tr.variables reads every scope (this request, environment, collection, globals) and sets this request's.
+            # tr.variables reads every scope (this request, the run's iteration data, environment, collection, globals) and sets this request's.
 
             def __init__(self, local, changes, scopes, dynamic=None):
                 super().__init__(local, changes)
@@ -439,6 +439,7 @@ internal static class PythonWorkerCode
             variables = message.get("variables") or {}
             changes = {"environment": {}, "collection": {}, "globals": {}, "local": {}}
             values = {scope: dict(variables.get(scope) or {}) for scope in changes}
+            data = dict(variables.get("data") or {})
             info = types.SimpleNamespace(phase=phase, script="", **(message.get("info") or {}))
             tests, logs = [], []
             request = Request(message.get("request") or {}, phase == "prerequest")
@@ -446,7 +447,8 @@ internal static class PythonWorkerCode
                 environment=Scope(values["environment"], changes["environment"]),
                 collection_variables=Scope(values["collection"], changes["collection"]),
                 globals=Scope(values["globals"], changes["globals"]),
-                variables=Variables(values["local"], changes["local"], [values["local"], values["environment"], values["collection"], values["globals"]], _dynamic(message.get("dynamic") or {})),
+                variables=Variables(values["local"], changes["local"], [values["local"], data, values["environment"], values["collection"], values["globals"]], _dynamic(message.get("dynamic") or {})),
+                iteration_data=Scope(data, {}),
                 request=request,
                 response=Response(message["response"]) if message.get("response") else None,
                 info=info,

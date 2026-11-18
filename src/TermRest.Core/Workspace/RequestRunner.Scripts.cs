@@ -350,10 +350,20 @@ public sealed partial class RequestRunner
                 ["collection"] = Values(collection.GetVariables(), Session.Find(collection)),
                 ["globals"] = Values(Workspace.Globals?.Values, Session.Globals),
                 ["local"] = Values(LocalVariables.Select(v => new KeyValueEntry { Key = v.Key, Value = v.Value }), local),
+
+                // With their JSON types: Postman's iteration data keeps them (pm.iterationData.get('count') is a number).
+                ["data"] = IterationData?.DeepClone() ?? new JsonObject(),
             },
             ["request"] = request,
             ["response"] = response,
-            ["info"] = new JsonObject { ["request_name"] = requestName, ["collection"] = collection.Name, ["environment"] = environment?.Name },
+            ["info"] = new JsonObject
+            {
+                ["request_name"] = requestName,
+                ["collection"] = collection.Name,
+                ["environment"] = environment?.Name,
+                ["iteration"] = Iteration,
+                ["iteration_count"] = IterationCount,
+            },
             ["dynamic"] = new JsonObject
             {
                 ["firstNames"] = PostmanJson.ToJsonArray(VariableResolver.FirstNames.Select(n => (JsonNode?)n)),
