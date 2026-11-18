@@ -10,6 +10,7 @@ A lightweight terminal REST client for development and testing:
 - **Recording.** Press Record (F12) and every request and response you send is recorded. On stop, TermRest asks where to save it as a HAR file (JSON, opens in browser dev tools). Credentials, cookies, tokens and secret variables are redacted, files sent with a request are recorded by path only, and a recording streams to a private temporary file instead of growing in memory.
 - **Large bodies from files.** Send a file as the body without loading it: it is streamed when the request is sent, and a JSON or XML file is checked first.
 - **Client certificates (mutual TLS)** are first-class: PEM (including encrypted keys and chains), PFX/PKCS#12, and OS certificate stores. That includes the Windows certificate store with non-exportable keys and the macOS keychain. Certificates bind to URL patterns via a Newman-compatible registry, and a TLS tab shows exactly what was negotiated and presented.
+- **OAuth 2.0 tokens fetched for you** from any standards-based authorization server: client credentials, password, and authorization code with or without PKCE (you sign in with your browser). The client authenticates with its secret, or with a JWT signed by one of your client certificates. Tokens are kept in memory only and refreshed when they expire. See [OAuth 2.0](#oauth-20).
 - **One native executable** per platform: Windows, macOS and Linux on x64 and ARM64. Built with .NET 10 Native AOT: about 20 MB, starts in about 50 ms, no runtime to install.
 - **A headless CLI** (`send`, `run`, `validate`, `convert`, `history`, `import-curl`, `certs`) for scripts and CI, using the same engine.
 
@@ -134,7 +135,7 @@ A request that is not in a collection (a new one, an imported curl command, or o
 
 - **Params:** query parameters (kept in sync with the URL) and path variables (`:id` segments). Values are sent as typed, except that a `#` in a query parameter, a path variable or a `{{variable}}` in the path, and a `?` in a path variable, are sent percent-encoded (`%23`, `%3F`): they stay part of the value instead of ending the query or path, where the rest would not be sent.
 - **Headers:** values are sent as typed, in UTF-8 as curl sends them (`X-User: José` works), and cookies a server set go back in the bytes it sent them in; a value with a line break or NUL is refused (a trailing line break is dropped), so a value can never add a header of its own. Headers that describe a body (`Content-Type`, `Content-Encoding` …) are left out of a request without one, with a warning.
-- **Auth:** inherit, none, Basic, Bearer, API key, Digest, NTLM, or an OAuth 2.0 access token. Other Postman auth types are kept but not yet applied. Passwords, tokens and API key values are masked. An empty Bearer token (as a login request's script fills in later) adds no header, as in Postman, and a warning says so: an `Authorization` header the request has stays. Digest and NTLM credentials answer only their own scheme's challenges (NTLM also Negotiate) from the request's origin, never a Basic one. Credentials in the URL (`https://user:password@host`) are sent as Basic auth, as curl and Postman send them, unless the request has an `Authorization` header or an auth helper; as in Postman, a `{{variable}}` there may hold any character: `@ / ? # \` in its value are encoded, so a password with them neither ends the user info nor makes the URL invalid. The history masks the password, or the user name of a URL without one (`https://***@host`), which is then the credential. An API key or OAuth 2.0 token sent in the query is URL-encoded and replaces a parameter of the same name.
+- **Auth:** inherit, none, Basic, Bearer, API key, Digest, NTLM, or OAuth 2.0, which fetches its token itself (see [OAuth 2.0](#oauth-20)). Other Postman auth types are kept but not yet applied. Passwords, tokens and API key values are masked. An empty Bearer token (as a login request's script fills in later) adds no header, as in Postman, and a warning says so: an `Authorization` header the request has stays. Digest and NTLM credentials answer only their own scheme's challenges (NTLM also Negotiate) from the request's origin, never a Basic one. Credentials in the URL (`https://user:password@host`) are sent as Basic auth, as curl and Postman send them, unless the request has an `Authorization` header or an auth helper; as in Postman, a `{{variable}}` there may hold any character: `@ / ? # \` in its value are encoded, so a password with them neither ends the user info nor makes the URL invalid. The history masks the password, or the user name of a URL without one (`https://***@host`), which is then the credential. An API key or OAuth 2.0 token sent in the query is URL-encoded and replaces a parameter of the same name.
 - **Body:** none, raw (JSON, XML, text, HTML, JavaScript, colored in the language chosen, with Beautify), form-data with files, x-www-form-urlencoded, a file (see [Sending a file as the body](#sending-a-file-as-the-body)), or GraphQL (its variables colored as JSON). Form-data is sent as browsers, curl and Postman send it: field and file names in UTF-8, a field's content type as typed (one with a line break or NUL is refused), and a file without one with the type of its extension (`.gif`, `.jpg`, `.jpeg`, `.png`, `.svg`, `.txt`, `.htm`, `.html`, `.pdf`, `.xml`, `.json`; any other gets `application/octet-stream`). An empty body is no body, sent without a `Content-Type`, as in Postman: raw text that is empty once its `{{variables}}` are replaced, a form with no enabled field, or a file body without a file (a warning says so).
 - **Scripts:** pre-request and post-response (test) scripts, in Python, JavaScript, C# or PowerShell (see [Scripts](#scripts)).
 - **Settings:** per-request SSL verification and redirects, which client certificate applies, and the description. Redirects are followed like `curl -L`: at most *max redirects* (0 follows none; a negative `maxRedirects` on a request, as earlier imports of `--max-redirs -1` saved it, uses the workspace's), never from https to http; 301 and 302 turn a POST into a GET, 303 any method but HEAD, and 307 and 308 send the method and body again. The `Authorization`, `Proxy-Authorization`, `Cookie` and `Host` headers and the auth helper's (such as an API key) go only to the request's origin (scheme, host and port); other headers follow the redirect. The URL a redirect leads to never takes the user and password of the request's URL (they are sent as its `Authorization` header), so it is shown, kept in the history and recorded without them.
@@ -609,6 +610,32 @@ Not yet supported in v3 collections:
 - A key that holds a space followed by `*` (`Accept *: v`) reads as text rather than as a key, so TermRest writes such keys double-quoted (`"Accept *": v`).
 - Header names over 1,024 characters can't be saved.
 
+## OAuth 2.0
+
+An OAuth 2.0 auth helper (a request's, or a collection's or folder's) fetches its access token itself, from any authorization server that follows the standard ([RFC 6749](https://www.rfc-editor.org/rfc/rfc6749)): Keycloak, Okta, Auth0, Ping, Microsoft Entra ID, your own. The token is fetched when a request that uses it is sent, kept in memory for the session (never in a file, the history or a recording), and refreshed with its refresh token, or fetched again, when it is about to expire. In the Auth tab, *Get new token* fetches one now, *Forget token* has the next request fetch a new one, and *Token* says when it was fetched and when it expires. Requests with the same settings (those that inherit a collection's auth) share the token.
+
+- **Grants:** client credentials, password credentials, and authorization code, with or without PKCE (SHA-256 or plain). The implicit grant, which the [OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700) retires, is kept but not fetched.
+- **When a token is fetched:** once the token URL is set (for an authorization code, the auth URL too). Until then the *Access token* field is sent, so a collection exported from Postman with a token pasted in it works as before.
+- **Signing in** (authorization code): TermRest opens the sign-in page in your browser, and the server sends the browser back to the callback URL with the code. A loopback callback URL (`http://localhost:8400/callback`, `http://127.0.0.1:…`, `http://[::1]:…`) is received by TermRest itself, as native apps do ([RFC 8252](https://www.rfc-editor.org/rfc/rfc8252)); an empty one is a free port of 127.0.0.1 (`http://127.0.0.1:<port>/`), which servers that allow loopback callbacks on any port take. With any other callback URL (Postman's `https://oauth.pstmn.io/v1/callback`, your app's), or a browser on another machine (over SSH), paste the address the browser ends on. The state is checked, so a response to another sign-in is refused; a random state and code verifier are used unless set. In the UI a dialog waits for the browser (with *Copy address*, *Open browser* and a field to paste into) and closes by itself when the browser returns; on the command line the address is printed to stderr and a pasted one read from stdin. With neither a browser nor a terminal (CI), `send` and `run` fail at once instead of waiting.
+- **Client authentication:** as in Postman, the client ID and secret go as HTTP Basic (*Basic header*, the default) or in the form (*In body*); a client without a secret (a public one, as with PKCE) names itself in the form. TermRest adds *Signed JWT*: a client assertion ([RFC 7523](https://www.rfc-editor.org/rfc/rfc7523), OpenID Connect's `private_key_jwt`) signed with the private key of one of the workspace's [client certificates](#client-certificates-mutual-tls), so no secret is needed. It is valid for 5 minutes and names the certificate by its SHA-256 and SHA-1 thumbprints (`x5t#S256`, `x5t`). Choose the algorithm (RS256 by default for an RSA key; PS256, and RS or PS with 384 and 512; ES256, ES384 or ES512, as the curve of an EC key says), a key ID (`kid`), the audience (by default the token URL) and whether the certificate chain goes along (`x5c`). A certificate registered without URL patterns only signs: it goes to no server. Keys in the OS store work too, non-exportable ones included. Mutual TLS client authentication ([RFC 8705](https://www.rfc-editor.org/rfc/rfc8705)) works as for any request: the token URL gets the registered certificate whose patterns match it.
+- **Extra parameters:** Postman's advanced options (`tokenRequestParams`, `authRequestParams`, `refreshRequestParams`: an `audience` or `resource`, a header, a URL parameter) are sent, and replace a parameter of the same name. TermRest doesn't edit them yet.
+- **Token requests** go with the workspace's SSL verification (or `--insecure`), proxy, CA bundle and timeout (60 seconds when none is set). They follow no redirects (they carry the client's credentials), send and keep no cookies, and are not recorded. A request's *Timeline* (and `send --verbose`) says where its token came from and when it expires. A token that can't be had stops the request, and its error says why, with the server's `error` and `error_description`; when the server refuses a refresh, a new token is fetched, with a warning.
+- **cURL:** *Copy as cURL* and `send --curl` send nothing, so they add the token fetched earlier, if there is one; otherwise a warning says the command has none.
+
+The settings are Postman's (`grant_type`, `accessTokenUrl`, `authUrl`, `redirect_uri`, `clientId`, `clientSecret`, `scope`, `state`, `code_verifier`, `challengeAlgorithm`, `client_authentication`, `refreshTokenUrl`, `headerPrefix`, `addTokenTo`, `accessToken` …). A signed JWT is TermRest's `client_authentication: private_key_jwt`, with `x-clientAssertionCertificate` (the certificate's name in the registry), `x-clientAssertionAlgorithm`, `x-clientAssertionKeyId`, `x-clientAssertionAudience` and `x-clientAssertionChain`:
+
+```yaml
+auth:
+  type: oauth2
+  credentials:
+    grant_type: client_credentials
+    accessTokenUrl: https://login.example.com/oauth2/token
+    clientId: "{{clientId}}"
+    scope: orders.read
+    client_authentication: private_key_jwt
+    x-clientAssertionCertificate: service identity
+```
+
 ## Client certificates (mutual TLS)
 
 Open **Tools › Client certificates** (F8). From there you can add a PEM pair, a PFX, or pick a certificate from the OS store. Then bind it to URL patterns and press **Test** to confirm it loads with its private key. Entries are stored in `.termrest/certificates.json`:
@@ -637,7 +664,7 @@ Open **Tools › Client certificates** (F8). From there you can add a PEM pair, 
 ```
 
 - **File format:** the same as Newman's `--ssl-client-cert-list` (`name`, `matches`, `cert`/`key`/`pfx` `src`, `passphrase`). `x-store` is a TermRest extension. Relative paths resolve against the workspace folder.
-- **Matching:** patterns follow Postman's rules: `scheme://host[:port]/path`, where `*.domain` matches the domain and its subdomains, and a pattern without a port matches any port. A host can be written in Unicode or in ASCII (punycode): `https://bücher.example/*` and `https://xn--bcher-kva.example/*` match the same URLs. An IPv6 address goes in brackets, in any of its forms: `https://[::1]:8443/*`. The most specific match wins. A `certificate` set on an individual request in the collection (a Postman v2.1 field) takes precedence over the registry; without URL patterns of its own, it goes to the request's own origin only. A redirect target gets the certificate selected for its own URL.
+- **Matching:** patterns follow Postman's rules: `scheme://host[:port]/path`, where `*.domain` matches the domain and its subdomains, and a pattern without a port matches any port. A host can be written in Unicode or in ASCII (punycode): `https://bücher.example/*` and `https://xn--bcher-kva.example/*` match the same URLs. An IPv6 address goes in brackets, in any of its forms: `https://[::1]:8443/*`. The most specific match wins. A `certificate` set on an individual request in the collection (a Postman v2.1 field) takes precedence over the registry; without URL patterns of its own, it goes to the request's own origin only. A redirect target gets the certificate selected for its own URL. An entry without patterns goes to no server: it signs [OAuth 2.0 client assertions](#oauth-20) (as any entry can).
 - **Passphrases:** avoid storing them in the file. Use `env:NAME` to read an environment variable, or `{{variable}}` to read a (secret) environment value.
 - **A certificate that can't be loaded** (a missing, locked or unreadable file, a wrong passphrase, or on Windows a file on a network share outside the workspace folder, until you allow files from outside it: see [Workspace layout](#workspace-layout)) is not used: the request is sent without it, and a warning says why. Likewise an extra CA bundle that can't be read: only the OS trust store is used then.
 - **OS stores**
@@ -685,7 +712,7 @@ snapshot options:    --send  --request <path>  --width <n>  --height <n>  --them
 ```sh
 termrest run "samples/TermRest Demo.postman_collection.json" -e "Postman Echo" --report-json report.json
 termrest send api.postman_collection.json "Users/Get user" --var userId=42 -i
-termrest send api.postman_collection.json "Users/Get user" --curl     # print an equivalent curl command (scripts do not run; none, and exit code 2, if it can't be sent or curl can't send it the same way)
+termrest send api.postman_collection.json "Users/Get user" --curl     # print an equivalent curl command (scripts do not run, no OAuth 2.0 token is fetched; none, and exit code 2, if it can't be sent or curl can't send it the same way)
 termrest send api.postman_collection.json "Users/List users" --filter '$.users[?@.active].email'
                                                                      # only the values a JSONPath query selects, as a JSON array
 termrest run api.postman_collection.json --python .venv/bin/python   # run the collection's Python scripts and tests
@@ -718,7 +745,7 @@ On Windows, commands write UTF-8 without a byte order mark to files and pipes, a
 | Environments / globals | Read/write: JSON (`*.postman_environment.json`, `*.postman_globals.json`) and YAML (`postman/environments/*.environment.yaml`, `postman/globals/workspace.globals.yaml`) |
 | Folders, descriptions, saved examples, `protocolProfileBehavior`, unknown fields | Kept; edited fields are rewritten surgically |
 | Body modes | raw, urlencoded, formdata (text + files), file (binary, or typed and checked: `file.language`), graphql |
-| Auth | inherit, noauth, basic, bearer, apikey, digest, ntlm, oauth2 (access token) — others are kept, not applied |
+| Auth | inherit, noauth, basic, bearer, apikey, digest, ntlm, oauth2 (client credentials, password and authorization code with or without PKCE fetched and refreshed, or a token pasted; see [OAuth 2.0](#oauth-20)) — others are kept, not applied |
 | Scripts | JavaScript (`pm.*`, and the older `postman.*` and `tests[]`) runs in Node.js or Bun, Python (`"type": "text/x-python"`; v3 `language: text/x-python`) in Python, C# (`"type": "text/x-csharp"`) with the .NET SDK, PowerShell (`"type": "text/x-powershell"`) in PowerShell 7; scripts in TermRest's languages are written `"disabled": true` so Postman and Newman skip them; see [Scripts](#scripts) for the `pm` API supported |
 | Client certificates | `request.certificate` honoured; Newman certificate-list format for the registry |
 | cURL | Import (bash, cmd and PowerShell syntax) and export |
@@ -749,7 +776,7 @@ src/TermRest.Core   UI-free engine: Postman model + mapper (v2.1 JSON, v3 YAML),
 src/TermRest.Tui    Terminal.Gui v2 views and dialogs
 src/TermRest.Cli    `termrest` executable (System.CommandLine): TUI by default + headless commands
 tests/…Core.Tests   xUnit v3: fidelity, mapper, URLs, variables, certificates, YAML, Postman v3, history, cURL,
-                    recording and redaction, in-process Kestrel HTTP/TLS/mTLS tests
+                    recording and redaction, in-process Kestrel HTTP/TLS/mTLS and OAuth 2.0 server tests
 tests/…Tui.Tests    headless UI tests: renders the real window, injects mouse/keyboard input, asserts on screen text
 tests/…Cli.Tests    termrest commands run as a process: exit codes, output, and the files they write
 ```
@@ -775,7 +802,7 @@ Notes:
 
 ## Roadmap
 
-- **Next:** OAuth 2.0 token acquisition, including Entra ID client credentials with a certificate; saving responses as Postman examples, and showing them in v3 collections.
+- **Next:** saving responses as Postman examples, and showing them in v3 collections.
 - **Phase 2:**
   - Proxy authentication.
   - Code snippets.
