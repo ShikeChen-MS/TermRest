@@ -180,6 +180,7 @@ internal sealed class RequestOptions
             StrictSslOverride = parseResult.GetValue(insecure) ? false : null,
             TimeoutOverrideMs = parseResult.GetValue(Timeout),
             ScriptsEnabled = !parseResult.GetValue(NoScripts),
+            OAuth2Interaction = new ConsoleSignIn(),
         };
 
         if (runner.ScriptsEnabled)

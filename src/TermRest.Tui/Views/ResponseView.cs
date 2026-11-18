@@ -237,9 +237,12 @@ internal sealed class ResponseView : View
     }
 
     /// <summary>Pre-request scripts are running: the request is not prepared yet.</summary>
-    public void ShowRunningScripts()
+    public void ShowRunningScripts() => ShowProgress("Running pre-request scripts …  (Esc or Send to cancel)");
+
+    /// <summary>Says what the request waits for before it goes (scripts, an OAuth 2.0 token).</summary>
+    public void ShowProgress(string text)
     {
-        _status.Text = "Running pre-request scripts …  (Esc or Send to cancel)";
+        _status.Text = text;
         _status.SchemeName = null;
     }
 

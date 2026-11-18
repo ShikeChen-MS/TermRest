@@ -27,6 +27,12 @@ public sealed class AppliedAuth
 
     /// <summary>Resolved credentials (passwords, tokens, key values) that must not end up in history or logs.</summary>
     public List<string> Secrets { get; } = [];
+
+    /// <summary>
+    /// OAuth 2.0 settings to fetch the access token with before the request is sent (see <see cref="OAuth2Tokens"/>); the
+    /// token is added then. Null for other auth, and for an OAuth 2.0 helper that has a token set but no URLs to fetch one.
+    /// </summary>
+    public OAuth2Settings? OAuth2 { get; set; }
 }
 
 public static class AuthApplier
@@ -118,15 +124,24 @@ public static class AuthApplier
 
             case "oauth2":
             {
+                // With URLs to fetch a token from, one is fetched (or the one fetched earlier taken) when the request is sent.
+                if (OAuth2Settings.Read(auth, value => variables.Resolve(value, unresolved), out var notFetched) is { } settings)
+                {
+                    result.OAuth2 = settings;
+                    result.Secrets.AddRange(settings.Secrets);
+                    result.Description = $"OAuth 2.0, {settings.GrantName}";
+                    break;
+                }
+
                 var token = Get("accessToken");
                 result.Secrets.Add(token);
                 if (token.Length == 0)
                 {
-                    result.Warnings.Add("OAuth 2.0: no access token is set. Paste a token in the Auth tab (token acquisition is not implemented yet).");
+                    result.Warnings.Add($"OAuth 2.0: there is no access token, and none is fetched: {notFetched}. The request was sent without one.");
                     break;
                 }
 
-                var prefix = auth.Get("headerPrefix") is { } p ? variables.Resolve(p, unresolved) : "Bearer";
+                var prefix = OAuth2Settings.HeaderPrefixOf(auth, value => variables.Resolve(value, unresolved));
                 if (string.Equals(auth.Get("addTokenTo"), "queryParams", StringComparison.OrdinalIgnoreCase))
                 {
                     result.QueryParameters.Add(new("access_token", token));

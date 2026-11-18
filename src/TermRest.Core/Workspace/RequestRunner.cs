@@ -1,3 +1,4 @@
+using TermRest.Core.Auth;
 using TermRest.Core.Certificates;
 using TermRest.Core.History;
 using TermRest.Core.Http;
@@ -76,6 +77,12 @@ public sealed partial class RequestRunner : IDisposable
 
     /// <summary>While set, every sent request is also recorded into a HAR file (see <see cref="RequestRecorder"/>).</summary>
     public RequestRecorder? Recorder { get; set; }
+
+    /// <summary>The OAuth 2.0 tokens requests fetched, kept (in memory only) for the session.</summary>
+    public OAuth2Tokens OAuth2Tokens { get; } = new();
+
+    /// <summary>How the user signs in for an OAuth 2.0 authorization code; null: such tokens are not fetched.</summary>
+    public IOAuth2Interaction? OAuth2Interaction { get; set; }
 
     /// <summary>Largest response body kept with a history entry.</summary>
     public int HistoryMaxBodyBytes { get; set; } = 256 * 1024;
@@ -208,10 +215,69 @@ public sealed partial class RequestRunner : IDisposable
     private async Task<HttpExchange> SendAsync(PostmanEnvironment? environment, PreparedRequest prepared, CancellationToken cancellationToken)
     {
         // No ConfigureAwait(false): UI callers resume on their own thread, which also records the entry.
+        await AuthorizeAsync(prepared, cancellationToken).ConfigureAwait(true);
         var exchange = await Executor.SendAsync(prepared, cancellationToken).ConfigureAwait(true);
         Record(exchange, environment?.Name);
         Recorder?.Record(exchange, environment?.Name);
         return exchange;
+    }
+
+    /// <summary>
+    /// The OAuth 2.0 token for a prepared request whose auth fetches one (see <see cref="PreparedRequest.OAuth2"/>): the one
+    /// fetched earlier while it is fresh, else one refreshed or fetched now (<paramref name="fetchNew"/>: a new one in any
+    /// case). Throws <see cref="OAuth2Exception"/> when none can be had.
+    /// </summary>
+    public Task<OAuth2Result> GetTokenAsync(PreparedRequest request, bool fetchNew = false, CancellationToken cancellationToken = default) =>
+        OAuth2Tokens.GetAsync(
+            request.OAuth2 ?? throw new ArgumentException("The request fetches no OAuth 2.0 token.", nameof(request)),
+            new OAuth2Context { Executor = Executor, Request = request, Defaults = CreateDefaults(), Interaction = OAuth2Interaction },
+            fetchNew,
+            cancellationToken);
+
+    /// <summary>
+    /// Adds to a prepared request whose auth fetches an OAuth 2.0 token the one fetched earlier, while it is fresh, without
+    /// fetching one (a cURL command sends nothing). False when there is none: a warning says the request lacks it.
+    /// </summary>
+    public bool AddCachedToken(PreparedRequest request)
+    {
+        if (request.OAuth2 is not { } settings || request.OAuth2Token is not null)
+        {
+            return request.OAuth2Token is not null;
+        }
+
+        if (OAuth2Tokens.Peek(settings) is not { } token)
+        {
+            request.Warnings.Add($"OAuth 2.0: no token was fetched yet, so the command has no access token: TermRest fetches one from " +
+                                 $"{OAuth2Tokens.Display(settings.AccessTokenUrl)} when it sends the request.");
+            return false;
+        }
+
+        OAuth2Tokens.Apply(request, new OAuth2Result(token, OAuth2TokenOrigin.Cached, OAuth2Tokens.Display(settings.AccessTokenUrl)));
+        return true;
+    }
+
+    /// <summary>
+    /// Adds the OAuth 2.0 token a prepared request needs, fetching it if it must (see <see cref="GetTokenAsync"/>): one that
+    /// can't be had is an error of the request, which is not sent then. Cancelled, it adds nothing: the request is cancelled.
+    /// </summary>
+    private async Task AuthorizeAsync(PreparedRequest request, CancellationToken cancellationToken)
+    {
+        if (request.OAuth2 is null || request.OAuth2Token is not null || request.Errors.Count > 0)
+        {
+            return;
+        }
+
+        try
+        {
+            OAuth2Tokens.Apply(request, await GetTokenAsync(request, cancellationToken: cancellationToken).ConfigureAwait(true));
+        }
+        catch (OAuth2Exception ex)
+        {
+            request.Errors.Add(ex.Message);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
     }
 
     public Task<HttpExchange> SendAsync(PostmanCollection collection, RequestNode? node, HttpRequestSpec spec, CancellationToken cancellationToken = default) =>

@@ -3137,7 +3137,7 @@ public sealed class MainWindowTests : IDisposable
         ui.Click("POST POST JSON");
         ui.Click("Auth");
         var shown = new List<string>();
-        (string Type, string Field, string Secret)[] fields = [("Bearer Token", "Token", "bearer-s3cret"), ("API Key", "Value", "apikey-s3cret"), ("OAuth 2.0 (access token)", "Access token", "oauth-s3cret")];
+        (string Type, string Field, string Secret)[] fields = [("Bearer Token", "Token", "bearer-s3cret"), ("API Key", "Value", "apikey-s3cret"), ("OAuth 2.0", "Access token", "oauth-s3cret")];
         foreach (var (type, field, secret) in fields)
         {
             ui.Click(type);
@@ -3153,6 +3153,213 @@ public sealed class MainWindowTests : IDisposable
 
         Assert.All(shown, screen => Assert.DoesNotContain("s3cret", screen, StringComparison.Ordinal));
         Assert.Equal(("oauth2", "oauth-s3cret"), (auth?.Type, auth?.Get("accessToken")));
+    }
+
+    /// <summary>OAuth 2.0 auth that fetches its token from <paramref name="server"/> (as a confidential client, unless the secret is set empty).</summary>
+    private static AuthSpec OAuth2(OAuthServer server, string grant, params (string Key, string Value)[] settings)
+    {
+        var auth = new AuthSpec { Type = "oauth2" };
+        foreach (var (key, value) in (ReadOnlySpan<(string, string)>)[("grant_type", grant), ("accessTokenUrl", server.Url("token")), ("clientId", OAuthServer.ClientId),
+                     ("clientSecret", OAuthServer.ClientSecret), .. settings])
+        {
+            auth.Set(key, value);
+        }
+
+        return auth;
+    }
+
+    private static string? SentAuthorization(TermRest.Core.Http.HttpExchange? exchange) =>
+        System.Text.Json.Nodes.JsonNode.Parse(exchange!.Response!.Body)!["authorization"]!.GetValue<string>();
+
+    [Fact]
+    public void Choosing_another_oauth2_grant_shows_the_settings_it_takes()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.Click("POST POST JSON");
+        ui.Click("Auth");
+        ui.Click("OAuth 2.0");
+        var before = ui.Screen();
+        ui.Click("Client credentials"); // opens the list of grants
+        ui.App.InjectKey(Key.CursorDown);
+        ui.App.InjectKey(Key.Enter);
+        ui.App.TimedEvents?.RunTimers(); // the fields are built again once the dropdown's own event is over
+        var after = ui.Screen();
+        var auth = ui.Window.Editor.Spec.Auth;
+        var labels = Descendants(ui.Window.Editor).OfType<Terminal.Gui.Views.Label>().Select(l => l.Text).ToList();
+        var focused = ui.App.Navigation?.GetFocused();
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        OnScreen("⟦ Get new token ⟧", before);
+        OnScreen("Client credentials", before);
+        Assert.Equal(("oauth2", "password_credentials"), (auth?.Type, auth?.Get("grant_type")));
+        OnScreen("Password credentials", after);
+        Assert.Contains("Username", labels);
+        Assert.Contains("Password", labels);
+
+        // The new dropdown has the focus the old one had.
+        Assert.NotNull(focused);
+        Assert.Contains(focused, Descendants(ui.Window.Editor).OfType<Terminal.Gui.Views.DropDownList>().SelectMany(Descendants));
+    }
+
+    [Fact]
+    public void The_oauth2_settings_scroll_with_the_wheel_over_their_fields()
+    {
+        using var ui = new Harness(_directory);
+        var token = ui.App.Begin(ui.Window);
+        ui.Window.Editor.Load(new HttpRequestSpec
+        {
+            Url = "https://api.example.com/me",
+            Auth = new AuthSpec { Type = "oauth2", Params = [new AuthParam { Key = "grant_type", Value = "authorization_code_with_pkce" }] },
+        });
+        ui.Click("Auth");
+        var top = ui.Screen();
+        var field = ui.Find("Header prefix");
+        for (var i = 0; i < 30; i++)
+        {
+            ui.App.InjectMouse(new Terminal.Gui.Input.Mouse { ScreenPosition = field with { X = field.X + 20 }, Flags = Terminal.Gui.Input.MouseFlags.WheeledDown });
+        }
+
+        var bottom = ui.Screen();
+        var auth = ui.Window.Editor.Spec.Auth;
+        ui.App.End(token!);
+
+        OnScreen("⟦ Get new token ⟧", top);
+        Assert.DoesNotContain("Fields may use {{variables}}.", top, StringComparison.Ordinal);
+        Assert.DoesNotContain("⟦ Get new token ⟧", bottom, StringComparison.Ordinal);
+        OnScreen("Fields may use {{variables}}.", bottom);
+        Assert.Equal("authorization_code_with_pkce", auth?.Get("grant_type")); // the wheel over the grant's dropdown changed nothing
+    }
+
+    [Fact]
+    public async Task Get_new_token_fetches_an_oauth2_token_and_forget_token_has_the_request_fetch_another()
+    {
+        await using var server = await OAuthServer.StartAsync();
+        using var ui = new Harness(_directory);
+        string before = "", fetched = "", forgotten = "", status = "";
+        TermRest.Core.Http.HttpExchange? sent = null;
+
+        Drive(ui, () =>
+            {
+                ui.Window.Editor.Load(new HttpRequestSpec { Url = server.Url("echo"), Auth = OAuth2(server, "client_credentials") });
+                ui.Click("Auth");
+                before = ui.Window.Editor.TokenStatus;
+                ui.Click("Get new token");
+            },
+            ("Fetched ", () =>
+            {
+                fetched = ui.Window.Editor.TokenStatus;
+                status = ui.Window.StatusMessage;
+                ui.Click("Forget token");
+                forgotten = ui.Window.Editor.TokenStatus;
+                ui.App.InjectKey(Key.F5);
+            }),
+            ("200 OK", () =>
+            {
+                sent = ui.Window.ResponsePane.Exchange;
+                ui.Window.Editor.MarkClean();
+                ui.App.RequestStop();
+            }));
+
+        Assert.Equal("None yet: fetched when sent.", before);
+        Assert.Matches(@"^Fetched \d\d:\d\d:\d\d, expires in 60 min\.$", fetched);
+        Assert.StartsWith($"✓ New OAuth 2.0 token from {server.Url("token")} (200 in ", status, StringComparison.Ordinal);
+        Assert.Equal("None yet: fetched when sent.", forgotten);
+        Assert.Equal(2, server.AccessTokens.Count);
+        Assert.Equal($"Bearer {server.AccessTokens.Last()}", SentAuthorization(sent));
+        Assert.StartsWith("OAuth 2.0, client credentials: new token from", sent!.Request.AuthDescription, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Signing_in_waits_in_a_dialog_that_closes_by_itself_when_the_browser_returns()
+    {
+        await using var server = await OAuthServer.StartAsync();
+        using var ui = new Harness(_directory);
+        using var browser = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false });
+        var seen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task? returning = null;
+
+        // The user signs in once the dialog is up: the server sends the browser back to TermRest's loopback port.
+        ui.Runner.OAuth2Interaction = new SignInDialog(() => ui.App, _ => { }, url =>
+        {
+            returning = Task.Run(async () =>
+            {
+                await seen.Task;
+                var location = (await browser.GetAsync(url, TestContext.Current.CancellationToken)).Headers.Location;
+                await browser.GetAsync(location, TestContext.Current.CancellationToken);
+            }, TestContext.Current.CancellationToken);
+            return true;
+        });
+        TermRest.Core.Http.HttpExchange? sent = null;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.Editor.Load(new HttpRequestSpec
+                {
+                    Url = server.Url("echo"),
+                    Auth = OAuth2(server, "authorization_code_with_pkce", ("authUrl", server.Url("authorize")), ("clientSecret", "")),
+                });
+                ui.App.InjectKey(Key.F5);
+            },
+            ("Waiting for the browser to return to http://127.0.0.1:", () => seen.SetResult()),
+            ("200 OK", () =>
+            {
+                sent = ui.Window.ResponsePane.Exchange;
+                ui.Window.Editor.MarkClean();
+                ui.App.RequestStop();
+            }));
+
+        await returning!;
+        OnScreen("Sign in to localhost in the browser that opened, or at this address:", screens[0]);
+        Assert.DoesNotContain("Sign in (OAuth 2.0)", screens[1], StringComparison.Ordinal);
+        Assert.Equal($"Bearer {Assert.Single(server.AccessTokens)}", SentAuthorization(sent));
+    }
+
+    [Fact]
+    public async Task The_address_the_browser_ended_on_is_pasted_into_the_sign_in_dialog()
+    {
+        await using var server = await OAuthServer.StartAsync();
+        using var ui = new Harness(_directory);
+        using var browser = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false });
+        string? ended = null;
+        Task? visiting = null;
+
+        // No browser here: the user signs in elsewhere, and copies the address of the callback page it ends on.
+        ui.Runner.OAuth2Interaction = new SignInDialog(() => ui.App, _ => { }, url =>
+        {
+            visiting = Task.Run(async () => Volatile.Write(ref ended, (await browser.GetAsync(url, TestContext.Current.CancellationToken)).Headers.Location!.ToString()),
+                TestContext.Current.CancellationToken);
+            return false;
+        });
+        TermRest.Core.Http.HttpExchange? sent = null;
+
+        var screens = Drive(ui, () =>
+            {
+                ui.Window.Editor.Load(new HttpRequestSpec
+                {
+                    Url = server.Url("echo"),
+                    Auth = OAuth2(server, "authorization_code", ("authUrl", server.Url("authorize")), ("redirect_uri", "https://oauth.pstmn.io/v1/callback")),
+                });
+                ui.App.InjectKey(Key.F5);
+            },
+            ("Paste the address it ends on", () =>
+            {
+                SpinWait.SpinUntil(() => Volatile.Read(ref ended) is not null, TimeSpan.FromSeconds(10));
+                ui.Type(ended!);
+                ui.App.InjectKey(Key.Enter);
+            }),
+            ("200 OK", () =>
+            {
+                sent = ui.Window.ResponsePane.Exchange;
+                ui.Window.Editor.MarkClean();
+                ui.App.RequestStop();
+            }));
+
+        await visiting!;
+        OnScreen("Open this address in a browser and sign in to localhost:", screens[0]);
+        OnScreen("Once you are signed in, the browser goes to https://oauth.pstmn.io/v1/callback.", screens[0]);
+        Assert.Equal($"Bearer {Assert.Single(server.AccessTokens)}", SentAuthorization(sent));
     }
 
     [Fact]

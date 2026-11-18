@@ -275,6 +275,15 @@ public sealed class PreparedRequest
     /// </summary>
     public Model.AuthSpec? AuthUsed { get; set; }
 
+    /// <summary>
+    /// OAuth 2.0 settings the access token is fetched with before the request is sent (see
+    /// <see cref="Workspace.RequestRunner"/>); null when its auth needs no token fetched.
+    /// </summary>
+    public Auth.OAuth2Settings? OAuth2 { get; set; }
+
+    /// <summary>The token added for <see cref="OAuth2"/> (see <see cref="Auth.OAuth2Tokens.Apply"/>); null until it is.</summary>
+    public Auth.OAuth2Result? OAuth2Token { get; set; }
+
     public ClientCertificateSelection? ClientCertificate { get; set; }
 
     /// <summary>

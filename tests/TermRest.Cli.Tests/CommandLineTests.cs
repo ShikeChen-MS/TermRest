@@ -89,6 +89,32 @@ public sealed class CommandLineTests
     }
 
     [Fact]
+    public async Task Send_fetches_an_oauth2_token_first_and_a_curl_command_says_it_has_none()
+    {
+        await using var server = await TestServer.StartAsync();
+        static JsonObject Parameter(string key, string value) => new() { ["key"] = key, ["value"] = value, ["type"] = "string" };
+        var auth = new JsonObject
+        {
+            ["type"] = "oauth2",
+            ["oauth2"] = new JsonArray(Parameter("grant_type", "client_credentials"), Parameter("accessTokenUrl", server.BaseUrl + "/token"),
+                Parameter("clientId", "cli"), Parameter("clientSecret", "{{secret}}")),
+        };
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Me", "GET", server.BaseUrl + "/auth")], auth);
+
+        var sent = await Termrest.RunAsync(["send", collection, "Me", "--var", "secret=cli-s3cret", "--verbose", "--no-history"]);
+        var curl = await Termrest.RunAsync(["send", collection, "Me", "--var", "secret=cli-s3cret", "--curl"]);
+
+        Assert.True(sent.ExitCode == 0, sent.ToString());
+        Assert.Equal($"Bearer {TestServer.Token}", JsonNode.Parse(sent.Text)!["authorization"]!.GetValue<string>());
+        Assert.Contains($"* Auth: OAuth 2.0, client credentials: new token from {server.BaseUrl}/token (200 in ", sent.Error, StringComparison.Ordinal);
+        Assert.True(curl.ExitCode == 0, curl.ToString());
+        Assert.DoesNotContain("Authorization", curl.Text, StringComparison.Ordinal);
+        Assert.Contains($"warning: OAuth 2.0: no token was fetched yet, so the command has no access token: TermRest fetches one from {server.BaseUrl}/token when it sends the request.",
+            curl.Error, StringComparison.Ordinal);
+        Assert.Equal(2, server.Requests); // the token and the request: the cURL command sent nothing
+    }
+
+    [Fact]
     public async Task Run_and_send_fail_when_files_of_the_collection_cannot_be_read()
     {
         await using var server = await TestServer.StartAsync();
