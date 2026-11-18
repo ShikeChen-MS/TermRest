@@ -6,6 +6,8 @@ namespace TermRest.Core.Scripting;
 /// too long for a command line, and no file is written. The worker then reads one JSON message per line, runs the
 /// scripts in it with Postman's <c>pm</c> object in a fresh <c>vm</c> context, and writes one reply line, marked with
 /// <see cref="ReplyMarker"/> so that anything else written to stdout (by programs that scripts start) is ignored.
+/// Requests the scripts send (pm.sendRequest) go out as marked lines too, and their answers come in as lines of input
+/// (see <see cref="ScriptWorker"/>'s RunAsync).
 /// </summary>
 internal static class JavaScriptWorkerCode
 {
@@ -68,7 +70,7 @@ internal static class JavaScriptWorkerCode
 
         async function run(line) {
           const context = vm.createContext({});
-          const state = { onError: null, console: null };
+          const state = { onError: null, console: null, sends: [] };
           active = state;
           try {
             const start = sandboxScript.runInContext(context);
@@ -77,9 +79,17 @@ internal static class JavaScriptWorkerCode
               compile: (name, code) => compile(context, name, code),
               onError: handler => { state.onError = handler; },
               onConsole: target => { state.console = target; },
+              send: request => send(state, request),
             }));
           } finally {
             active = null;
+
+            // Requests still waiting when the scripts end (one failed meanwhile) get no answer: TermRest cancels them.
+            for (const id of state.sends) {
+              const resolve = answers.get(id);
+              answers.delete(id);
+              if (resolve !== undefined) resolve({ error: 'The scripts finished before the request was answered.' });
+            }
           }
         }
 
@@ -105,11 +115,34 @@ internal static class JavaScriptWorkerCode
 
         let queue = Promise.resolve();
         let partial = [];
+        let sendCount = 0;
+        const answers = new Map(); // what waits for TermRest's answer to a request that scripts sent, by its id
 
         // Halves of surrogate pairs (a script's substring of an emoji) are not text: JSON.stringify writes them as escapes
         // (\ud83d), which JSON readers may refuse. They become U+FFFD; whole pairs are written as they are.
+        function marked(text) {
+          return MARKER + text.replace(/\\(\\|ud[89a-f][0-9a-f]{2})/g, (escape, what) => what === '\\' ? escape : '\\ufffd') + '\n';
+        }
+
         function reply(text) {
-          process.stdout.write(MARKER + text.replace(/\\(\\|ud[89a-f][0-9a-f]{2})/g, (escape, what) => what === '\\' ? escape : '\\ufffd') + '\n');
+          process.stdout.write(marked(text));
+        }
+
+        // A request that scripts send goes through TermRest (its certificates, proxy and settings): a line asks for it, and
+        // TermRest answers with a line of input of its own, {"sent": …}, while the scripts run (see receive).
+        function send(state, request) {
+          return new Promise(resolve => {
+            if (active !== state) {
+              resolve({ error: 'The scripts already finished: TermRest sends no more requests for them.' });
+              return;
+            }
+
+            const id = ++sendCount;
+            const line = marked(JSON.stringify({ send: { id, request } }));
+            answers.set(id, resolve);
+            state.sends.push(id);
+            process.stdout.write(line);
+          });
         }
 
         function receive(chunk) {
@@ -119,7 +152,12 @@ internal static class JavaScriptWorkerCode
             chunk = chunk.slice(index + 1);
             const line = partial.join('');
             partial = [];
-            if (line.trim().length > 0) {
+            if (line.startsWith('{"sent":')) {
+              const answer = JSON.parse(line).sent;
+              const resolve = answers.get(answer.id);
+              answers.delete(answer.id);
+              if (resolve !== undefined) resolve(answer);
+            } else if (line.trim().length > 0) {
               queue = queue.then(() => run(line)).then(reply, error => reply(JSON.stringify({ fatal: error && error.stack ? String(error.stack) : String(error) })));
             }
           }
@@ -743,7 +781,7 @@ internal static class JavaScriptWorkerCode
             return result;
           }
 
-          // ----- pm.sendRequest: the runtime's own fetch ---------------------------------------------------
+          // ----- pm.sendRequest: sent by TermRest, with its certificates, proxy and settings ---------------------
 
           const list = value => Array.isArray(value) ? value : value !== null && typeof value === 'object' && Array.isArray(value.members) ? value.members : [];
 
@@ -767,43 +805,32 @@ internal static class JavaScriptWorkerCode
             return pairs;
           }
 
+          // As Postman's pm.sendRequest takes it (a URL, or { url, method, header, body, auth }); TermRest reads the rest. Its
+          // {{variables}} are sent as written, as in Postman: pm.variables.replaceIn replaces them.
           async function send(options) {
             if (typeof options === 'string' || options instanceof Url) options = { url: String(options) };
             options = options || {};
-            const target = options.url !== null && typeof options.url === 'object' && !(options.url instanceof Url) && options.url.raw !== undefined
-              ? String(options.url.raw)
-              : String(options.url);
-            const method = String(options.method || 'GET').toUpperCase();
-            const headers = headerPairs(options.header !== undefined ? options.header : options.headers);
-            const hasHeader = name => headers.some(([key]) => key.toLowerCase() === name);
-            let body;
-            const data = options.body;
-            if (typeof data === 'string') {
-              body = data;
-            } else if (data !== null && data !== undefined && typeof data === 'object') {
-              const mode = data.mode || (data.raw !== undefined ? 'raw' : undefined);
-              if (mode === 'raw') {
-                body = typeof data.raw === 'string' ? data.raw : stringify(data.raw);
-              } else if (mode === 'urlencoded') {
-                body = list(data.urlencoded).filter(item => item && !item.disabled)
-                  .map(item => encodeURIComponent(item.key) + '=' + encodeURIComponent(item.value === undefined || item.value === null ? '' : item.value)).join('&');
-                if (!hasHeader('content-type')) headers.push(['Content-Type', 'application/x-www-form-urlencoded']);
-              } else if (mode === 'formdata') {
-                body = new host.FormData();
-                for (const item of list(data.formdata)) if (item && !item.disabled) body.append(String(item.key), item.value === undefined || item.value === null ? '' : String(item.value));
-              } else if (mode === 'graphql') {
-                body = stringify(data.graphql || {});
-                if (!hasHeader('content-type')) headers.push(['Content-Type', 'application/json']);
+            const url = options.url instanceof Url ? String(options.url) : options.url;
+            let body = options.body;
+            if (body !== null && typeof body === 'object' && !Array.isArray(body)) {
+              body = Object.assign({}, body);
+              for (const key of ['urlencoded', 'formdata']) {
+                const fields = body[key];
+                if (fields !== null && typeof fields === 'object' && !Array.isArray(fields) && Array.isArray(fields.members)) body[key] = fields.members;
               }
             }
 
-            const started = Date.now();
-            const answer = await host.fetch(target, { method, headers, body: method === 'GET' || method === 'HEAD' ? undefined : body, redirect: 'follow' });
-            const bytes = host.Buffer.from(await answer.arrayBuffer());
-            const pairs = [];
-            answer.headers.forEach((value, key) => { if (key !== 'set-cookie') pairs.push([key, value]); });
-            for (const cookie of typeof answer.headers.getSetCookie === 'function' ? answer.headers.getSetCookie() : []) pairs.push(['set-cookie', cookie]);
-            return makeResponse({ status: answer.status, reason: answer.statusText, headers: pairs, time: Date.now() - started, size: bytes.length, base64: bytes.toString('base64') });
+            const request = {
+              url: url !== null && typeof url === 'object' ? url : url === undefined || url === null ? '' : String(url),
+              method: options.method === undefined || options.method === null ? 'GET' : String(options.method),
+              header: headerPairs(options.header !== undefined ? options.header : options.headers).map(([key, value]) => ({ key, value })),
+              body,
+              auth: options.auth,
+            };
+            const answer = await host.send(request);
+            if (answer.log) log(answer.log);
+            if (answer.error !== undefined) throw new Error(answer.error);
+            return makeResponse(answer.response);
           }
 
           function sendRequest(options, callback) {
@@ -1417,8 +1444,8 @@ internal static class JavaScriptWorkerCode
           const pm = {
             info: {
               eventName: phase === 'prerequest' ? 'prerequest' : 'test',
-              iteration: 0,
-              iterationCount: 1,
+              iteration: typeof info.iteration === 'number' ? info.iteration : 0,
+              iterationCount: typeof info.iteration_count === 'number' ? info.iteration_count : 1,
               requestName: info.request_name === null ? undefined : info.request_name,
               requestId: host.uuid(),
             },
@@ -1532,8 +1559,8 @@ internal static class JavaScriptWorkerCode
             xml2Json,
             environment: pm.environment.toObject(),
             globals: pm.globals.toObject(),
-            data: {},
-            iteration: 0,
+            data: pm.iterationData.toObject(),
+            iteration: pm.info.iteration,
             request: { url: String(pm.request.url), method: pm.request.method, headers: pm.request.headers.toObject(true, true), data: pm.request.body.raw, name: pm.info.requestName },
           });
 

@@ -133,16 +133,28 @@ public sealed class HttpExecutor
             }
 
             headersAt = clock.Elapsed;
-            var (body, truncated, received, warning) = await ReadBodyAsync(response, request.MaxResponseBytes, linked.Token).ConfigureAwait(false);
-            exchange.Response = Snapshot(response, body, truncated, received);
-            if (warning is not null)
+            if (response.StatusCode == HttpStatusCode.ProxyAuthenticationRequired)
             {
-                request.Warnings.Add(warning);
+                request.Warnings.Add(ProxySignInHint);
             }
 
-            if (truncated)
+            if (Streams(response))
             {
-                request.Warnings.Add($"The response body was truncated at {HttpExchange.FormatSize(request.MaxResponseBytes)}.");
+                await ReadStreamAsync(exchange, response, timeoutSource, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                var (body, truncated, received, warning) = await ReadBodyAsync(response, request.MaxResponseBytes, linked.Token).ConfigureAwait(false);
+                exchange.Response = Snapshot(response, body, truncated, received);
+                if (warning is not null)
+                {
+                    request.Warnings.Add(warning);
+                }
+
+                if (truncated)
+                {
+                    request.Warnings.Add($"The response body was truncated at {HttpExchange.FormatSize(request.MaxResponseBytes)}.");
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -216,13 +228,27 @@ public sealed class HttpExecutor
             case null or "" or "system":
                 handler.UseProxy = true;
                 capture.Proxy = HttpClient.DefaultProxy; // the one the handler uses
+
+                // Its sign-in: the user name and password given for it, else the user's own, which .NET sends only to an NTLM or
+                // Negotiate (Kerberos) challenge, never to a Basic or Digest one. A proxy HTTPS_PROXY names with a user and
+                // password signs in with those, unless others were given for it: .NET would prefer the URL's.
+                handler.DefaultProxyCredentials = request.ProxyCredential ?? CredentialCache.DefaultCredentials;
+                if (request.ProxyCredential is { } signIn && capture.Proxy.Credentials is not null)
+                {
+                    handler.Proxy = capture.Proxy = new SignedInProxy(capture.Proxy, signIn);
+                }
+
                 break;
             case "none":
                 handler.UseProxy = false;
                 break;
             default:
                 handler.UseProxy = true;
-                handler.Proxy = capture.Proxy = new WebProxy(request.Proxy!.Trim());
+                var proxy = request.Proxy!.Trim();
+                handler.Proxy = capture.Proxy = new WebProxy(proxy)
+                {
+                    Credentials = request.ProxyCredential ?? CredentialsInUrl(proxy) ?? CredentialCache.DefaultCredentials,
+                };
                 break;
         }
 
@@ -263,6 +289,27 @@ public sealed class HttpExecutor
         handler.SslOptions = options;
         return handler;
     }
+
+    /// <summary>
+    /// The user name and password in a proxy's URL (<c>http://user:password@host:port</c>), as curl and <c>HTTPS_PROXY</c>
+    /// take them: percent-escapes decoded, a user name with a domain (<c>CONTOSO%5Cada</c>) for NTLM. Null without one.
+    /// </summary>
+    internal static NetworkCredential? CredentialsInUrl(string proxy)
+    {
+        if (!Uri.TryCreate(proxy, UriKind.Absolute, out var uri) || uri.UserInfo.Length == 0)
+        {
+            return null;
+        }
+
+        var colon = uri.UserInfo.IndexOf(':', StringComparison.Ordinal);
+        var user = Uri.UnescapeDataString(colon < 0 ? uri.UserInfo : uri.UserInfo[..colon]);
+        return Workspace.ProxyCredentialStore.Credential(user, colon < 0 ? "" : Uri.UnescapeDataString(uri.UserInfo[(colon + 1)..]));
+    }
+
+    /// <summary>What a 407 from the proxy means, and how to give it a user name and password.</summary>
+    internal const string ProxySignInHint =
+        "The proxy asks for a user name and password (407 Proxy Authentication Required), or did not accept those it got: give them in " +
+        "Tools › Settings (Proxy sign-in), with --proxy-user, or in the proxy's URL (http://user:password@host:port).";
 
     /// <summary>
     /// SChannel sends the chain it builds from the certificate stores. Creating a context adds the chain's CA certificates
@@ -519,6 +566,214 @@ public sealed class HttpExecutor
         return (body, cut, received.Length, null);
     }
 
+    /// <summary>Whether the response's body streams (see <see cref="ResponseStreams"/>); HEAD, 204 and 304 responses have none.</summary>
+    private static bool Streams(HttpResponseMessage response) =>
+        response.RequestMessage?.Method != HttpMethod.Head && response.StatusCode is not (HttpStatusCode.NoContent or HttpStatusCode.NotModified)
+        && ResponseStreams.Streams(response.Content.Headers.ContentType?.MediaType ?? RawContentType(response.Content.Headers));
+
+    /// <summary>
+    /// Reads a body that streams as it arrives, part by part, removing its content codings on the way, and gives each part
+    /// to the request's watcher. The watcher's stop and the request timeout end it, keeping what arrived, and so does a
+    /// connection that ends before the stream does; at most the maximum response size is kept (decoded). Cancelling the
+    /// request discards it, as it does any response.
+    /// </summary>
+    private static async Task ReadStreamAsync(HttpExchange exchange, HttpResponseMessage response, CancellationTokenSource? timeout,
+        CancellationToken cancellationToken)
+    {
+        var request = exchange.Request;
+        var watcher = request.StreamWatcher;
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(watcher?.Stopping ?? CancellationToken.None, timeout?.Token ?? CancellationToken.None);
+        using var reading = CancellationTokenSource.CreateLinkedTokenSource(stop.Token, cancellationToken);
+        var codings = ContentCodings(response.Content.Headers);
+        string? warning = null;
+        if (codings.Find(c => c is not ("gzip" or "x-gzip" or "deflate" or "br")) is { } unknown)
+        {
+            warning = $"The body is kept as received: TermRest cannot decode Content-Encoding '{unknown}'.";
+            codings.Clear();
+        }
+
+        using var body = new MemoryStream();
+        var chunk = ArrayPool<byte>.Shared.Rent(16 * 1024);
+        var (truncated, stopped) = (false, false);
+        ReadThrough? wire = null;
+        Stream? source = null;
+        watcher?.Started(Snapshot(response, [], truncated: false, received: 0));
+        try
+        {
+            wire = new ReadThrough(await response.Content.ReadAsStreamAsync(reading.Token).ConfigureAwait(false));
+            source = await DecodingAsync(wire, codings, reading.Token).ConfigureAwait(false);
+            int read;
+            while ((read = await source.ReadAsync(chunk.AsMemory(), reading.Token).ConfigureAwait(false)) > 0)
+            {
+                var count = (int)Math.Clamp(request.MaxResponseBytes - body.Length, 0, read);
+                body.Write(chunk, 0, count);
+                watcher?.Received(chunk.AsSpan(0, count));
+                if (count < read)
+                {
+                    (truncated, stopped) = (true, true);
+                    warning ??= $"The stream was stopped at the maximum response size, {HttpExchange.FormatSize(request.MaxResponseBytes)}: its body is what arrived until then.";
+                    break;
+                }
+            }
+        }
+        catch (Exception ex) when ((ex is OperationCanceledException or IOException or HttpRequestException) && stop.IsCancellationRequested
+                                   && !cancellationToken.IsCancellationRequested)
+        {
+            stopped = true;
+            warning ??= watcher?.Stopping.IsCancellationRequested != true && timeout?.IsCancellationRequested == true
+                ? $"The stream was stopped at the request timeout ({HttpExchange.Format(request.Timeout)}): its body is what arrived until then."
+                : "The stream was stopped: its body is what arrived until then.";
+        }
+        catch (Exception ex) when ((ex is IOException or HttpRequestException or InvalidDataException) && !cancellationToken.IsCancellationRequested)
+        {
+            stopped = true;
+            warning ??= ex is InvalidDataException
+                ? $"The rest of the stream could not be decoded (Content-Encoding: {string.Join(", ", codings)}): its body is what was decoded until then."
+                : $"The connection ended before the stream did ({ex.Message}): its body is what arrived until then.";
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(chunk);
+            if (source is not null)
+            {
+                await source.DisposeAsync().ConfigureAwait(false);
+            }
+            else if (wire is not null)
+            {
+                await wire.DisposeAsync().ConfigureAwait(false);
+            }
+
+            watcher?.Ended();
+        }
+
+        exchange.Response = Snapshot(response, ToArray(body), truncated, wire?.Count ?? 0, stopped);
+        if (warning is not null)
+        {
+            request.Warnings.Add(warning);
+        }
+    }
+
+    /// <summary>
+    /// A streamed body with its content codings removed as it is read, the last one applied first. Deflate is zlib data, as
+    /// the standard has it, or raw deflate data, as some servers send: its first byte tells, as for a whole body (see
+    /// <see cref="CreateDecoder"/>).
+    /// </summary>
+    private static async Task<Stream> DecodingAsync(Stream source, List<string> codings, CancellationToken cancellationToken)
+    {
+        try
+        {
+            for (var i = codings.Count - 1; i >= 0; i--)
+            {
+                if (codings[i] == "deflate")
+                {
+                    var first = new byte[1];
+                    var read = await source.ReadAsync(first, cancellationToken).ConfigureAwait(false);
+                    source = new ReadThrough(source, first.AsMemory(0, read));
+                    source = read == 1 && (first[0] & 0x0F) != 8 ? new DeflateStream(source, CompressionMode.Decompress) : new ZLibStream(source, CompressionMode.Decompress);
+                }
+                else
+                {
+                    source = codings[i] == "br" ? new BrotliStream(source, CompressionMode.Decompress) : new GZipStream(source, CompressionMode.Decompress);
+                }
+            }
+
+            return source;
+        }
+        catch
+        {
+            await source.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Reads <paramref name="inner"/>, after <paramref name="prefix"/> (bytes read from it already, to look at them), and counts
+    /// what it reads from it: the size of a streamed body as received, before its content codings are removed.
+    /// </summary>
+    private sealed class ReadThrough(Stream inner, ReadOnlyMemory<byte> prefix = default) : Stream
+    {
+        private ReadOnlyMemory<byte> _prefix = prefix;
+
+        public long Count { get; private set; }
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+
+        public override int Read(Span<byte> buffer) => _prefix.IsEmpty ? Counted(inner.Read(buffer)) : Replay(buffer);
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            _prefix.IsEmpty ? Counted(await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) : Replay(buffer.Span);
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override void Flush()
+        {
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask DisposeAsync()
+        {
+            await inner.DisposeAsync().ConfigureAwait(false);
+            await base.DisposeAsync().ConfigureAwait(false);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+
+        private int Counted(int read)
+        {
+            Count += read;
+            return read;
+        }
+
+        private int Replay(Span<byte> buffer)
+        {
+            var count = Math.Min(buffer.Length, _prefix.Length);
+            _prefix.Span[..count].CopyTo(buffer);
+            _prefix = _prefix[count..];
+            return count;
+        }
+    }
+
+    /// <summary>
+    /// The system's proxy (<see cref="HttpClient.DefaultProxy"/>) with the user name and password given for it: .NET signs in
+    /// with a proxy's own credentials (those of a user and password in <c>HTTPS_PROXY</c>) before the handler's.
+    /// </summary>
+    private sealed class SignedInProxy(IWebProxy proxy, ICredentials credentials) : IWebProxy
+    {
+        public ICredentials? Credentials { get; set; } = credentials;
+
+        public Uri? GetProxy(Uri destination) => proxy.GetProxy(destination);
+
+        public bool IsBypassed(Uri host) => proxy.IsBypassed(host);
+    }
+
     /// <summary>A body's content codings in the order they were applied, leaving out identity (and "none", which some servers send).</summary>
     private static List<string> ContentCodings(HttpContentHeaders headers)
     {
@@ -594,7 +849,7 @@ public sealed class HttpExecutor
     /// <summary>The buffer itself when the content fills it exactly, otherwise a copy of the content.</summary>
     private static byte[] ToArray(MemoryStream buffer) => buffer.Length == buffer.Capacity ? buffer.GetBuffer() : buffer.ToArray();
 
-    private static ResponseSnapshot Snapshot(HttpResponseMessage response, byte[] body, bool truncated, long received)
+    private static ResponseSnapshot Snapshot(HttpResponseMessage response, byte[] body, bool truncated, long received, bool stopped = false)
     {
         var headers = new List<KeyValuePair<string, string>>();
         void AddAll(HttpHeaders source)
@@ -620,6 +875,7 @@ public sealed class HttpExecutor
             Body = body,
             ReceivedBodySize = received,
             BodyTruncated = truncated,
+            Stopped = stopped,
             // .NET reads no type from a Content-Type it can't parse (a trailing ";", an empty charset …), which servers send:
             // the header as the server sent it then, as Postman reads it (the charset and media type are read leniently).
             ContentType = response.Content.Headers.ContentType?.ToString() ?? RawContentType(response.Content.Headers),
@@ -670,6 +926,18 @@ public sealed class HttpExecutor
         }
 
         summary = MaskUrlPasswords(summary);
+
+        // A tunnel (https through the proxy) that the proxy refused with 407: what it wants.
+        for (var e = ex; e is not null; e = e.InnerException)
+        {
+            if (e is HttpRequestException { StatusCode: HttpStatusCode.ProxyAuthenticationRequired }
+                || (e is HttpRequestException { HttpRequestError: HttpRequestError.ProxyTunnelError } && e.Message.Contains("'407'", StringComparison.Ordinal)))
+            {
+                summary += $". {ProxySignInHint}";
+                break;
+            }
+        }
+
         return ex is HttpRequestException { HttpRequestError: not HttpRequestError.Unknown } hre ? $"{hre.HttpRequestError}: {summary}" : summary;
     }
 

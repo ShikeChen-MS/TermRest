@@ -13,6 +13,18 @@ internal interface ICollectionStorage
 
     /// <param name="overwriteChanged">Also write files that changed on disk since they were read (see <see cref="FileChangedException"/>).</param>
     void Save(PostmanCollection collection, bool overwriteChanged);
+
+    /// <summary>
+    /// Whether a request has saved examples that are not loaded yet (into its <c>response</c> array: see
+    /// <see cref="LoadExamples"/>). Answered without reading files.
+    /// </summary>
+    bool HasUnloadedExamples(JsonObject item);
+
+    /// <summary>
+    /// Loads a request's saved examples into its <c>response</c> array, once (a v3 collection keeps them in files of their
+    /// own, read only when needed). Returns problems with files that could not be read (they are left alone).
+    /// </summary>
+    IReadOnlyList<string> LoadExamples(JsonObject item);
 }
 
 /// <summary>
@@ -29,11 +41,14 @@ internal sealed class V3CollectionStorage : ICollectionStorage
 
     private static readonly TextFileInfo NewFile = new(false, true, false);
 
-    /// <summary>The keys of an example file, in Postman's order.</summary>
-    private static readonly string[] ExampleOrder = ["$kind", "name", "request", "response", "order"];
-
     private readonly Dictionary<JsonObject, Origin> _origins = new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<JsonObject, List<JsonObject>> _loadedChildren = new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>
+    /// The saved examples of the requests whose examples are loaded (see <see cref="LoadExamples"/>), by request: what each
+    /// example was read from or last written to. The examples of other requests stay on disk, untouched.
+    /// </summary>
+    private readonly Dictionary<JsonObject, Dictionary<JsonObject, ExampleOrigin>> _examples = new(ReferenceEqualityComparer.Instance);
     private YamlStyle _style = YamlStyle.Default;
 
     /// <summary>On Unix, the permissions of the files a conversion creates (see <see cref="ConvertFrom"/>); null: the default.</summary>
@@ -86,6 +101,101 @@ internal sealed class V3CollectionStorage : ICollectionStorage
 
         /// <summary>For requests: the file name (without suffix) <see cref="V3"/> was read or written under; its <c>examples</c> path refers to it.</summary>
         public string? Stem { get; set; }
+    }
+
+    /// <summary>What was read from (or last written to) disk for one saved example of a request.</summary>
+    private sealed class ExampleOrigin
+    {
+        public required string Path { get; set; }
+
+        /// <summary>The file as last read or written.</summary>
+        public required YamlFile File { get; set; }
+
+        public FileStamp? Stamp { get; set; }
+
+        public TextFileInfo FileInfo { get; set; } = NewFile;
+
+        /// <summary>The v3 content as last read or written.</summary>
+        public required JsonObject V3 { get; set; }
+
+        /// <summary>The v2.1 example (as in the request's <c>response</c> array) as last read or written.</summary>
+        public required JsonObject Baseline { get; set; }
+    }
+
+    // ----- examples ----------------------------------------------------------------------------------
+
+    public bool HasUnloadedExamples(JsonObject item) =>
+        !_examples.ContainsKey(item) && _origins.TryGetValue(item, out var origin) && origin.V3?["examples"].GetString() is { Length: > 0 };
+
+    public IReadOnlyList<string> LoadExamples(JsonObject item)
+    {
+        if (IsFolder(item) || _examples.ContainsKey(item))
+        {
+            return [];
+        }
+
+        var loaded = new Dictionary<JsonObject, ExampleOrigin>(ReferenceEqualityComparer.Instance);
+        _examples[item] = loaded;
+
+        // A request not saved yet has its examples in memory only.
+        if (!_origins.TryGetValue(item, out var origin) || origin.V3?["examples"].GetString() is not { Length: > 0 })
+        {
+            return [];
+        }
+
+        var folder = ExamplesFolder(origin.Path, origin.V3);
+        if (!System.IO.Directory.Exists(folder))
+        {
+            return [];
+        }
+
+        var warnings = new List<string>();
+        var examples = new List<(double? Order, string Name, JsonObject Example)>();
+        foreach (var file in System.IO.Directory.EnumerateFiles(folder).Where(f => f.EndsWith(V3Names.ExampleSuffix, StringComparison.OrdinalIgnoreCase)))
+        {
+            // One that cannot be read, or is not an example, is left alone (and out).
+            var (yaml, info, stamp, _) = Read(file, warnings, []);
+            if (yaml is null || (yaml.Json["$kind"].GetString() is { } kind && kind != V3Convert.HttpExampleKind))
+            {
+                continue;
+            }
+
+            var name = yaml.Json["name"].GetString() is { Length: > 0 } given ? given : Path.GetFileName(file)[..^V3Names.ExampleSuffix.Length];
+            var example = V3Convert.ExampleToV21(yaml.Json, name);
+            loaded[example] = new ExampleOrigin { Path = file, File = yaml, Stamp = stamp, FileInfo = info, V3 = yaml.Json, Baseline = (JsonObject)example.DeepClone() };
+            examples.Add((OrderValue(yaml.Json["order"]), name, example));
+        }
+
+        if (item["response"] is not JsonArray responses)
+        {
+            responses = [];
+            item.SetOrdered("response", responses, PostmanRequestMapper.ItemOrder);
+        }
+
+        foreach (var (_, _, example) in examples.OrderBy(e => e.Order ?? double.MaxValue).ThenBy(e => e.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            responses.Add((JsonNode)example);
+        }
+
+        return warnings;
+    }
+
+    /// <summary>
+    /// The folder of a request's example files: the one its <c>examples</c> reference names (relative to the request's
+    /// folder) while that is inside the collection, else where Postman puts them.
+    /// </summary>
+    private string ExamplesFolder(string requestFile, JsonObject? v3)
+    {
+        if (v3?["examples"].GetString() is { Length: > 0 } reference)
+        {
+            var folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.Combine(Path.GetDirectoryName(requestFile)!, reference)));
+            if (folder.StartsWith(Directory + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            {
+                return folder;
+            }
+        }
+
+        return Path.Combine(V3Names.ResourcesPath(requestFile), "examples");
     }
 
     // ----- loading ---------------------------------------------------------------------------------
@@ -257,41 +367,171 @@ internal sealed class V3CollectionStorage : ICollectionStorage
     }
 
     /// <summary>
-    /// Writes the saved responses (v2.1 <c>response</c>) of a request that is new to the folder as v3 example files next to
-    /// <paramref name="requestFile"/>; returns the request's <c>examples</c> reference to them, or null when it has none.
+    /// Whether saving writes or deletes example files of a request: its examples were loaded, and some are new, edited,
+    /// renamed or deleted (see <see cref="SaveExamples"/>). The snapshot that tells whether a request changed leaves them out.
     /// </summary>
-    private string? WriteExamples(JsonObject item, string requestFile)
+    private bool ExamplesChange(JsonObject item)
     {
-        if (item["response"] is not JsonArray { Count: > 0 } responses)
+        if (IsFolder(item) || !_examples.TryGetValue(item, out var loaded))
         {
-            return null;
+            return false;
         }
 
-        var folder = Path.Combine(V3Names.ResourcesPath(requestFile), "examples");
-        CreateFolder(folder);
-        var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var order = 0;
-        foreach (var response in responses.OfType<JsonObject>())
-        {
-            var responseName = response["name"].GetString() is { Length: > 0 } given ? given : "Example";
-            var name = V3Names.Unique(V3Names.Safe(responseName), taken);
-            taken.Add(name);
-            var example = V3Convert.ExampleToV3(response);
+        var examples = (item["response"] as JsonArray ?? []).OfType<JsonObject>().ToList();
+        return examples.Count != loaded.Count || examples.Any(e => !loaded.TryGetValue(e, out var origin) || !JsonNode.DeepEquals(e, origin.Baseline));
+    }
 
-            // A name its file can't have (cut, made safe or unique) is kept in the file, as Postman keeps it.
-            if (name != responseName)
+    /// <summary>
+    /// Writes a request's saved examples where they changed: new ones as new files named for them (a name a file can't have
+    /// is kept in it, as Postman keeps it), edited ones in place (only the edited entries), renamed ones under their new
+    /// name, and deleted ones removed. The examples of a request that were never loaded are as they were: nothing to write.
+    /// Files another program changed since they were read are left alone unless that is allowed. Returns the request's
+    /// <c>examples</c> reference when it has example files and lacks one.
+    /// </summary>
+    private string? SaveExamples(JsonObject item, string requestFile, bool isNew, JsonObject v3, LeftAlone leftAlone)
+    {
+        if (!_examples.TryGetValue(item, out var loaded))
+        {
+            if (!isNew)
             {
-                example.SetOrdered("name", responseName, ExampleOrder);
+                return null;
             }
 
-            order += 1000;
-            example["order"] = order;
-            var path = Path.Combine(folder, name + ".example.yaml");
-            var (text, info) = YamlFile.WriteChecked(null, example, Style, path, NewFile, out _);
-            TextFile.WriteAtomic(path, text, info, _newFileMode);
+            loaded = new Dictionary<JsonObject, ExampleOrigin>(ReferenceEqualityComparer.Instance);
+            _examples[item] = loaded;
         }
 
-        return order == 0 ? null : $"./{V3Names.ResourcesDirectory}/{V3Names.RequestStem(requestFile)}.resources/examples";
+        var examples = (item["response"] as JsonArray ?? []).OfType<JsonObject>().ToList();
+        var folder = ExamplesFolder(requestFile, v3);
+
+        // Moved along with the request's resources folder (the request was renamed or moved).
+        foreach (var origin in loaded.Values.Where(o => Path.GetDirectoryName(o.Path) != folder))
+        {
+            origin.Path = Path.Combine(folder, Path.GetFileName(origin.Path));
+        }
+
+        var current = new HashSet<JsonObject>(examples, ReferenceEqualityComparer.Instance);
+        foreach (var (json, origin) in loaded.Where(e => !current.Contains(e.Key)).ToList())
+        {
+            if (File.Exists(origin.Path))
+            {
+                if (origin.Stamp?.HasChanged(origin.Path) == true && !leftAlone.OverwriteChanged)
+                {
+                    leftAlone.Changed.Add(origin.Path);
+                    continue;
+                }
+
+                File.Delete(origin.Path);
+            }
+
+            loaded.Remove(json);
+        }
+
+        // Names in use, also by files TermRest does not show (one it could not read).
+        var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (System.IO.Directory.Exists(folder))
+        {
+            foreach (var file in System.IO.Directory.EnumerateFiles(folder).Where(f => f.EndsWith(V3Names.ExampleSuffix, StringComparison.OrdinalIgnoreCase)))
+            {
+                taken.Add(Path.GetFileName(file)[..^V3Names.ExampleSuffix.Length]);
+            }
+        }
+
+        var order = loaded.Values.Select(o => OrderValue(o.V3["order"])).Max() ?? 0;
+        double? previous = null; // the order of the example before, as the request shows them
+        for (var index = 0; index < examples.Count; index++)
+        {
+            var json = examples[index];
+            var name = json["name"].GetString() is { Length: > 0 } given ? given : "Example";
+            if (loaded.TryGetValue(json, out var origin))
+            {
+                previous = OrderValue(origin.V3["order"]) ?? previous;
+                if (JsonNode.DeepEquals(json, origin.Baseline))
+                {
+                    continue;
+                }
+
+                if (File.Exists(origin.Path) && origin.Stamp?.HasChanged(origin.Path) == true && !leftAlone.OverwriteChanged)
+                {
+                    leftAlone.Changed.Add(origin.Path);
+                    continue;
+                }
+
+                var stem = Path.GetFileName(origin.Path)[..^V3Names.ExampleSuffix.Length];
+                var edited = V3Convert.ExampleToV3(json, origin.V3);
+                if (origin.Baseline["name"].GetString() != json["name"].GetString())
+                {
+                    taken.Remove(stem);
+                    stem = V3Names.Unique(V3Names.Safe(name), taken);
+                    NameExample(edited, name, stem);
+                }
+
+                taken.Add(stem);
+                var path = Path.Combine(folder, stem + V3Names.ExampleSuffix);
+                if (path != origin.Path && File.Exists(origin.Path))
+                {
+                    File.Move(origin.Path, path); // a new name, also one that differs in case only
+                    origin.Path = path; // where it is now, should writing it fail: the next save finds it there
+                }
+
+                CreateFolder(folder);
+                var (text, info) = YamlFile.WriteChecked(origin.File, edited, Style, path, origin.FileInfo, out var written);
+                TextFile.WriteAtomic(path, text, info, out var stamp, _newFileMode);
+                origin.Path = path;
+                origin.File = written;
+                origin.Stamp = stamp;
+                origin.FileInfo = info;
+                origin.V3 = edited;
+                origin.Baseline = (JsonObject)json.DeepClone();
+            }
+            else
+            {
+                var stem = V3Names.Unique(V3Names.Safe(name), taken);
+                taken.Add(stem);
+                var created = V3Convert.ExampleToV3(json);
+                NameExample(created, name, stem);
+
+                // Where the request shows it (a copy right after its original): between its neighbors, after the last in steps of 1000.
+                var next = examples.Skip(index + 1).Select(e => loaded.TryGetValue(e, out var o) ? OrderValue(o.V3["order"]) : null).FirstOrDefault(v => v is not null);
+                double value;
+                if (next is { } high && (previous is null || high > previous))
+                {
+                    value = previous is { } low ? low + ((high - low) / 2) : high - 1000;
+                    if (previous is { } below && high - below >= 2)
+                    {
+                        value = Math.Floor(value);
+                    }
+                }
+                else
+                {
+                    order = (Math.Floor(order / 1000) + 1) * 1000;
+                    value = order;
+                }
+
+                previous = value;
+                created["order"] = value == Math.Floor(value) && Math.Abs(value) < 1e15 ? JsonValue.Create((long)value) : JsonValue.Create(value);
+                CreateFolder(folder);
+                var path = Path.Combine(folder, stem + V3Names.ExampleSuffix);
+                var (text, info) = YamlFile.WriteChecked(null, created, Style, path, NewFile, out var written);
+                TextFile.WriteAtomic(path, text, info, out var stamp, _newFileMode);
+                loaded[json] = new ExampleOrigin { Path = path, File = written, Stamp = stamp, FileInfo = info, V3 = created, Baseline = (JsonObject)json.DeepClone() };
+            }
+        }
+
+        return loaded.Count > 0 && v3["examples"] is null ? $"./{V3Names.ResourcesDirectory}/{V3Names.RequestStem(requestFile)}.resources/examples" : null;
+
+        // A name its file can't have (cut, made safe or unique) is kept in the file, as Postman keeps it.
+        static void NameExample(JsonObject example, string name, string stem)
+        {
+            if (stem != name)
+            {
+                example.SetOrdered("name", name, V3Convert.ExampleFileOrder);
+            }
+            else
+            {
+                example.Remove("name");
+            }
+        }
     }
 
     private (YamlFile? File, TextFileInfo Info, FileStamp? Stamp, string? Error) Read(string path, List<string> warnings, List<YamlTree> trees)
@@ -439,8 +679,9 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             }
         }
 
-        // Whether this save writes the item or puts it in place: it is new, moved, reordered or edited. A folder without an order
-        // gets one whenever its siblings change: while it is gone (see below), that alone is no change (see step 4).
+        // Whether this save writes the item or puts it in place: it is new, moved, reordered or edited, or its examples are. A
+        // folder without an order gets one whenever its siblings change: while it is gone (see below), that alone is no change
+        // (see step 4).
         var changes = new Dictionary<JsonObject, bool>(ReferenceEqualityComparer.Instance);
         bool Changes(JsonObject item)
         {
@@ -448,6 +689,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             {
                 changed = !pinned.Contains(item)
                           && (!_origins.TryGetValue(item, out var origin) || Moved(item) || !JsonNode.DeepEquals(Snapshot(item), origin.Baseline)
+                              || ExamplesChange(item)
                               || (orders.ContainsKey(item) && (!IsFolder(item) || OrderValue(origin.Order) is not null || System.IO.Directory.Exists(current[item]))));
                 changes[item] = changed;
             }
@@ -585,6 +827,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
 
             _origins.Remove(item);
             _loadedChildren.Remove(item);
+            _examples.Remove(item);
         }
 
         foreach (var (item, origin) in _origins)
@@ -711,6 +954,7 @@ internal sealed class V3CollectionStorage : ICollectionStorage
         var isFolder = IsFolder(item);
         var file = isFolder ? V3Names.DefinitionPath(path) : path;
         var snapshot = Snapshot(item);
+        var examplesChange = ExamplesChange(item); // before they are written
         JsonObject v3;
         if (origin is not null && JsonNode.DeepEquals(snapshot, origin.Baseline))
         {
@@ -750,16 +994,18 @@ internal sealed class V3CollectionStorage : ICollectionStorage
             }
         }
 
-        if (!isFolder && origin is null && WriteExamples(item, path) is { } examplesFolder)
+        if (!isFolder && SaveExamples(item, path, origin is null, v3, leftAlone) is { } examplesFolder)
         {
             v3.SetOrdered("examples", examplesFolder, order);
         }
 
         // Folders get a definition file when they are new, have something to store or had one (also when it is gone: see
-        // WriteAnew); requests always have a file.
+        // WriteAnew); requests always have a file. A request whose file is gone stays gone, as a folder does, unless its
+        // examples are written: they belong to it, so it is written anew.
         var hadFile = origin?.File is not null;
         var needsFile = !isFolder || origin is null || origin.V3 is not null || v3.Count > 1;
-        if (needsFile && !(hadFile && JsonNode.DeepEquals(v3, origin!.V3)))
+        var writtenAnew = !isFolder && hadFile && examplesChange && !File.Exists(file);
+        if (needsFile && (writtenAnew || !(hadFile && JsonNode.DeepEquals(v3, origin!.V3))))
         {
             var existing = File.Exists(file);
             if (existing && origin?.ReadError is { } error)
@@ -1160,12 +1406,13 @@ internal sealed class V3CollectionStorage : ICollectionStorage
     private static bool IsFolder(JsonObject item) => item["item"] is JsonArray;
 
     /// <summary>The item without its children (folder content changes are tracked per child).</summary>
+    /// <summary>An item without its children and saved examples, which have files of their own: what its file is written from.</summary>
     private static JsonObject Snapshot(JsonObject item)
     {
         var copy = new JsonObject();
         foreach (var (key, value) in item)
         {
-            if (key != "item")
+            if (key is not ("item" or "response"))
             {
                 copy[key] = value?.DeepClone();
             }

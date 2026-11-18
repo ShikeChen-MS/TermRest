@@ -88,6 +88,12 @@ public sealed class ResponseSnapshot
 
     public bool BodyTruncated { get; init; }
 
+    /// <summary>
+    /// The body streamed (see <see cref="ResponseStreams"/>) and was stopped before the server ended it: by its watcher, the
+    /// request timeout, or the connection. It is what arrived until then (a warning says why it stopped).
+    /// </summary>
+    public bool Stopped { get; init; }
+
     public string? ContentType { get; init; }
 
     public Uri? FinalUri { get; init; }

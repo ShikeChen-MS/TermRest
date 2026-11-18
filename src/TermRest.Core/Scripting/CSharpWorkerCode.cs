@@ -244,12 +244,13 @@ internal static partial class CSharpWorkerCode
             {
                 private readonly JsonArray _tests;
 
-                internal Tr(Scope environment, Scope collectionVariables, Scope globals, Variables variables, Request request, Response response, Info info, JsonArray tests)
+                internal Tr(Scope environment, Scope collectionVariables, Scope globals, Variables variables, Scope iterationData, Request request, Response response, Info info, JsonArray tests)
                 {
                     Environment = environment;
                     CollectionVariables = collectionVariables;
                     Globals = globals;
                     Variables = variables;
+                    IterationData = iterationData;
                     Request = request;
                     Response = response;
                     Info = info;
@@ -263,8 +264,11 @@ internal static partial class CSharpWorkerCode
 
                 public Scope Globals { get; }
 
-                /// <summary>Reads every scope (this request, environment, collection, globals); Set is for this request only.</summary>
+                /// <summary>Reads every scope (this request, the run's iteration data, environment, collection, globals); Set is for this request only.</summary>
                 public Variables Variables { get; }
+
+                /// <summary>The data of the run's current iteration, a row of its data file (termrest run --iteration-data); empty without one.</summary>
+                public Scope IterationData { get; }
 
                 /// <summary>The request: change it in pre-request scripts ({{variables}} are not replaced yet).</summary>
                 public Request Request { get; }
@@ -282,6 +286,23 @@ internal static partial class CSharpWorkerCode
                 });
 
                 public void Test(string name, Func<Task> test) => Record(name, test);
+
+                /// <summary>
+                /// Sends a request through TermRest, with its certificates, proxy and settings, and returns its response (as
+                /// tr.Response has it); throws HttpRequestException when it can't be sent. The request is a URL, or as Postman's
+                /// pm.sendRequest takes it: new { url, method, header, body, auth }, where header may be a dictionary of names to
+                /// values, and body text (raw), JSON (any object without a mode) or Postman's { mode, raw … }. Its {{variables}}
+                /// are sent as written: tr.Variables.ReplaceIn replaces them.
+                /// </summary>
+                public Response SendRequest(object request) => Host.Send(request switch
+                {
+                    string url => JsonValue.Create(url),
+                    JsonNode node => node.DeepClone(),
+                    null => throw new ArgumentNullException(nameof(request)),
+                    _ => JsonSerializer.SerializeToNode(request, request.GetType()),
+                });
+
+                public Task<Response> SendRequestAsync(object request) => Task.Run(() => SendRequest(request));
 
                 public void Assert(bool condition, string message = null, [CallerArgumentExpression(nameof(condition))] string expression = null)
                 {
@@ -652,6 +673,8 @@ internal static partial class CSharpWorkerCode
                     RequestName = Host.AsText(data?["request_name"]);
                     Collection = Host.AsText(data?["collection"]);
                     Environment = Host.AsText(data?["environment"]);
+                    Iteration = data?["iteration"] is JsonValue iteration && iteration.TryGetValue<int>(out var number) ? number : 0;
+                    IterationCount = data?["iteration_count"] is JsonValue count && count.TryGetValue<int>(out var total) ? total : 1;
                 }
 
                 /// <summary>"prerequest" or "test".</summary>
@@ -665,6 +688,12 @@ internal static partial class CSharpWorkerCode
                 public string Collection { get; }
 
                 public string Environment { get; }
+
+                /// <summary>The run's current iteration, from 0.</summary>
+                public int Iteration { get; }
+
+                /// <summary>The number of iterations of the run.</summary>
+                public int IterationCount { get; }
             }
 
             /// <summary>A failed tr.Assert or tr.AssertEqual: a test shows its message alone.</summary>
@@ -684,7 +713,12 @@ internal static partial class CSharpWorkerCode
                 private static readonly JsonSerializerOptions Options = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
                 private static readonly UTF8Encoding Utf8 = new(false);
                 private static readonly Capture Output = new();
+                private static readonly object SendLock = new();
                 private static FileStream _nothing;
+                private static TextReader _input;
+                private static TextWriter _output;
+                private static bool _sending;
+                private static int _sent;
 
                 private static int Main(string[] args)
                 {
@@ -696,6 +730,7 @@ internal static partial class CSharpWorkerCode
                     }
 
                     var (input, output) = Channel();
+                    (_input, _output) = (input, output);
                     Console.SetIn(TextReader.Null);
                     Console.SetOut(Output);
                     Console.SetError(Output);
@@ -703,6 +738,11 @@ internal static partial class CSharpWorkerCode
                     while ((line = input.ReadLine()) is not null)
                     {
                         JsonObject reply;
+                        lock (SendLock)
+                        {
+                            _sending = true;
+                        }
+
                         try
                         {
                             reply = Run(JsonNode.Parse(line).AsObject());
@@ -712,11 +752,51 @@ internal static partial class CSharpWorkerCode
                             reply = new JsonObject { ["fatal"] = error.ToString() };
                         }
 
+                        // After a request a task still waits for: its answer comes before the next message.
+                        lock (SendLock)
+                        {
+                            _sending = false;
+                        }
+
                         output.Write(Marker + reply.ToJsonString(Options) + "\n");
                         output.Flush();
                     }
 
                     return 0;
+                }
+
+                /// <summary>
+                /// tr.SendRequest: asks TermRest to send the request, with a line of output, and reads its answer, a line of
+                /// input; one at a time, as only the thread that asked may read it.
+                /// </summary>
+                internal static Response Send(JsonNode request)
+                {
+                    string line;
+                    lock (SendLock)
+                    {
+                        if (!_sending)
+                        {
+                            throw new InvalidOperationException("The scripts already finished: TermRest sends no more requests for them.");
+                        }
+
+                        var send = new JsonObject { ["send"] = new JsonObject { ["id"] = ++_sent, ["request"] = request } };
+                        _output.Write(Marker + send.ToJsonString(Options) + "\n");
+                        _output.Flush();
+                        line = _input.ReadLine();
+                    }
+
+                    var answer = (line is null ? null : JsonNode.Parse(line)?["sent"] as JsonObject) ?? new JsonObject { ["error"] = "TermRest did not answer." };
+                    if (AsText(answer["log"]) is { } log)
+                    {
+                        Output.Write(log + "\n");
+                    }
+
+                    if (answer["error"] is not null)
+                    {
+                        throw new System.Net.Http.HttpRequestException(AsText(answer["error"]));
+                    }
+
+                    return new Response(answer["response"] as JsonObject ?? new JsonObject());
                 }
 
                 /// <summary>
@@ -801,7 +881,7 @@ internal static partial class CSharpWorkerCode
                         return values;
                     }
 
-                    Dictionary<string, string> environment = Values("environment"), collection = Values("collection"), globals = Values("globals"), local = Values("local");
+                    Dictionary<string, string> environment = Values("environment"), collection = Values("collection"), globals = Values("globals"), local = Values("local"), data = Values("data");
                     var info = new Info(phase, message["info"] as JsonObject);
                     var tests = new JsonArray();
                     var logs = new JsonArray();
@@ -810,7 +890,8 @@ internal static partial class CSharpWorkerCode
                         new Scope(environment, changes["environment"].AsObject()),
                         new Scope(collection, changes["collection"].AsObject()),
                         new Scope(globals, changes["globals"].AsObject()),
-                        new Variables(local, changes["local"].AsObject(), new[] { local, environment, collection, globals }, message["dynamic"] as JsonObject),
+                        new Variables(local, changes["local"].AsObject(), new[] { local, data, environment, collection, globals }, message["dynamic"] as JsonObject),
+                        new Scope(data, new JsonObject()),
                         request,
                         message["response"] is JsonObject response ? new Response(response) : null,
                         info,

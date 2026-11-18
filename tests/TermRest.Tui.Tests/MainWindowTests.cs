@@ -572,6 +572,179 @@ public sealed class MainWindowTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task A_stream_is_shown_as_it_arrives_and_esc_stops_it_keeping_its_events()
+    {
+        await using var server = await TermRest.Core.Tests.Infrastructure.EchoServer.StartAsync();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.Url("events/0/20"));
+        var (live, stopped, events) = ("", "", "");
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            ui.App.InjectKey(Key.F5);
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            var screen = ui.Screen();
+            if (DateTime.UtcNow > deadline)
+            {
+                (live, stopped, events) = (live.Length > 0 ? live : screen, stopped.Length > 0 ? stopped : screen, screen);
+                ui.App.RequestStop();
+                return false;
+            }
+
+            if (live.Length == 0)
+            {
+                if (screen.Contains("200 OK · streaming ·", StringComparison.Ordinal) && screen.Contains("data: {\"n\":", StringComparison.Ordinal))
+                {
+                    live = screen;
+                    ui.App.InjectKey(Key.Esc);
+                }
+            }
+            else if (stopped.Length == 0)
+            {
+                if (screen.Contains("stream stopped", StringComparison.Ordinal))
+                {
+                    stopped = screen;
+                    var tab = ui.Find("│Events (");
+                    ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(tab.X + 2, tab.Y)));
+                }
+            }
+            else
+            {
+                events = screen;
+                ui.App.RequestStop();
+                return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("200 OK · streaming ·", live);
+        OnScreen("so far · Esc stops it", live);
+        OnScreen("⟦ Stop ⟧", live);
+        OnScreen("· stream stopped", stopped);
+        OnScreen("Event", events);
+        OnScreen("tick", events);
+        OnScreen("{\"n\":1}", events);
+        var response = ui.Window.ResponsePane.Exchange!.Response!;
+        Assert.True(response.Stopped);
+        Assert.StartsWith("id: 1\nevent: tick\ndata: {\"n\":1}\n\n", System.Text.Encoding.UTF8.GetString(response.Body), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Esc_once_a_stream_has_arrived_cancels_the_scripts_that_run_on_it()
+    {
+        var node = TestJavaScript.Require();
+        await using var server = await TermRest.Core.Tests.Infrastructure.EchoServer.StartAsync();
+        var setup = PostmanCollection.Load(Path.Combine(_directory, "TermRest Demo.postman_collection.json"));
+        var request = setup.FindRequest("Basics/GET with query")!;
+        var spec = request.ReadSpec();
+        spec.Scripts = new ScriptSet("", "await new Promise(resolve => setTimeout(resolve, 30000));", ScriptLanguage.JavaScript);
+        setup.UpdateRequest(request, spec);
+        setup.Save();
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.Url("events/2/10");
+            runner.SetJavaScriptRuntime(node);
+        });
+        var (running, done) = ("", "");
+        var pressed = DateTime.MaxValue;
+        var deadline = DateTime.UtcNow.AddSeconds(25);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            ui.App.InjectKey(Key.F5);
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            var screen = ui.Screen();
+            if (DateTime.UtcNow > deadline)
+            {
+                (running, done) = (running.Length > 0 ? running : screen, screen);
+                ui.App.RequestStop();
+                return false;
+            }
+
+            if (running.Length == 0)
+            {
+                if (screen.Contains(" received …", StringComparison.Ordinal))
+                {
+                    running = screen;
+                    pressed = DateTime.UtcNow;
+                    ui.App.InjectKey(Key.Esc);
+                }
+            }
+            else if (!ui.Window.IsSending)
+            {
+                done = screen;
+                ui.App.RequestStop();
+                return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        OnScreen("(Esc or Send to cancel)", running);
+        OnScreen("⟦ Cancel ⟧", running);
+        Assert.True(DateTime.UtcNow - pressed < TimeSpan.FromSeconds(15), done);
+        var exchange = ui.Window.ResponsePane.Exchange!;
+        Assert.Contains("Cancelled while the test scripts ran.", exchange.Scripts!.Notes);
+        Assert.Equal(200, exchange.Response!.StatusCode);
+    }
+
+    [Fact]
+    public async Task A_stream_still_arriving_when_another_request_is_opened_is_stopped_and_kept_in_the_history()
+    {
+        await using var server = await TermRest.Core.Tests.Infrastructure.EchoServer.StartAsync();
+        var state = TestFiles.NewTempDirectory();
+        using var ui = new Harness(_directory, runner =>
+        {
+            runner.LocalVariables["baseUrl"] = server.Url("events/0/20"); // until the client goes
+            runner.ConfigureHistory(state);
+        });
+        var arrived = "";
+        var step = 0;
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(300), () =>
+        {
+            ui.App.InjectKey(Key.F5);
+            return false;
+        });
+        ui.App.AddTimeout(TimeSpan.FromMilliseconds(100), () =>
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                ui.App.RequestStop();
+                return false;
+            }
+
+            switch (step)
+            {
+                case 0 when ui.Window.ResponsePane.StatusText.Contains("· streaming ·", StringComparison.Ordinal):
+                    ui.Click("POST POST JSON");
+                    step = 1;
+                    break;
+                case 1 when ui.Runner.History!.Load().Count == 1:
+                    arrived = ui.Window.StatusMessage;
+                    ui.App.RequestStop();
+                    return false;
+            }
+
+            return true;
+        });
+
+        ui.App.Run(ui.Window);
+
+        Assert.StartsWith("Earlier request: GET localhost → 200", arrived, StringComparison.Ordinal);
+        Assert.StartsWith("id: 1\n", System.Text.Encoding.UTF8.GetString(ui.Runner.History!.ReadBody(Assert.Single(ui.Runner.History.Load()))!), StringComparison.Ordinal);
+    }
+
     /// <summary>A screen's text with its lines joined and its box-drawing characters left out, so a check doesn't depend on where a dialog wraps.</summary>
     private static string Unwrapped(string screen) => System.Text.RegularExpressions.Regex.Replace(screen, @"[\s\u2500-\u259F]+", " ");
 
@@ -1187,6 +1360,150 @@ public sealed class MainWindowTests : IDisposable
         Assert.Single(screens);
         Assert.True(changed && saved);
         Assert.Equal((0, "none"), (ui.Workspace.Settings.MaxRedirects, ui.Workspace.Settings.Proxy));
+    }
+
+    [Fact]
+    public void A_proxy_sign_in_typed_in_the_settings_is_kept_in_the_users_private_file_not_the_workspace()
+    {
+        var userDirectory = TestFiles.NewTempDirectory();
+        using var ui = new Harness(_directory, runner => runner.ConfigureProxy(userDirectory));
+        var saved = false;
+
+        var screens = Drive(ui, () =>
+            {
+                SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out saved, userDirectory);
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () =>
+            {
+                var label = ui.Find("Proxy sign-in");
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 23, label.Y))); // its user field
+                ui.Type("CONTOSO\\ada");
+                ui.App.InjectKey(Key.Tab); // the password
+                ui.Type("s3cret-pw");
+                ui.Click("► Save ◄");
+            }));
+
+        Assert.Single(screens);
+        Assert.True(saved);
+        var credential = ui.Runner.CreateDefaults().ProxyCredential; // the system's proxy, used at once
+        Assert.Equal(("ada", "s3cret-pw", "CONTOSO"), (credential?.UserName, credential?.Password, credential?.Domain));
+        var file = File.ReadAllText(Path.Combine(userDirectory, ProxyCredentialStore.FileName));
+        Assert.Contains("CONTOSO\\\\ada", file, StringComparison.Ordinal);
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.DoesNotContain("s3cret-pw", file, StringComparison.Ordinal);
+        }
+
+        var workspaceSettings = ui.Workspace.SettingsPath;
+        Assert.False(File.Exists(workspaceSettings) && File.ReadAllText(workspaceSettings).Contains("ada", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_proxy_sign_in_left_masked_moves_to_the_new_proxy_and_sign_ins_another_termrest_saved_stay()
+    {
+        var userDirectory = TestFiles.NewTempDirectory();
+        var kept = ProxyCredentialStore.Load(userDirectory);
+        kept.Set("system", "CONTOSO\\ada", "s3cret-pw");
+        kept.Save(userDirectory);
+        using var ui = new Harness(_directory, runner => runner.ConfigureProxy(userDirectory));
+
+        // Another TermRest (another workspace) saves a sign-in for its proxy meanwhile.
+        var other = ProxyCredentialStore.Load(userDirectory);
+        other.Set("http://other-proxy:8080", "bob", "hunter2-pw");
+        other.Save(userDirectory);
+
+        var saved = false;
+        var screens = Drive(ui, () =>
+            {
+                SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out saved, userDirectory);
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () =>
+            {
+                // A proxy URL in place of the system's; its sign-in left as shown, the password masked.
+                var label = ui.Find("Proxy ");
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 23, label.Y)));
+                ui.App.InjectKey(Key.End);
+                foreach (var _ in "system")
+                {
+                    ui.App.InjectKey(Key.Backspace);
+                }
+
+                ui.Type("http://new-proxy:3128");
+                ui.Click("► Save ◄");
+            }));
+
+        Assert.Single(screens);
+        Assert.True(saved);
+        var credential = ui.Runner.CreateDefaults().ProxyCredential;
+        Assert.Equal(("http://new-proxy:3128", "ada", "s3cret-pw", "CONTOSO"),
+            (ui.Workspace.Settings.Proxy, credential?.UserName, credential?.Password, credential?.Domain));
+        var file = ProxyCredentialStore.Load(userDirectory);
+        Assert.Equal("hunter2-pw", file.Find("http://other-proxy:8080")?.Password);
+        Assert.Equal("s3cret-pw", file.Find("http://new-proxy:3128")?.Password);
+    }
+
+    [Fact]
+    public void The_settings_show_a_sign_in_another_termrest_saved_since_and_saving_them_keeps_it()
+    {
+        var userDirectory = TestFiles.NewTempDirectory();
+        using var ui = new Harness(_directory, runner => runner.ConfigureProxy(userDirectory));
+
+        // Another TermRest saves a sign-in for the system's proxy, which every workspace without a proxy of its own uses.
+        var other = ProxyCredentialStore.Load(userDirectory);
+        other.Set("system", "CONTOSO\\ada", "s3cret-pw");
+        other.Save(userDirectory);
+
+        var saved = false;
+        var screens = Drive(ui, () =>
+            {
+                SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out saved, userDirectory);
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () => ui.Click("► Save ◄")));
+
+        Assert.Contains("CONTOSO\\ada", Assert.Single(screens), StringComparison.Ordinal);
+        Assert.True(saved);
+        Assert.Equal("s3cret-pw", ProxyCredentialStore.Load(userDirectory).Find(null)?.Password);
+        Assert.Equal("ada", ui.Runner.CreateDefaults().ProxyCredential?.UserName); // for this session too
+    }
+
+    [Fact]
+    public void Naming_a_proxy_while_no_sign_in_is_shown_keeps_the_one_kept_for_that_proxy()
+    {
+        var userDirectory = TestFiles.NewTempDirectory();
+        var kept = ProxyCredentialStore.Load(userDirectory);
+        kept.Set("http://corp-proxy:3128", "bob", "hunter2-pw"); // saved with another workspace
+        kept.Save(userDirectory);
+        using var ui = new Harness(_directory, runner => runner.ConfigureProxy(userDirectory));
+
+        var saved = false;
+        var screens = Drive(ui, () =>
+            {
+                SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out saved, userDirectory);
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () =>
+            {
+                // That proxy in place of the system's, for which no sign-in is kept: the sign-in fields stay empty.
+                var label = ui.Find("Proxy ");
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 23, label.Y)));
+                ui.App.InjectKey(Key.End);
+                foreach (var _ in "system")
+                {
+                    ui.App.InjectKey(Key.Backspace);
+                }
+
+                ui.Type("http://corp-proxy:3128");
+                ui.Click("► Save ◄");
+            }));
+
+        Assert.Single(screens);
+        Assert.True(saved);
+        Assert.Equal("hunter2-pw", ProxyCredentialStore.Load(userDirectory).Find("http://corp-proxy:3128")?.Password);
+        var credential = ui.Runner.CreateDefaults().ProxyCredential;
+        Assert.Equal(("http://corp-proxy:3128", "bob", "hunter2-pw"), (ui.Workspace.Settings.Proxy, credential?.UserName, credential?.Password));
     }
 
     [Theory]
@@ -1857,7 +2174,7 @@ public sealed class MainWindowTests : IDisposable
         // Each column starts at the same place on every row (a message box would center every line on its own).
         int Column(params string[] texts) => Assert.Single(texts.Select(t => At(screen, t).X).Distinct());
         var keys = Column("F5, Ctrl+Enter", "Esc ", "F2 ", "Insert ", "F8 ", "F9 ");
-        var actions = Column("Send (again to cancel)", "Cancel a running request", "Rename tree item", "Add a table row", "Client certificates", "Collections ⇄ History");
+        var actions = Column("Send (again to cancel)", "Cancel a request, stop a stream", "Rename tree item", "Add a table row", "Client certificates", "Collections ⇄ History");
         var moreKeys = Column("F12  ", "Tab, Shift+Tab", "←, → (tab row)", "Shift+F10", "Ctrl+L", "Ctrl+F ", "F3, Shift+F3");
         var moreActions = Column("Start / stop recording", "Next / previous field", "Previous / next tab", "Focus the URL bar", "Find in the response", "Next / previous match");
         Assert.True(keys < actions && actions < moreKeys && moreKeys < moreActions, screen);
@@ -3012,6 +3329,82 @@ public sealed class MainWindowTests : IDisposable
 
         ui.App.Run(ui.Window);
         return screens;
+    }
+
+    [Fact]
+    public async Task Save_as_example_keeps_the_response_under_its_request_where_it_opens_for_editing()
+    {
+        await using var server = await LocalEchoServer.StartAsync();
+        using var ui = new Harness(_directory, runner => runner.LocalVariables["baseUrl"] = server.BaseUrl + "/echo");
+        var offered = false;
+        var screens = Drive(ui, () => ui.App.InjectKey(Key.F5),
+            ("200 OK", () =>
+            {
+                offered = ui.Window.ResponsePane.OffersSaveAsExample;
+                ui.Window.SaveResponseAsExample("Echoed");
+                ui.App.InjectKey(Key.S.WithCtrl); // saved: stopping asks nothing
+                ui.App.RequestStop();
+            }));
+        Assert.Single(screens);
+        Assert.True(offered);
+        OnScreen("Save as example", screens[0]);
+
+        var collection = ui.Workspace.Collections[0];
+        var request = collection.FindRequest("Basics/GET with query")!;
+        var example = Assert.Single(collection.GetExamples(request));
+        var spec = example.ReadSpec();
+        Assert.Equal(("Echoed", 200, "OK", "json"), (spec.Name, spec.Code, spec.Status, spec.Language));
+        Assert.Contains("/echo/get", spec.Body, StringComparison.Ordinal);
+        Assert.Equal("{{baseUrl}}/get?foo=bar&source=termrest", spec.Request.Url);
+
+        var token = ui.App.Begin(ui.Window);
+        ui.Click("e.g. Echoed");
+        var screen = ui.Screen();
+        OnScreen("Example — TermRest Demo / Basics/GET with query / Echoed", screen);
+        OnScreen("│Params│Headers│Body│", screen);
+        OnScreen("Example response", screen);
+        Assert.True(ui.Window.Editor.ExampleMode);
+
+        ui.Window.ExampleEditor.CodeField.Text = "201";
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.App.End(token!);
+
+        var saved = PostmanCollection.Load(collection.FilePath!);
+        var written = Assert.Single(saved.GetExamples(saved.FindRequest("Basics/GET with query")!)).ReadSpec();
+        Assert.Equal(("Echoed", 201, "OK"), (written.Name, written.Code, written.Status));
+        Assert.Equal(spec.Body, written.Body);
+    }
+
+    [Fact]
+    public void An_example_is_not_sent_and_its_edits_are_saved_until_a_request_is_opened()
+    {
+        var file = Path.Combine(_directory, "TermRest Demo.postman_collection.json");
+        var demo = PostmanCollection.Load(file);
+        var post = demo.FindRequest("Basics/POST JSON")!;
+        demo.AddExample(post, new ExampleSpec { Name = "Created", Request = post.ReadSpec(), Code = 201, Status = "Created", Body = "{}", Language = "json" });
+        demo.Save();
+
+        using var ui = new Harness(_directory);
+        var collection = ui.Workspace.Collections[0];
+        var request = collection.FindRequest("Basics/POST JSON")!;
+        var token = ui.App.Begin(ui.Window);
+        ui.Window.ShowExample(Assert.Single(collection.GetExamples(request)));
+
+        ui.App.InjectKey(Key.F5);
+        var notice = ui.Window.StatusMessage;
+        ui.Window.ExampleEditor.BodyArea.SetFocus();
+        ui.Type("[");
+        ui.App.InjectKey(Key.S.WithCtrl);
+        ui.Window.ShowRequest(request);
+        var screen = ui.Screen();
+        ui.App.End(token!);
+
+        Assert.Contains("An example is not sent", notice, StringComparison.Ordinal);
+        Assert.False(ui.Window.Editor.ExampleMode);
+        OnScreen("│Params│Headers│Auth│Body│Scripts│Settings│", screen);
+        OnScreen("Request — TermRest Demo / Basics/POST JSON", screen);
+        var saved = PostmanCollection.Load(file);
+        Assert.Equal("[{}", Assert.Single(saved.GetExamples(saved.FindRequest("Basics/POST JSON")!)).ReadSpec().Body);
     }
 
     [Fact]

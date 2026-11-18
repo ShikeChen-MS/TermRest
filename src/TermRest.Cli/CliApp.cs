@@ -11,6 +11,18 @@ internal static class CliApp
     /// <summary>Cancelled by the first Ctrl+C or SIGTERM while <c>send</c> or <c>run</c> works (see <see cref="Stop"/>).</summary>
     private static readonly CancellationTokenSource Stopping = new();
 
+    private static Action? s_interrupt;
+
+    /// <summary>
+    /// Takes the next Ctrl+C in place of <see cref="Stopping"/>, once: <c>send</c> stops a response that streams with it,
+    /// keeping what arrived. Null: Ctrl+C stops the command.
+    /// </summary>
+    internal static Action? Interrupt
+    {
+        get => Volatile.Read(ref s_interrupt);
+        set => Volatile.Write(ref s_interrupt, value);
+    }
+
     public static async Task<int> RunAsync(string[] args)
     {
         var insecure = new Option<bool>("--insecure", "-k") { Description = "Do not verify server TLS certificates", Recursive = true };
@@ -71,10 +83,17 @@ internal static class CliApp
     /// <summary>
     /// The first Ctrl+C (or SIGTERM: a cancelled CI job) stops <c>send</c> and <c>run</c>, which still save their recording
     /// and write their report, however long that takes (System.CommandLine would end the process 2 seconds after the
-    /// signal); another one ends TermRest at once.
+    /// signal); another one ends TermRest at once. A Ctrl+C that <see cref="Interrupt"/> takes does neither.
     /// </summary>
     private static void Stop(PosixSignalContext context)
     {
+        if (context.Signal == PosixSignal.SIGINT && Interlocked.Exchange(ref s_interrupt, null) is { } interrupt)
+        {
+            context.Cancel = true;
+            interrupt();
+            return;
+        }
+
         context.Cancel = !Stopping.IsCancellationRequested;
         Stopping.Cancel();
     }

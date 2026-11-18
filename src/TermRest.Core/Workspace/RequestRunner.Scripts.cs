@@ -350,10 +350,20 @@ public sealed partial class RequestRunner
                 ["collection"] = Values(collection.GetVariables(), Session.Find(collection)),
                 ["globals"] = Values(Workspace.Globals?.Values, Session.Globals),
                 ["local"] = Values(LocalVariables.Select(v => new KeyValueEntry { Key = v.Key, Value = v.Value }), local),
+
+                // With their JSON types: Postman's iteration data keeps them (pm.iterationData.get('count') is a number).
+                ["data"] = IterationData?.DeepClone() ?? new JsonObject(),
             },
             ["request"] = request,
             ["response"] = response,
-            ["info"] = new JsonObject { ["request_name"] = requestName, ["collection"] = collection.Name, ["environment"] = environment?.Name },
+            ["info"] = new JsonObject
+            {
+                ["request_name"] = requestName,
+                ["collection"] = collection.Name,
+                ["environment"] = environment?.Name,
+                ["iteration"] = Iteration,
+                ["iteration_count"] = IterationCount,
+            },
             ["dynamic"] = new JsonObject
             {
                 ["firstNames"] = PostmanJson.ToJsonArray(VariableResolver.FirstNames.Select(n => (JsonNode?)n)),
@@ -367,7 +377,8 @@ public sealed partial class RequestRunner
         {
             // Off the caller's thread: starting a runtime (or building C#) takes a moment, and the UI must stay responsive.
             var related = language == ScriptLanguage.CSharp ? CSharpScriptsOf(collection) : null;
-            reply = await Task.Run(() => worker.RunAsync(message, ScriptTimeout, related, cancellationToken), cancellationToken).ConfigureAwait(true);
+            reply = await Task.Run(() => worker.RunAsync(message, ScriptTimeout, related,
+                (sent, token) => SendForScriptAsync(sent, environment, collection, language, token), cancellationToken), cancellationToken).ConfigureAwait(true);
         }
         catch (ScriptException ex)
         {
@@ -523,6 +534,83 @@ public sealed partial class RequestRunner
                 results.Notes.Add("The request body was not changed: scripts can change raw bodies only.");
             }
         }
+    }
+
+    /// <summary>
+    /// Sends a request that a script sends (pm.sendRequest, tr.send_request …; see <see cref="ScriptRequest"/>) as TermRest
+    /// sends its own: with the workspace's client certificates, CA bundle, proxy (and its sign-in), timeout and limits, and the
+    /// session's cookies. As in Postman, its <c>{{variables}}</c> are sent as written (scripts replace them with replaceIn), and
+    /// its auth is its own: it inherits none. It is recorded with the requests when they are, not kept in the history. The
+    /// script gets the response, as its language's response object has it, or the error, and a line for its output.
+    /// Called off the caller's thread, while the scripts run.
+    /// </summary>
+    private async Task<JsonObject> SendForScriptAsync(JsonNode? request, PostmanEnvironment? environment, PostmanCollection collection,
+        string language, CancellationToken cancellationToken)
+    {
+        var spec = ScriptRequest.Read(request);
+
+        // Its own URL, headers, body and auth as written; the workspace's settings (a certificate's {{passphrase}}) as for any request.
+        var resolver = CreateResolver(environment, collection, null);
+        var preparer = new RequestPreparer(VariableResolver.Literal, Certificates, CreateDefaults(), settingsVariables: resolver);
+        var prepared = preparer.Prepare(spec, spec.Auth is { Type: not "inherit" } own ? own : null, collection.BaseDirectory);
+        prepared.AddSecretValues(SecretVariableValues(environment, collection, resolver));
+        prepared.AddSensitiveValues(VariablesNamedLikeSecrets(environment, collection, resolver, null));
+        await AuthorizeAsync(prepared, cancellationToken).ConfigureAwait(false);
+        var sent = $"{prepared.Method} {Shown(prepared)} →";
+        var note = Unreplaced(prepared, language);
+        if (prepared.Errors.Count > 0)
+        {
+            var problem = string.Join(" ", prepared.Errors) + note;
+            return new JsonObject { ["error"] = problem, ["log"] = $"{sent} not sent: {problem}{Warnings(prepared)}" };
+        }
+
+        var exchange = await Executor.SendAsync(prepared, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        Recorder?.Record(exchange, environment?.Name);
+        if (exchange.Response is not { } response)
+        {
+            var problem = (exchange.ErrorMessage ?? "No response.") + note;
+            return new JsonObject { ["error"] = problem, ["log"] = $"{sent} failed: {problem}{Warnings(prepared)}" };
+        }
+
+        var cut = response.BodyTruncated ? ", body cut at the size limit" : "";
+        return new JsonObject
+        {
+            ["response"] = ResponseReceived(exchange),
+            ["log"] = $"{sent} {response.StatusCode} {response.ReasonPhrase} ({exchange.Timing.Total?.TotalMilliseconds ?? 0:0} ms{cut}){note}{Warnings(prepared)}",
+        };
+    }
+
+    /// <summary>
+    /// The warnings of a request that a script sent (a client certificate not used, a redirect not followed …), as lines of
+    /// the script's output after its own: the line says the unreplaced variables already.
+    /// </summary>
+    private static string Warnings(PreparedRequest request) =>
+        string.Concat(request.Warnings.Where(w => !w.StartsWith("Unresolved variables:", StringComparison.Ordinal)).Select(w => "\n  ⚠ " + w));
+
+    /// <summary>Where a request went, for a script's output: without the query, which may hold a key, nor a password.</summary>
+    private static string Shown(PreparedRequest request) => request.Uri is { } uri
+        ? $"{uri.Scheme}://{uri.Authority}{uri.AbsolutePath}{(uri.Query.Length > 1 ? "?…" : "")}"
+        : PostmanUrl.MaskCredentials(request.Url);
+
+    /// <summary>For a request that a script sent with <c>{{references}}</c> in it: that they went as written, and what replaces them.</summary>
+    private static string Unreplaced(PreparedRequest request, string language)
+    {
+        var names = request.UnresolvedVariables;
+        if (names.Count == 0)
+        {
+            return "";
+        }
+
+        var replaceIn = language switch
+        {
+            ScriptLanguage.Python => "tr.variables.replace_in(…)",
+            ScriptLanguage.CSharp => "tr.Variables.ReplaceIn(…)",
+            ScriptLanguage.PowerShell => "$tr.Variables.ReplaceIn(…)",
+            _ => "pm.variables.replaceIn(…)",
+        };
+        var shown = string.Join(", ", names.Take(3).Select(name => "{{" + name + "}}")) + (names.Count > 3 ? ", …" : "");
+        return $" ({shown} sent as written: {replaceIn} replaces variables)";
     }
 
     /// <summary>The request as pre-request scripts see it: as written, with <c>{{variables}}</c> not yet replaced.</summary>

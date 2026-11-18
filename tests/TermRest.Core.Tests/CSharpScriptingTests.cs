@@ -434,9 +434,9 @@ public class CSharpScriptingTests
         JsonObject Message() => new() { ["phase"] = "test", ["scripts"] = new JsonArray(new JsonObject { ["name"] = "request", ["code"] = mine }) };
         int Builds() => File.ReadLines(commands).Count(l => l.StartsWith("run ", StringComparison.Ordinal));
 
-        var reply = await worker.RunAsync(Message(), TimeSpan.FromSeconds(30), collection, _ct);
+        var reply = await worker.RunAsync(Message(), TimeSpan.FromSeconds(30), collection, cancellationToken: _ct);
         var builds = Builds();
-        var again = await worker.RunAsync(Message(), TimeSpan.FromSeconds(30), collection, _ct);
+        var again = await worker.RunAsync(Message(), TimeSpan.FromSeconds(30), collection, cancellationToken: _ct);
 
         Assert.Null(reply["error"]);
         Assert.Equal("ok", reply["tests"]![0]!["name"]!.GetValue<string>());

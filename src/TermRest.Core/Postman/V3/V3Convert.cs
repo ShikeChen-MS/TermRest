@@ -1053,43 +1053,116 @@ internal static class V3Convert
 
     // ----- examples (saved responses) ------------------------------------------------------------
 
-    /// <summary>A v2.1 saved response as a v3 <c>http-example</c> file.</summary>
-    public static JsonObject ExampleToV3(JsonObject response)
+    public const string HttpExampleKind = "http-example";
+
+    /// <summary>The keys of an example file, in Postman's order.</summary>
+    internal static readonly string[] ExampleFileOrder = ["$kind", "name", "request", "response", "order"];
+
+    private static readonly string[] ExampleRequestOrder = ["url", "method", "headers", "queryParams", "pathVariables", "body"];
+    private static readonly string[] ExampleResponseOrder = ["statusCode", "statusText", "headers", "body"];
+    private static readonly string[] ExampleBodyOrder = ["type", "content"];
+
+    /// <summary>A v3 <c>http-example</c> file as a v2.1 saved response named <paramref name="name"/>.</summary>
+    public static JsonObject ExampleToV21(JsonObject v3, string name)
     {
+        var request = v3["request"] as JsonObject;
+        var original = new JsonObject
+        {
+            ["method"] = request?["method"].GetString() ?? "GET",
+            ["header"] = KeyValuesToV21(request?["headers"]),
+        };
+        if (BodyToV21(request?["body"]) is { } body)
+        {
+            original["body"] = body;
+        }
+
+        var url = new JsonObject { ["raw"] = request?["url"].GetString() ?? "" };
+        if (request?["queryParams"] is JsonArray or JsonObject)
+        {
+            url["query"] = KeyValuesToV21(request["queryParams"]);
+        }
+
+        if (request?["pathVariables"] is JsonArray or JsonObject)
+        {
+            url["variable"] = KeyValuesToV21(request["pathVariables"]);
+        }
+
+        original["url"] = url;
+        var response = v3["response"] as JsonObject;
+        var example = new JsonObject
+        {
+            ["name"] = name,
+            ["originalRequest"] = original,
+            ["status"] = response?["statusText"].GetString() ?? "",
+        };
+        if (response?["statusCode"].GetInt() is { } code)
+        {
+            example["code"] = code;
+        }
+
+        var responseBody = response?["body"] as JsonObject;
+        example["_postman_previewlanguage"] = responseBody?["type"].GetString() ?? "text";
+        example["header"] = KeyValuesToV21(response?["headers"]);
+        example["cookie"] = new JsonArray();
+        example["body"] = ContentText(responseBody?["content"]);
+        return example;
+    }
+
+    /// <summary>
+    /// A v2.1 saved response as a v3 <c>http-example</c> file, based on <paramref name="template"/> (the file as it was
+    /// read): what did not change stays as the file has it (key order, maps or lists, keys TermRest does not edit). Its
+    /// <c>name</c> and <c>order</c> are the caller's.
+    /// </summary>
+    public static JsonObject ExampleToV3(JsonObject response, JsonObject? template = null)
+    {
+        var v3 = template is null ? new JsonObject { ["$kind"] = HttpExampleKind } : (JsonObject)template.DeepClone();
         var original = response["originalRequest"] as JsonObject;
-        var request = new JsonObject
+        var templateRequest = template?["request"] as JsonObject;
+        var request = templateRequest is null ? new JsonObject() : (JsonObject)templateRequest.DeepClone();
+        var (raw, query, variables) = ReadUrl(original?["url"]);
+        Set(request, "url", raw, ExampleRequestOrder);
+        Set(request, "method", original?["method"].GetString() ?? "GET", ExampleRequestOrder);
+        Set(request, "headers", KeyValuesToV3(CleanHeaders(original?["header"]), templateRequest?["headers"], mapWhenNew: true), ExampleRequestOrder);
+
+        // Postman's example files name the URL only; parameters the file lists are kept in step with it.
+        if (templateRequest?.ContainsKey("queryParams") == true)
         {
-            ["url"] = ReadUrl(original?["url"]).Raw,
-            ["method"] = original?["method"].GetString() ?? "GET",
-        };
-        if (KeyValuesToV3(CleanHeaders(original?["header"]), null, mapWhenNew: true) is { } requestHeaders)
-        {
-            request["headers"] = requestHeaders;
+            Set(request, "queryParams", KeyValuesToV3(query, templateRequest["queryParams"], mapWhenNew: false), ExampleRequestOrder);
         }
 
-        if (BodyToV3(original?["body"] as JsonObject, null) is { } requestBody)
+        if (templateRequest?.ContainsKey("pathVariables") == true)
         {
-            request["body"] = requestBody;
+            Set(request, "pathVariables", KeyValuesToV3(variables, templateRequest["pathVariables"], mapWhenNew: false), ExampleRequestOrder);
         }
 
-        var result = new JsonObject
-        {
-            ["statusCode"] = response["code"].GetInt() ?? 200,
-            ["statusText"] = response["status"].GetString() ?? "",
-        };
-        if (KeyValuesToV3(CleanHeaders(response["header"]), null, mapWhenNew: true) is { } headers)
-        {
-            result["headers"] = headers;
-        }
+        var fileBody = templateRequest?["body"];
+        Set(request, "body", fileBody is not null && JsonNode.DeepEquals(BodyToV21(fileBody), original?["body"])
+            ? fileBody.DeepClone()
+            : BodyToV3(original?["body"] as JsonObject, fileBody), ExampleRequestOrder);
+        Set(v3, "request", request, ExampleFileOrder);
 
+        var templateResponse = template?["response"] as JsonObject;
+        var result = templateResponse is null ? new JsonObject() : (JsonObject)templateResponse.DeepClone();
+        var code = response["code"].GetInt() ?? (template is null ? 200 : null);
+        Set(result, "statusCode", code is { } statusCode ? JsonValue.Create(statusCode) : null, ExampleResponseOrder);
+        Set(result, "statusText", response["status"].GetString() ?? "", ExampleResponseOrder);
+        Set(result, "headers", KeyValuesToV3(CleanHeaders(response["header"]), templateResponse?["headers"], mapWhenNew: true), ExampleResponseOrder);
+
+        // A type the file has stays, also one TermRest does not color (csv, say).
+        var templateBody = templateResponse?["body"] as JsonObject;
         var language = response["_postman_previewlanguage"].GetString();
-        result["body"] = new JsonObject
+        var type = language is not null && (RawLanguages.Contains(language) || language == "yaml" || language == templateBody?["type"].GetString()) ? language : "text";
+        var body = templateBody is null ? new JsonObject() : (JsonObject)templateBody.DeepClone();
+        Set(body, "type", type, ExampleBodyOrder);
+        var content = response["body"].GetString() ?? "";
+        if (templateBody is null || ContentText(templateBody["content"]) != content)
         {
-            ["type"] = language is not null && (RawLanguages.Contains(language) || language == "yaml") ? language : "text",
-            ["content"] = response["body"].GetString() ?? "",
-        };
+            Set(body, "content", content, ExampleBodyOrder);
+        }
 
-        return new JsonObject { ["$kind"] = "http-example", ["request"] = request, ["response"] = result };
+        Set(result, "body", body, ExampleResponseOrder);
+        Set(v3, "response", result, ExampleFileOrder);
+        return v3;
 
         static JsonArray? CleanHeaders(JsonNode? node)
         {
@@ -1170,6 +1243,9 @@ internal static class V3Convert
         JsonValue value => value.GetString() ?? value.ToJsonString(),
         _ => node.ToJsonString(),
     };
+
+    /// <summary>An example body's content as text: v3 keeps it as a string, though a file may hold other YAML there.</summary>
+    private static string ContentText(JsonNode? node) => Text(node) ?? "";
 
     /// <summary>The template's value when it means the same text (keeps e.g. a number unquoted).</summary>
     private static JsonNode? Reuse(JsonNode? template, JsonNode? value) =>

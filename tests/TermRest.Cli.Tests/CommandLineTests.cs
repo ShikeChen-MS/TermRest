@@ -814,6 +814,73 @@ public sealed class CommandLineTests
     }
 
     [Fact]
+    public async Task Send_prints_a_stream_as_it_arrives_once()
+    {
+        await using var server = await TestServer.StartAsync();
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Events", "GET", server.BaseUrl + "/events")]);
+
+        var result = await Termrest.RunAsync(["send", collection, "Events", "-i", "--no-history"]);
+
+        Assert.True(result.ExitCode == 0, result.ToString());
+        var events = string.Concat(Enumerable.Range(1, 3).Select(n => $"id: {n}\ndata: {{\"n\":{n}}}\n\n"));
+        var text = result.Text.ReplaceLineEndings("\n");
+        Assert.StartsWith("HTTP/1.1 200 OK\n", text, StringComparison.Ordinal);
+        Assert.EndsWith("Content-Type: text/event-stream\n\n" + events, text, StringComparison.Ordinal); // its headers, then its events, once
+        Assert.Contains("200 OK · streaming (Ctrl+C stops it, keeping what arrived)", result.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Send_stops_a_stream_once_what_reads_its_output_has_gone()
+    {
+        await using var server = await TestServer.StartAsync();
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Events", "GET", server.BaseUrl + "/events?count=0")]);
+
+        var result = await Termrest.RunAsync(["send", collection, "Events", "--no-history"], outputLimit: 40); // | head -c 40
+
+        Assert.True(result.ExitCode == 0, result.ToString());
+        Assert.Contains("warning: The stream was stopped: its body is what arrived until then.", result.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Send_signs_in_to_the_system_proxy_with_proxy_user_rather_than_with_the_user_and_password_in_http_proxy()
+    {
+        await using var proxy = new SignInProxy("ada", "s3cret");
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Hello", "GET", "http://api.example.test/hello")]);
+        var environment = new Dictionary<string, string> { ["HTTP_PROXY"] = proxy.Url.Replace("http://", "http://ada:old-password@", StringComparison.Ordinal), ["NO_PROXY"] = "" };
+
+        var given = await Termrest.RunAsync(["send", collection, "Hello", "--proxy-user", "ada:s3cret", "--no-history"], environment);
+        var fromUrl = await Termrest.RunAsync(["send", collection, "Hello", "--no-history"], environment);
+
+        Assert.True(given.ExitCode == 0, given.ToString());
+        Assert.Contains("through the proxy", given.Text, StringComparison.Ordinal);
+        Assert.Contains("407", fromUrl.Error, StringComparison.Ordinal); // the URL's own, when none is given
+    }
+
+    [Fact]
+    public async Task Ctrl_c_stops_a_stream_that_send_prints_keeping_what_arrived()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Skip("Signals a process: Unix only (Ctrl+C needs a console on Windows).");
+        }
+
+        await using var server = await TestServer.StartAsync();
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Events", "GET", server.BaseUrl + "/events?count=0")]);
+
+        var result = await Termrest.RunAsync(["send", collection, "Events", "--no-history"], whileRunning: async process =>
+        {
+            await server.Waiting.WaitAsync(TimeSpan.FromMinutes(1), TestContext.Current.CancellationToken);
+            await Task.Delay(200, TestContext.Current.CancellationToken);
+            using var interrupt = Process.Start("kill", ["-INT", process.Id.ToString(CultureInfo.InvariantCulture)])!;
+            await interrupt.WaitForExitAsync(TestContext.Current.CancellationToken);
+        });
+
+        Assert.True(result.ExitCode == 0, result.ToString());
+        Assert.StartsWith("id: 1\ndata: {\"n\":1}\n\nid: 2\n", result.Text, StringComparison.Ordinal);
+        Assert.Contains("warning: The stream was stopped: its body is what arrived until then.", result.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Send_filter_prints_the_values_a_jsonpath_query_selects()
     {
         await using var server = await TestServer.StartAsync();
@@ -1113,6 +1180,59 @@ public sealed class CommandLineTests
         Assert.True(allowed.ExitCode == 1, allowed.ToString()); // the proxy refused the connection
         Assert.DoesNotContain("is not used", allowed.Error, StringComparison.Ordinal);
         Assert.Equal(2, server.Requests);
+    }
+
+    [Fact]
+    public async Task Run_sends_the_requests_once_for_each_row_of_a_data_file()
+    {
+        await using var server = await TestServer.StartAsync();
+        var directory = TestFiles.NewTempDirectory();
+        var collection = WriteCollection(directory, "Api", [("Greet", "GET", server.BaseUrl + "/echo/{{name}}?n={{n}}")]);
+        var data = Path.Combine(directory, "people.csv");
+        File.WriteAllText(data, "name,n\nada,1\n\"grace\",2\n");
+        var report = Path.Combine(directory, "report.json");
+
+        var rows = await Termrest.RunAsync(["run", collection, "-d", data, "--report-json", report]);
+        var more = await Termrest.RunAsync(["run", collection, "--iteration-data", data, "-n", "3"]); // past the last row: that row again
+        var missing = await Termrest.RunAsync(["run", collection, "-d", Path.Combine(directory, "missing.csv")]);
+
+        Assert.True(rows.ExitCode == 0, rows.ToString());
+        Assert.Contains("Running 1 request(s) × 2 iterations from 'Api', data from people.csv (2 row(s))", rows.ToString(), StringComparison.Ordinal);
+        Assert.Contains("Iteration 2/2", rows.ToString(), StringComparison.Ordinal);
+        var json = JsonNode.Parse(File.ReadAllText(report))!;
+        Assert.Equal(2, (int)json["iterations"]!);
+        Assert.Equal(
+            [(1, server.BaseUrl + "/echo/ada?n=1"), (2, server.BaseUrl + "/echo/grace?n=2")],
+            ((JsonArray)json["results"]!).Select(r => ((int)r!["iteration"]!, (string)r["url"]!)));
+        Assert.True(more.ExitCode == 0, more.ToString());
+        Assert.Contains("Iteration 3/3", more.ToString(), StringComparison.Ordinal);
+        Assert.Contains("3 passed, 0 failed", more.ToString(), StringComparison.Ordinal);
+        Assert.Equal(5, server.Requests);
+        Assert.Equal(2, missing.ExitCode);
+        Assert.Contains("--iteration-data:", missing.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Send_signs_in_to_a_proxy_with_proxy_user_and_says_what_a_proxy_that_wants_a_sign_in_needs()
+    {
+        await using var proxy = new SignInProxy("ada", "s3cret");
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Hello", "GET", "http://api.example.test/hello")]);
+
+        var signedIn = await Termrest.RunAsync(["send", collection, "Hello", "--proxy", proxy.Url, "--proxy-user", "ada:s3cret"]);
+        var refused = await Termrest.RunAsync(["send", collection, "Hello", "-x", proxy.Url["http://".Length..]]); // host:port, as curl takes it
+        var noPassword = await Termrest.RunAsync(["send", collection, "Hello", "--proxy", proxy.Url, "--proxy-user", "ada"]); // nobody to type it
+        var invalid = await Termrest.RunAsync(["send", collection, "Hello", "--proxy", "ftp://proxy:21"]);
+
+        Assert.True(signedIn.ExitCode == 0, signedIn.ToString());
+        Assert.Contains("through the proxy", signedIn.Text, StringComparison.Ordinal);
+        Assert.True(refused.ExitCode == 0, refused.ToString()); // a response: the proxy's 407
+        Assert.Contains("407", refused.Error, StringComparison.Ordinal);
+        Assert.Contains("The proxy asks for a user name and password", refused.Error, StringComparison.Ordinal);
+        Assert.Equal(2, noPassword.ExitCode);
+        Assert.Contains("give the password as user:password", noPassword.Error, StringComparison.Ordinal);
+        Assert.Equal(2, invalid.ExitCode);
+        Assert.Contains("--proxy expects a URL", invalid.Error, StringComparison.Ordinal);
+        Assert.Equal(3, proxy.Requests.Count); // the two that reached it: one with a sign-in after the challenge
     }
 
     [Fact]

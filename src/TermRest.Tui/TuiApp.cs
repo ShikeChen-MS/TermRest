@@ -60,6 +60,11 @@ public static class TuiApp
             runner.ConfigureHistory();
             runner.ConfigureScripts();
             runner.ConfigureProxy();
+            if (runner.ProxyCredentials.LoadError is { } credentialsProblem && !workspace.LoadErrors.Contains(credentialsProblem))
+            {
+                workspace.LoadErrors.Add(credentialsProblem); // no proxy sign-in is used then, and the file is not saved over
+            }
+
             runner.ConfigureFiles();
             using var app = Application.Create();
             app.Init(options.Driver);

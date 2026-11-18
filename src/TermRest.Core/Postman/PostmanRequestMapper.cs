@@ -51,7 +51,17 @@ public static class PostmanRequestMapper
     public static HttpRequestSpec Read(JsonObject item, PostmanSchemaVersion version)
     {
         var spec = new HttpRequestSpec();
-        switch (item["request"])
+        ReadRequest(item["request"], spec, version);
+        spec.Settings = ReadSettings(item["protocolProfileBehavior"]);
+        spec.Scripts = ReadScripts(item["event"]);
+        spec.ScriptSettings = ReadScriptSettings(item["termrest"]);
+        return spec;
+    }
+
+    /// <summary>Reads a <c>request</c> object (an item's, or a saved example's <c>originalRequest</c>), or its short form, a URL.</summary>
+    internal static void ReadRequest(JsonNode? node, HttpRequestSpec spec, PostmanSchemaVersion version)
+    {
+        switch (node)
         {
             case JsonValue shortForm:
                 spec.Url = shortForm.GetString() ?? "";
@@ -69,11 +79,6 @@ public static class PostmanRequestMapper
                 spec.Description = ReadDescription(request["description"]);
                 break;
         }
-
-        spec.Settings = ReadSettings(item["protocolProfileBehavior"]);
-        spec.Scripts = ReadScripts(item["event"]);
-        spec.ScriptSettings = ReadScriptSettings(item["termrest"]);
-        return spec;
     }
 
     internal static List<KeyValueEntry> ReadKeyValues(JsonNode? node, bool environmentStyle = false)
@@ -359,6 +364,30 @@ public static class PostmanRequestMapper
             force = true;
         }
 
+        ApplyRequest(request, spec, baseline, version, force);
+        if (!spec.Settings.ContentEquals(baseline.Settings))
+        {
+            var settings = WriteSettings(spec.Settings);
+            if (settings is null)
+            {
+                item.Remove("protocolProfileBehavior");
+            }
+            else
+            {
+                item.SetOrdered("protocolProfileBehavior", settings, ItemOrder);
+            }
+        }
+
+        ApplyScripts(item, spec.Scripts, baseline.Scripts, ItemOrder);
+        ApplyScriptSettings(item, spec.ScriptSettings, baseline.ScriptSettings);
+    }
+
+    /// <summary>
+    /// Writes the parts of a <c>request</c> object (an item's, or a saved example's <c>originalRequest</c>) that differ from
+    /// <paramref name="baseline"/>; with <paramref name="force"/> (a new object) all of them.
+    /// </summary>
+    internal static void ApplyRequest(JsonObject request, HttpRequestSpec spec, HttpRequestSpec baseline, PostmanSchemaVersion version, bool force)
+    {
         if (force || spec.Method != baseline.Method)
         {
             request.SetOrdered("method", spec.Method, RequestOrder);
@@ -430,22 +459,6 @@ public static class PostmanRequestMapper
                 request.SetOrdered("description", WriteDescription(request["description"], spec.Description), RequestOrder);
             }
         }
-
-        if (!spec.Settings.ContentEquals(baseline.Settings))
-        {
-            var settings = WriteSettings(spec.Settings);
-            if (settings is null)
-            {
-                item.Remove("protocolProfileBehavior");
-            }
-            else
-            {
-                item.SetOrdered("protocolProfileBehavior", settings, ItemOrder);
-            }
-        }
-
-        ApplyScripts(item, spec.Scripts, baseline.Scripts, ItemOrder);
-        ApplyScriptSettings(item, spec.ScriptSettings, baseline.ScriptSettings);
     }
 
     /// <summary>

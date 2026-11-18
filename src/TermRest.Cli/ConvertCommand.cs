@@ -126,11 +126,13 @@ internal static class ConvertCommand
             return 2;
         }
 
+        var warningsBefore = source.LoadWarnings.Count;
         TextFile.WriteAtomic(file, source.ExportV21Json(), newFileMode: TextFile.CopyMode(path)); // as private as its source
-        Output.Status($"✓ {source.AllRequests().Count()} request(s) written to {file}", true);
-        if (Directory.EnumerateFiles(path, "*.example.yaml", SearchOption.AllDirectories).Any())
+        var exampleCount = source.AllRequests().Sum(r => source.GetExamples(r).Count);
+        Output.Status($"✓ {source.AllRequests().Count()} request(s){(exampleCount > 0 ? $" and {exampleCount} example(s)" : "")} written to {file}", true);
+        foreach (var unreadable in source.LoadWarnings.Skip(warningsBefore))
         {
-            Output.Info("  Saved examples (*.example.yaml) are not included in the v2.1 file.");
+            Output.Warning($"Example left out: {unreadable}");
         }
 
         if (source.CredentialSetsLeftOutOfV21() is { Count: > 0 } owners)

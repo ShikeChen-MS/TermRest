@@ -22,6 +22,7 @@ internal sealed class TabPanel : View
 
     private readonly TabHeader _header;
     private readonly List<View> _pages = [];
+    private readonly List<View> _all = [];
     private readonly Dictionary<View, View> _lastFocused = [];
     private View? _value;
 
@@ -35,7 +36,7 @@ internal sealed class TabPanel : View
     /// <summary>Raised after another page was selected.</summary>
     public event EventHandler<ValueChangedEventArgs<View?>>? ValueChanged;
 
-    /// <summary>The pages, in tab order. A page's <see cref="View.Title"/> labels its tab.</summary>
+    /// <summary>The pages shown, in tab order (see <see cref="ShowOnly"/>). A page's <see cref="View.Title"/> labels its tab.</summary>
     public IReadOnlyList<View> Pages => _pages;
 
     /// <summary>Position of the selected page in <see cref="Pages"/> (-1 without pages).</summary>
@@ -66,12 +67,29 @@ internal sealed class TabPanel : View
                 }
             };
             _pages.Add(page);
+            _all.Add(page);
             Add(page);
         }
 
         if (_value is null && _pages.Count > 0)
         {
             Select(_pages[0], focusPage: false);
+        }
+
+        _header.SetNeedsDraw();
+    }
+
+    /// <summary>
+    /// Shows the tabs of <paramref name="pages"/> only, in their order of adding (null: all of them). When the selected
+    /// page is hidden, the first one shown is selected.
+    /// </summary>
+    public void ShowOnly(IReadOnlyCollection<View>? pages)
+    {
+        _pages.Clear();
+        _pages.AddRange(pages is null ? _all : _all.Where(pages.Contains));
+        if (_value is not null && !_pages.Contains(_value) && _pages.Count > 0)
+        {
+            Select(_pages[0], focusPage: _value.HasFocus);
         }
 
         _header.SetNeedsDraw();

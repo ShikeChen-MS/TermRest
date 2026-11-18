@@ -24,6 +24,7 @@
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestFiles.cs" Link="Infrastructure\Shared\TestFiles.cs" />
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TempDirectoryCleanup.cs" Link="Infrastructure\Shared\TempDirectoryCleanup.cs" />
     <Compile Include="..\TermRest.Core.Tests\Infrastructure\TestJavaScript.cs" Link="Infrastructure\Shared\TestJavaScript.cs" />
+    <Compile Include="..\TermRest.Core.Tests\Infrastructure\SignInProxy.cs" Link="Infrastructure\Shared\SignInProxy.cs" />
   </ItemGroup>
 
 </Project>

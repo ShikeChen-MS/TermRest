@@ -10,7 +10,8 @@ namespace TermRest.Cli.Tests.Infrastructure;
 /// must find its own dependencies). <c>/bytes</c> returns a binary body, <c>/octets</c> and <c>/protobuf</c> binary
 /// bodies without a NUL byte, <c>/xlsx</c> an Excel workbook, <c>/large</c> 1.5 MB of zeros, <c>/utf8</c>
 /// <see cref="Utf8Json"/>, <c>/token</c> a login (or OAuth 2.0 token) response with <see cref="Token"/>, <c>/auth</c> the
-/// request's Authorization header, <c>/wait</c> no response until the server stops (see <see cref="Waiting"/>); any
+/// request's Authorization header, <c>/wait</c> no response until the server stops (see <see cref="Waiting"/>),
+/// <c>/events</c> server-sent events, 30 ms apart (<c>?count=</c> of them, 3 by default; 0: until the client goes); any
 /// other path returns the request as JSON.
 /// </summary>
 internal sealed class TestServer : IAsyncDisposable
@@ -53,7 +54,7 @@ internal sealed class TestServer : IAsyncDisposable
     /// <summary>How many requests it received.</summary>
     public int Requests => Volatile.Read(ref _requests);
 
-    /// <summary>Completes when a request to <c>/wait</c> arrives.</summary>
+    /// <summary>Completes when a request to <c>/wait</c> arrives, or <c>/events</c> sent its first event.</summary>
     public Task Waiting => _waiting.Task;
 
     public static Task<TestServer> StartAsync() => Task.FromResult(new TestServer());
@@ -122,6 +123,21 @@ internal sealed class TestServer : IAsyncDisposable
                 {
                     _waiting.TrySetResult();
                     await Task.Delay(Timeout.Infinite, _stop.Token);
+                }
+
+                if (path == "/events")
+                {
+                    var query = requestLine[1].Contains("count=", StringComparison.Ordinal) ? requestLine[1].Split("count=")[1].Split('&')[0] : "3";
+                    var count = int.Parse(query, System.Globalization.CultureInfo.InvariantCulture);
+                    await stream.WriteAsync("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"u8.ToArray(), _stop.Token);
+                    for (var i = 1; count == 0 || i <= count; i++)
+                    {
+                        await stream.WriteAsync(Encoding.UTF8.GetBytes($"id: {i}\ndata: {{\"n\":{i}}}\n\n"), _stop.Token);
+                        _waiting.TrySetResult();
+                        await Task.Delay(30, _stop.Token);
+                    }
+
+                    return;
                 }
 
                 var (body, type) = path switch

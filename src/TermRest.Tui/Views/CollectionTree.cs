@@ -131,12 +131,24 @@ internal sealed class CollectionTree : View
 
     public void Select(object item)
     {
-        if (item is CollectionNode node)
+        // An example is under its request: the request's folders and the request open for it.
+        var node = item switch
+        {
+            CollectionNode collectionNode => collectionNode,
+            ExampleNode example => example.Request,
+            _ => null,
+        };
+        if (node is not null)
         {
             _tree.Expand(node.Collection);
             foreach (var ancestor in node.Ancestors().Reverse())
             {
                 _tree.Expand(ancestor is CollectionRootNode ? node.Collection : ancestor);
+            }
+
+            if (item is ExampleNode)
+            {
+                _tree.Expand(node);
             }
         }
 
@@ -160,16 +172,18 @@ internal sealed class CollectionTree : View
     {
         PostmanCollection collection => collection.RootNode.Children,
         FolderNode folder => folder.Children,
+        RequestNode request => request.Collection.GetExamples(request), // read when first expanded (a v3 collection's are files)
         _ => [],
     };
 
-    private static bool CanExpand(object item) => item is PostmanCollection or FolderNode;
+    private static bool CanExpand(object item) => item is PostmanCollection or FolderNode || (item is RequestNode request && request.Collection.HasExamples(request));
 
     private string Describe(object item) => Ui.Drawable(item switch
     {
         PostmanCollection collection => $"{(collection.IsDirty ? "● " : "")}{_workspace.DisplayName(collection)}",
         FolderNode folder => folder.Name,
         RequestNode request => $"{ShortMethod(request.Method),-4} {request.Name}",
+        ExampleNode example => $"e.g. {example.Name}",
         _ => item.ToString() ?? "",
     });
 

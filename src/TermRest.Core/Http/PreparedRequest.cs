@@ -309,7 +309,16 @@ public sealed class PreparedRequest
     /// <summary>Null/"system" = OS proxy, "none" = direct, otherwise a proxy URL.</summary>
     public string? Proxy { get; set; }
 
+    /// <summary>The proxy's user name and password (see <see cref="ExecutionDefaults.ProxyCredential"/>); never recorded.</summary>
+    public System.Net.NetworkCredential? ProxyCredential { get; set; }
+
     public long MaxResponseBytes { get; set; } = 50L * 1024 * 1024;
+
+    /// <summary>
+    /// Sees the response arrive when it streams (server-sent events, JSON lines), and can stop it, keeping what arrived; see
+    /// <see cref="IStreamWatcher"/>. Null: such a response is read whole, until the server ends it or the timeout stops it.
+    /// </summary>
+    public IStreamWatcher? StreamWatcher { get; set; }
 
     public List<string> Warnings { get; } = [];
 

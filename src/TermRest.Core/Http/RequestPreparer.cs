@@ -25,6 +25,12 @@ public sealed class ExecutionDefaults
 
     public string? Proxy { get; set; }
 
+    /// <summary>
+    /// The user name and password for the proxy (see <see cref="Proxy"/>): given on the command line, or kept for it in the
+    /// user's settings. Null: those in the proxy's URL, else the user's own sign-in (NTLM and Negotiate only).
+    /// </summary>
+    public System.Net.NetworkCredential? ProxyCredential { get; set; }
+
     public long MaxResponseBytes { get; set; } = 50L * 1024 * 1024;
 
     public string HttpVersion { get; set; } = "1.1";
@@ -39,7 +45,13 @@ public sealed class ExecutionDefaults
 }
 
 /// <summary>Turns an editable <see cref="HttpRequestSpec"/> into a <see cref="PreparedRequest"/>.</summary>
-public sealed class RequestPreparer(VariableResolver variables, ClientCertificateProvider? certificates, ExecutionDefaults defaults)
+/// <param name="settingsVariables">
+/// The variables of the workspace's own settings, such as a client certificate's <c>{{passphrase}}</c>: those of
+/// <paramref name="variables"/> by default. A request that a script sends replaces none of its own, but its certificates'
+/// passphrases are replaced as for any request.
+/// </param>
+public sealed class RequestPreparer(VariableResolver variables, ClientCertificateProvider? certificates, ExecutionDefaults defaults,
+    VariableResolver? settingsVariables = null)
 {
     private static readonly System.Security.Cryptography.X509Certificates.X509Certificate2Collection EmptyTrust = [];
 
@@ -184,6 +196,7 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
         prepared.UseCookies = !(spec.Settings.DisableCookies ?? false);
         prepared.Timeout = defaults.Timeout;
         prepared.Proxy = defaults.Proxy;
+        prepared.ProxyCredential = defaults.ProxyCredential;
         prepared.HttpVersion = defaults.HttpVersion;
         prepared.MaxResponseBytes = defaults.MaxResponseBytes;
         prepared.ExtraTrustedCertificates = LoadTrust(prepared.Warnings);
@@ -271,7 +284,7 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
             return Environment.GetEnvironmentVariable(value[4..]);
         }
 
-        return Variables.Resolve(value);
+        return (settingsVariables ?? Variables).Resolve(value);
     }
 
     /// <summary>

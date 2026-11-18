@@ -39,6 +39,7 @@ internal sealed class ResponseView : View
     private const int MinValueColumns = 10;
 
     private readonly Label _status;
+    private readonly Button _saveExample;
     private readonly TabPanel _tabs;
     private readonly View _bodyTab;
     private readonly TextArea _body;
@@ -50,6 +51,13 @@ internal sealed class ResponseView : View
     private readonly TextArea _timeline;
     private readonly TextArea _tls;
     private readonly TextArea _scripts;
+    private readonly View _eventsTab;
+    private readonly TableView _events;
+    private readonly View[] _regularTabs; // all but Events, which server-sent events have
+    private List<ServerSentEvent> _shownEvents = [];
+    private byte[] _eventsBody = [];
+    private int _eventsVersion; // events read in the background are shown only if no other response replaced them meanwhile
+    private ResponseSnapshot? _liveHead; // the head of the stream shown as it arrives
     private readonly View _filterRow;
     private readonly TextField _filterField;
     private readonly Label _filterStatus;
@@ -73,7 +81,11 @@ internal sealed class ResponseView : View
         Width = Dim.Fill();
         Height = Dim.Fill();
 
-        _status = new Label { HotKeySpecifier = Ui.NoHotKey, X = 0, Y = 0, Width = Dim.Fill(), Text = "No response yet. Press F5 (or Enter in the URL bar) to send." };
+        _status = new Label { HotKeySpecifier = Ui.NoHotKey, X = 0, Y = 0, Width = Dim.Fill(17), Text = "No response yet. Press F5 (or Enter in the URL bar) to send." };
+
+        // Saves the response shown as an example of its request (Postman's Save Response › Save as example).
+        _saveExample = new Button { Text = "Save as example", X = Pos.AnchorEnd(15), Y = 0, NoDecorations = true, ShadowStyle = null, Visible = false };
+        _saveExample.Accepted += (_, _) => SaveAsExampleRequested?.Invoke(this, EventArgs.Empty);
 
         _tabs = new TabPanel { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill() };
 
@@ -136,7 +148,20 @@ internal sealed class ResponseView : View
         _scripts = new TextArea { ReadOnly = true };
         scriptsTab.Add(_scripts);
 
-        _tabs.AddTabs(_bodyTab, headersTab, timelineTab, tlsTab, scriptsTab);
+        // Server-sent events, one a row, once the stream ends; Enter or a double-click shows an event's data in full.
+        _eventsTab = new View { Title = "Events", Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = true };
+        _events = new TableView { Width = Dim.Fill(), Height = Dim.Fill(), FullRowSelect = true };
+        _events.Style.ExpandLastColumn = true;
+        _events.Style.GetOrCreateColumnStyle(3);
+        _events.FrameChanged += (_, _) => FitDataColumn();
+        _events.Accepted += (_, _) => ShowSelectedEvent();
+        _events.KeyBindings.Remove(Key.N.WithCtrl);
+        _events.KeyBindings.Remove(Key.P.WithCtrl);
+        _eventsTab.Add(_events);
+
+        _tabs.AddTabs(_bodyTab, _eventsTab, headersTab, timelineTab, tlsTab, scriptsTab);
+        _regularTabs = [_bodyTab, headersTab, timelineTab, tlsTab, scriptsTab];
+        _tabs.ShowOnly(_regularTabs);
 
         // Find (Ctrl+F): in the text of the tab shown.
         _findBar = new View { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = true, Visible = false };
@@ -181,7 +206,7 @@ internal sealed class ResponseView : View
             };
         }
 
-        Add(_status, _tabs, _findBar);
+        Add(_status, _saveExample, _tabs, _findBar);
         SetHeaders([]);
         _scripts.SetText(NoScripts);
     }
@@ -196,6 +221,12 @@ internal sealed class ResponseView : View
 
     /// <summary>Raised with short user-facing notices (copied, saved, …).</summary>
     public event EventHandler<string>? Notice;
+
+    /// <summary>Save as example was pressed (shown while a response is).</summary>
+    public event EventHandler? SaveAsExampleRequested;
+
+    /// <summary>Whether Save as example is offered (for tests).</summary>
+    internal bool OffersSaveAsExample => _saveExample.Visible;
 
     public HttpExchange? Exchange => _exchange;
 
@@ -226,6 +257,7 @@ internal sealed class ResponseView : View
     {
         _exchange = null;
         _fromHistory = false;
+        _saveExample.Visible = false;
         _status.Text = "No response yet. Press F5 (or Enter in the URL bar) to send.";
         _status.SchemeName = null;
         ShowBody("");
@@ -234,6 +266,7 @@ internal sealed class ResponseView : View
         _tls.SetText("");
         _scripts.SetText(NoScripts);
         SetHeaders([]);
+        ShowEvents(null);
     }
 
     /// <summary>Pre-request scripts are running: the request is not prepared yet.</summary>
@@ -244,13 +277,41 @@ internal sealed class ResponseView : View
     {
         _status.Text = text;
         _status.SchemeName = null;
+        _saveExample.Visible = false;
     }
 
     public void ShowSending(PreparedRequest request)
     {
         _status.Text = $"Sending {request.Method} {request.Url} …  (Esc or Send to cancel)";
         _status.SchemeName = null;
+        _saveExample.Visible = false;
         _timeline.SetText(DescribeRequest(request, null));
+    }
+
+    /// <summary>
+    /// Shows a response that streams while it arrives (see <see cref="LiveResponse"/>): its status, its headers, and the end of
+    /// its text, followed as it grows. <paramref name="ended"/>: its body has been read, and scripts may still run on it. Once
+    /// the request is done, <see cref="ShowExchange"/> shows it whole, with its events.
+    /// </summary>
+    public void ShowLive(ResponseSnapshot head, long received, string text, bool cut, bool ended = false)
+    {
+        _exchange = null; // Copy, Save and Filter wait for the whole response
+        _fromHistory = false;
+        _saveExample.Visible = false;
+        _status.Text = ended
+            ? $"{head.StatusCode} {head.ReasonPhrase} · {HttpExchange.FormatSize(received)} received …  (Esc or Send to cancel)"
+            : $"{head.StatusCode} {head.ReasonPhrase} · streaming · {HttpExchange.FormatSize(received)} so far · Esc stops it";
+        _status.SchemeName = null;
+        if (!ReferenceEquals(_liveHead, head))
+        {
+            _liveHead = head;
+            SetHeaders(head.Headers);
+            ShowEvents(null);
+            SetFilterStatus("", error: false);
+        }
+
+        ShowBody(cut ? $"… {HttpExchange.FormatSize(received)} so far: the end is shown until the stream ends\n{text}" : text);
+        _body.MoveEnd();
     }
 
     /// <param name="fromHistory">
@@ -262,8 +323,10 @@ internal sealed class ResponseView : View
         // A response shown again (a request that could not be sent puts back the one shown before it) keeps where it came from.
         _fromHistory = fromHistory || (_fromHistory && ReferenceEquals(exchange, _exchange));
         _exchange = exchange;
+        _liveHead = null;
         var response = exchange.Response;
         var scripts = exchange.Scripts;
+        _saveExample.Visible = response is not null;
         if (response is null)
         {
             _status.Text = exchange.Cancelled ? "Request cancelled." : $"Error: {exchange.ErrorMessage}";
@@ -273,16 +336,18 @@ internal sealed class ResponseView : View
             ShowBody(exchange.Cancelled ? "" : scripts?.Error is not null ? ShownScripts($"{exchange.ErrorMessage}\n\n{scripts.Describe()}") : exchange.ErrorMessage ?? "");
             SetFilterStatus(_filter is null ? "" : "No response to filter.", error: false);
             SetHeaders([]);
+            ShowEvents(null);
         }
         else
         {
             var http = $"HTTP/{response.Version.Major}{(response.Version.Major < 2 ? "." + response.Version.Minor : "")}";
             var warnings = exchange.Request.Warnings.Count > 0 ? $" · ⚠ {exchange.Request.Warnings.Count} warning(s), see Timeline" : "";
             var tests = scripts?.Summary is { Length: > 0 } summary ? $" · {summary}" : "";
+            var stopped = response.Stopped ? " · stream stopped" : "";
 
             // The history may keep only the start of the body: its entry has the size received.
             var size = (_fromHistory ? exchange.HistoryEntry?.Size : null) ?? response.Body.LongLength;
-            _status.Text = $"{response.StatusCode} {response.ReasonPhrase} · {HttpExchange.Format(exchange.Timing.Total)} · {HttpExchange.FormatSize(size)} · {http}{tests}{warnings}";
+            _status.Text = $"{response.StatusCode} {response.ReasonPhrase} · {HttpExchange.Format(exchange.Timing.Total)} · {HttpExchange.FormatSize(size)} · {http}{stopped}{tests}{warnings}";
             _status.SchemeName = response.StatusCode switch
             {
                 >= 500 => "Error",
@@ -292,6 +357,7 @@ internal sealed class ResponseView : View
             };
             SetHeaders(response.Headers);
             RenderBody();
+            ShowEvents(BodyNotKept ? null : response);
         }
 
         _scripts.SetText(_fromHistory ? "Script results are not kept in the history." : scripts is null ? NoScripts : ShownScripts(scripts.Describe()));
@@ -609,6 +675,124 @@ internal sealed class ResponseView : View
         if (dialog.Result == 1)
         {
             Notify(Ui.CopyToClipboard(App, value) ? $"The value of {name} copied to the clipboard." : "Clipboard is not available in this terminal.");
+        }
+    }
+
+    /// <summary>
+    /// The Events tab: shown for server-sent events, with the events read from the body (a large one in the background, the
+    /// tab saying so meanwhile); hidden for other responses (<paramref name="response"/> null: none).
+    /// </summary>
+    private void ShowEvents(ResponseSnapshot? response)
+    {
+        var version = ++_eventsVersion;
+        if (response is null || !ResponseStreams.IsEventStream(response.ContentType))
+        {
+            SetEvents([], []);
+            _tabs.ShowOnly(_regularTabs);
+            return;
+        }
+
+        _tabs.ShowOnly(null);
+        var body = response.Body;
+        if (App is not { } app || body.Length < BackgroundSize)
+        {
+            SetEvents(ServerSentEvents.Parse(body), body);
+            return;
+        }
+
+        SetEvents([], []);
+        _eventsTab.Title = "Events (reading)";
+        _ = Task.Run(() => ServerSentEvents.Parse(body)).ContinueWith(
+            task => app.AddTimeout(TimeSpan.Zero, () =>
+            {
+                if (version == _eventsVersion && !_disposed && task.IsCompletedSuccessfully)
+                {
+                    SetEvents(task.Result, body);
+                }
+
+                return false;
+            }),
+            TaskScheduler.Default);
+    }
+
+    private void SetEvents(List<ServerSentEvent> events, byte[] body)
+    {
+        (_shownEvents, _eventsBody) = (events, body);
+        _eventsTab.Title = events.Count == 0 ? "Events" : $"Events ({events.Count.ToString("N0", CultureInfo.InvariantCulture)})";
+        _events.Table = new EventRows(this);
+        FitDataColumn();
+        _events.Update();
+        _tabs.SetNeedsDraw();
+    }
+
+    /// <summary>The events as the Events tab's rows, each cell read when it is drawn: no copy of a long stream's events.</summary>
+    private sealed class EventRows(ResponseView view) : ITableSource
+    {
+        public string[] ColumnNames { get; } = ["#", "Event", "Id", "Data"];
+
+        public int Columns => ColumnNames.Length;
+
+        public int Rows => view._shownEvents.Count;
+
+        public object this[int row, int col] => col switch
+        {
+            0 => row + 1,
+            1 => view._shownEvents[row].Type,
+            2 => view._shownEvents[row].Id(view._eventsBody) ?? "",
+            _ => view.EventPreview(row),
+        };
+    }
+
+    /// <summary>The start of an event's data, on one line: a table cell (read from the body when it is drawn).</summary>
+    private string EventPreview(int index)
+    {
+        if (index >= _shownEvents.Count)
+        {
+            return "";
+        }
+
+        var data = _shownEvents[index].Data(_eventsBody, maxBytes: 1024);
+        var line = data.AsSpan(0, data.IndexOfAny('\r', '\n') is >= 0 and var end ? end : data.Length);
+        return line.Length > 200 || line.Length < data.Length ? string.Concat(line[..Math.Min(line.Length, 200)], "…") : data;
+    }
+
+    /// <summary>Keeps the Data column within the pane, as <see cref="FitValueColumn"/> does the headers' values.</summary>
+    private void FitDataColumn()
+    {
+        var others = Math.Min(_events.MaxCellWidth, 30) + 12;
+        var width = Math.Max(MinValueColumns, _events.Viewport.Width - others);
+        var style = _events.Style.GetOrCreateColumnStyle(3);
+        if (style.MaxWidth != width)
+        {
+            style.MaxWidth = width;
+            _events.Update();
+        }
+    }
+
+    /// <summary>The selected event's data in full (Enter or a double-click), JSON pretty-printed, to read, select or copy.</summary>
+    private void ShowSelectedEvent()
+    {
+        if (App is null || _events.Value is not { } selection || selection.SelectedCell.Y < 0 || selection.SelectedCell.Y >= _shownEvents.Count)
+        {
+            return;
+        }
+
+        var shown = _shownEvents[selection.SelectedCell.Y];
+        var data = shown.Data(_eventsBody);
+        var start = data.AsSpan().TrimStart();
+        var text = start.StartsWith('{') || start.StartsWith('[') ? BodyFormatter.Format(Encoding.UTF8.GetBytes(data), "application/json", pretty: true) : data;
+        var title = $"Event {selection.SelectedCell.Y + 1}: {shown.Type}{(shown.Id(_eventsBody) is { Length: > 0 } id ? $" (id {id})" : "")}";
+        using var dialog = new Dialog { HotKeySpecifier = Ui.NoHotKey, Title = title, Width = Dim.Percent(80), Height = Dim.Percent(60) };
+        var area = new TextArea { X = 1, Y = 1, Width = Dim.Fill(1), Height = Dim.Fill(), ReadOnly = true, WordWrap = true };
+        area.SyntaxLanguage = ReferenceEquals(text, data) ? null : "json";
+        area.SetText(text);
+        dialog.Add(area);
+        dialog.AddButton(new Button { Text = "Close" });
+        dialog.AddButton(new Button { Text = "Copy" });
+        App.Run(dialog);
+        if (dialog.Result == 1)
+        {
+            Notify(Ui.CopyToClipboard(App, data) ? "The event's data copied to the clipboard." : "Clipboard is not available in this terminal.");
         }
     }
 

@@ -33,6 +33,35 @@ public sealed partial class RequestRunner : IDisposable
     /// <summary>Highest-precedence variables (CLI <c>--var</c>, values captured during a run).</summary>
     public Dictionary<string, string> LocalVariables { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// The data of the run's current iteration (a row of its data file, see <see cref="IterationDataFile"/>): data variables,
+    /// below this request's variables and above the environment's, as in Postman. Scripts get its values with their JSON
+    /// types (<c>pm.iterationData</c>); requests get them as text (numbers and true as written, objects as JSON). Null: none.
+    /// </summary>
+    public System.Text.Json.Nodes.JsonObject? IterationData
+    {
+        get => _iterationData;
+        set
+        {
+            _iterationData = value;
+            _iterationText = value?.ToDictionary(p => p.Key, p => p.Value switch
+            {
+                null => "null",
+                System.Text.Json.Nodes.JsonValue text when text.TryGetValue<string>(out var s) => s,
+                var other => other.ToJsonString(),
+            }, StringComparer.Ordinal);
+        }
+    }
+
+    /// <summary>The run's current iteration, from 0 (<c>pm.info.iteration</c>).</summary>
+    public int Iteration { get; set; }
+
+    /// <summary>The number of iterations of the run (<c>pm.info.iterationCount</c>).</summary>
+    public int IterationCount { get; set; } = 1;
+
+    private System.Text.Json.Nodes.JsonObject? _iterationData;
+    private Dictionary<string, string>? _iterationText;
+
     /// <summary>Overrides the workspace's active environment (e.g. CLI <c>--env file.json</c>).</summary>
     public PostmanEnvironment? EnvironmentOverride { get; set; }
 
@@ -51,12 +80,21 @@ public sealed partial class RequestRunner : IDisposable
     /// <summary>
     /// The proxy URL of the workspace's settings while it is not the <see cref="AllowedProxy"/>: requests use the system's
     /// proxy settings then (the OS's, <c>HTTPS_PROXY</c>), as without a proxy setting. Null when the settings name no proxy
-    /// URL ("system", "none") or the one allowed.
+    /// URL ("system", "none") or the one allowed, and while <see cref="ProxyOverride"/> replaces it.
     /// </summary>
     public string? BlockedProxy =>
-        Workspace.Settings.Proxy is var proxy && WorkspaceSettings.IsProxyUrl(proxy) && !string.Equals(proxy.Trim(), AllowedProxy?.Trim(), StringComparison.Ordinal)
+        ProxyOverride is null && Workspace.Settings.Proxy is var proxy && WorkspaceSettings.IsProxyUrl(proxy) && !string.Equals(proxy.Trim(), AllowedProxy?.Trim(), StringComparison.Ordinal)
             ? proxy
             : null;
+
+    /// <summary>The proxy for every request in place of the workspace's (CLI <c>--proxy</c>: a URL, "system" or "none"); typed by the user, so used as it is.</summary>
+    public string? ProxyOverride { get; set; }
+
+    /// <summary>The proxy's user name and password for every request (CLI <c>--proxy-user</c>), in place of those kept for it.</summary>
+    public System.Net.NetworkCredential? ProxyCredentialOverride { get; set; }
+
+    /// <summary>The user names and passwords the user keeps for proxies (read by <see cref="ConfigureProxy"/>).</summary>
+    public ProxyCredentialStore ProxyCredentials { get; set; } = ProxyCredentialStore.Empty();
 
     /// <summary>
     /// Whether requests may send body and form-data files from outside the workspace folder, and open client certificates and
@@ -107,13 +145,15 @@ public sealed partial class RequestRunner : IDisposable
 
     /// <summary>
     /// Sets <see cref="AllowedProxy"/> to the proxy URL of the workspace's settings when the user's settings allow it for
-    /// this workspace folder (<see cref="UserSettings.IsProxyAllowed"/>), else to none.
+    /// this workspace folder (<see cref="UserSettings.IsProxyAllowed"/>), else to none, and reads the user names and
+    /// passwords the user keeps for proxies (<see cref="ProxyCredentials"/>).
     /// </summary>
     /// <param name="userSettingsDirectory">Overrides the user's configuration folder (tests, portable setups).</param>
     public void ConfigureProxy(string? userSettingsDirectory = null)
     {
         var proxy = Workspace.Settings.Proxy;
         AllowedProxy = WorkspaceSettings.IsProxyUrl(proxy) && UserSettings.Load(userSettingsDirectory).IsProxyAllowed(Workspace.RootPath, proxy) ? proxy : null;
+        ProxyCredentials = ProxyCredentialStore.Load(userSettingsDirectory);
     }
 
     /// <summary>Sets <see cref="OutsideFilesAllowed"/> as the user's settings say for this workspace folder.</summary>
@@ -134,6 +174,11 @@ public sealed partial class RequestRunner : IDisposable
         if (LocalVariables.Count > 0 || requestVariables is { Count: > 0 })
         {
             scopes.Add(new OverlayScope(new DictionaryScope("local", LocalVariables), requestVariables));
+        }
+
+        if (_iterationText is { Count: > 0 } data)
+        {
+            scopes.Add(new DictionaryScope($"data (iteration {Iteration + 1})", data));
         }
 
         if (environment is not null)
@@ -158,6 +203,10 @@ public sealed partial class RequestRunner : IDisposable
     {
         var settings = Workspace.Settings;
         var timeoutMs = TimeoutOverrideMs ?? settings.TimeoutMs;
+
+        // One not allowed: the system's proxy settings, as without one. Trimmed, as requests use it: recordings then find the
+        // password of a URL written with a space before it.
+        var proxy = ProxyOverride?.Trim() ?? (BlockedProxy is null ? settings.Proxy?.Trim() : null);
         return new ExecutionDefaults
         {
             StrictSsl = StrictSslOverride ?? settings.StrictSsl,
@@ -165,9 +214,8 @@ public sealed partial class RequestRunner : IDisposable
             Timeout = timeoutMs > 0 ? TimeSpan.FromMilliseconds(timeoutMs) : null,
             FollowRedirects = settings.FollowRedirects,
             MaxRedirects = settings.MaxRedirects,
-            // One not allowed: the system's proxy settings, as without one. Trimmed, as requests use it: recordings then find
-            // the password of a URL written with a space before it.
-            Proxy = BlockedProxy is null ? settings.Proxy?.Trim() : null,
+            Proxy = proxy,
+            ProxyCredential = ProxyCredentialOverride ?? ProxyCredentials.Find(proxy),
             MaxResponseBytes = Math.Max(1, settings.MaxResponseSizeMb) * 1024L * 1024L,
             HttpVersion = settings.HttpVersion,
             FilesFolder = FilesFolder,
@@ -365,6 +413,11 @@ public sealed partial class RequestRunner : IDisposable
             .Where(e => e.Enabled)
             .Select(e => new KeyValuePair<string, string?>(e.Key, e.Value));
         variables = variables.Concat(LocalVariables.Select(v => new KeyValuePair<string, string?>(v.Key, v.Value)));
+        if (_iterationText is { Count: > 0 } data)
+        {
+            variables = variables.Concat(data.Select(v => new KeyValuePair<string, string?>(v.Key, v.Value))); // a data file's apiToken column
+        }
+
         IEnumerable<IReadOnlyDictionary<string, string?>?> setByScripts =
             [environment is not null ? Session.Find(environment) : null, Session.Find(collection), Session.Globals, requestVariables];
         variables = variables.Concat(setByScripts.SelectMany(values => values ?? new Dictionary<string, string?>()));

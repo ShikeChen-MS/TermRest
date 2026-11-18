@@ -1,6 +1,8 @@
+using System.Buffers;
 using System.CommandLine;
 using System.Text;
 using TermRest.Core.Http;
+using TermRest.Core.IO;
 using TermRest.Core.Json;
 using TermRest.Core.Postman;
 
@@ -125,13 +127,23 @@ internal static class SendCommand
             }
 
             var printed = 0;
-            var exchange = await runner.SendAsync(match.Collection, match.Node, spec, prepared =>
+            HttpExchange exchange;
+            bool streamed;
+
+            // A response that streams is printed as it arrives, unless it goes to a file or a filter; Ctrl+C stops it.
+            using (var stream = new ConsoleStream(print: query is null && parseResult.GetValue(output) is null, parseResult.GetValue(include)))
             {
-                PrintWarnings(prepared);
-                printed = prepared.Warnings.Count;
-            }, cancellationToken);
+                exchange = await runner.SendAsync(match.Collection, match.Node, spec, prepared =>
+                {
+                    PrintWarnings(prepared);
+                    printed = prepared.Warnings.Count;
+                    prepared.StreamWatcher = stream;
+                }, cancellationToken);
+                streamed = stream.Printed;
+            }
+
             var recorded = options.SaveRecording(parseResult, runner, recorder, cancellationToken.IsCancellationRequested);
-            var code = await ReportAsync(parseResult, exchange, query, verbose, include, output, raw, fail, cancellationToken);
+            var code = await ReportAsync(parseResult, exchange, query, verbose, include, output, raw, fail, streamed, cancellationToken);
 
             // Those raised while it was sent: a redirect not followed, a header left out, a body cut short …
             PrintWarnings(exchange.Request, printed);
@@ -185,9 +197,10 @@ internal static class SendCommand
         return [];
     }
 
+    /// <param name="streamed">The body went to standard output as it arrived (a response that streams; see <see cref="ConsoleStream"/>).</param>
     private static async Task<int> ReportAsync(
         ParseResult parseResult, HttpExchange exchange, JsonPath? query, Option<bool> verbose, Option<bool> include, Option<string?> output, Option<bool> raw,
-        Option<bool> fail, CancellationToken cancellationToken)
+        Option<bool> fail, bool streamed, CancellationToken cancellationToken)
     {
         if (parseResult.GetValue(verbose))
         {
@@ -201,7 +214,7 @@ internal static class SendCommand
         }
 
         Output.Status($"{response.StatusCode} {response.ReasonPhrase} · {HttpExchange.Format(exchange.Timing.Total)} · {HttpExchange.FormatSize(response.Body.LongLength)}", response.StatusCode < 400);
-        if (parseResult.GetValue(include))
+        if (parseResult.GetValue(include) && !streamed)
         {
             Console.Out.WriteLine($"HTTP/{response.Version} {response.StatusCode} {response.ReasonPhrase}");
             foreach (var (key, value) in response.Headers)
@@ -232,6 +245,10 @@ internal static class SendCommand
             }
 
             Output.Info($"Saved {HttpExchange.FormatSize(response.Body.LongLength)} to {file}");
+        }
+        else if (streamed)
+        {
+            // printed as it arrived
         }
         else if (Console.IsOutputRedirected
                      ? parseResult.GetValue(raw) || BodyFormatter.IsBinary(response.Body, response.ContentType)
@@ -317,6 +334,130 @@ internal static class SendCommand
             foreach (var line in tls.Describe().Split('\n'))
             {
                 Output.Info("* " + line);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A response that streams (server-sent events, JSON lines): its body printed to standard output as it arrives (with -i,
+    /// after its headers), unless <c>print</c> is off (-o, --filter: they get it whole). The first Ctrl+C stops it, keeping
+    /// what arrived, which is then reported as the response; once its body is read, Ctrl+C cancels as before (the scripts
+    /// that run on it). A console gets it as text, as the rest of the output; a pipe or file the bytes as they are, and a pipe
+    /// whose reader went (| head -n 5) stops it, as nothing reads it any more.
+    /// </summary>
+    private sealed class ConsoleStream(bool print, bool include) : IStreamWatcher, IDisposable
+    {
+        private readonly CancellationTokenSource _stop = new();
+        private Stream? _stdout;
+        private Decoder? _text; // a console: UTF-8 parts as text (a character split between two parts too), as Console.Out writes text
+
+        public CancellationToken Stopping => _stop.Token;
+
+        /// <summary>Whether the body went to standard output as it arrived.</summary>
+        public bool Printed { get; private set; }
+
+        public void Started(ResponseSnapshot head)
+        {
+            CliApp.Interrupt = Stop;
+            Output.Info($"{head.StatusCode} {head.ReasonPhrase} · streaming (Ctrl+C stops it, keeping what arrived)");
+            if (!print)
+            {
+                return;
+            }
+
+            if (include)
+            {
+                Console.Out.WriteLine($"HTTP/{head.Version} {head.StatusCode} {head.ReasonPhrase}");
+                foreach (var (key, value) in head.Headers)
+                {
+                    Console.Out.WriteLine($"{key}: {value}");
+                }
+
+                Console.Out.WriteLine();
+                Console.Out.Flush();
+            }
+
+            if (Console.IsOutputRedirected)
+            {
+                _stdout = StandardOutput.OpenPipe() ?? Console.OpenStandardOutput();
+            }
+            else
+            {
+                _text = Encoding.UTF8.GetDecoder();
+            }
+
+            Printed = true;
+        }
+
+        public void Received(ReadOnlySpan<byte> data)
+        {
+            if (data.IsEmpty)
+            {
+                return;
+            }
+
+            try
+            {
+                if (_text is not null)
+                {
+                    Write(data, flush: false);
+                }
+                else if (_stdout is not null)
+                {
+                    _stdout.Write(data);
+                    _stdout.Flush();
+                }
+            }
+            catch (IOException)
+            {
+                // What reads the output went: the stream is stopped, as nothing reads it any more.
+                (_stdout, _text) = (null, null);
+                Stop();
+            }
+        }
+
+        public void Ended()
+        {
+            CliApp.Interrupt = null;
+            if (_text is not null)
+            {
+                Write([], flush: true); // the end of a character the stream did not finish
+                _text = null;
+            }
+        }
+
+        /// <summary>The request ended: Ctrl+C stops the command again.</summary>
+        public void Dispose()
+        {
+            CliApp.Interrupt = null;
+            _stdout?.Dispose();
+            _stop.Dispose();
+        }
+
+        private void Write(ReadOnlySpan<byte> data, bool flush)
+        {
+            var chars = ArrayPool<char>.Shared.Rent(Math.Max(1, Encoding.UTF8.GetMaxCharCount(data.Length)));
+            try
+            {
+                var count = _text!.GetChars(data, chars, flush);
+                Console.Out.Write(chars, 0, count);
+                Console.Out.Flush();
+            }
+            finally
+            {
+                ArrayPool<char>.Shared.Return(chars);
+            }
+        }
+
+        private void Stop()
+        {
+            try
+            {
+                _stop.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // it ended meanwhile
             }
         }
     }

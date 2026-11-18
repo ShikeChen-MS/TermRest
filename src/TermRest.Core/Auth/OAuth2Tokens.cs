@@ -508,6 +508,7 @@ public sealed class OAuth2Tokens
             UseCookies = false,
             Timeout = defaults.Timeout ?? DefaultTimeout,
             Proxy = defaults.Proxy,
+            ProxyCredential = defaults.ProxyCredential,
             HttpVersion = defaults.HttpVersion,
             MaxResponseBytes = Math.Min(defaults.MaxResponseBytes, 1024 * 1024),
         };

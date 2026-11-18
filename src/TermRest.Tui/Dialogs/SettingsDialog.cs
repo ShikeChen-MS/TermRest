@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using Terminal.Gui.App;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
@@ -64,6 +65,17 @@ internal static class SettingsDialog
 
         dialog.Add(proxyHint);
         y += 1;
+
+        // Kept for the proxy in the user's private credentials file, never in the workspace; a password left masked stays. The
+        // file is read now, as it is the user's, for every workspace: another TermRest may have saved to it since this one started.
+        const string keptPassword = "********";
+        var originalProxy = settings.Proxy;
+        var onDisk = ProxyCredentialStore.Load(userDirectory);
+        var (keptUser, hasPassword) = (onDisk.LoadError is null ? onDisk : runner.ProxyCredentials).Describe(settings.Proxy);
+        var proxyUser = Ui.AddRow(dialog, "Proxy sign-in", new TextField { Text = keptUser, Width = 22 }, y, 22);
+        var proxyPassword = new TextField { X = Pos.Right(proxyUser) + 11, Y = y, Width = 16, Secret = true, Text = hasPassword ? keptPassword : "" };
+        dialog.Add(new Label { Text = "password", X = Pos.Right(proxyUser) + 2, Y = y }, proxyPassword);
+        y += 1;
         var http = Ui.AddRow(dialog, "HTTP version", new OptionSelector { Labels = ["HTTP/1.1", "HTTP/2 (when supported)"], Orientation = Orientation.Horizontal, Value = settings.HttpVersion == "2" ? 1 : 0 }, y, 22);
         y += 1;
         var maxSize = Ui.AddRow(dialog, "Max response (MB)", new TextField { Text = settings.MaxResponseSizeMb.ToString(CultureInfo.InvariantCulture), Width = 8 }, y, 22);
@@ -104,7 +116,7 @@ internal static class SettingsDialog
         var redact = Ui.AddRow(dialog, "Recordings redact", new TextField { Text = string.Join(", ", settings.RecordingRedact ?? []) }, y, 22);
         y += 1;
         dialog.Add(Ui.Hint("Extra header, parameter and field names, comma-separated (credentials, cookies and tokens always are).", 24, y));
-        y += 2;
+        y += 1; // no blank line before the last row: with the proxy sign-in, the dialog still fits a terminal of 30 rows
         var outsideFiles = Ui.AddRow(dialog, "Outside files", new CheckBox
         {
             Text = "Allow files from outside this folder",
@@ -172,6 +184,34 @@ internal static class SettingsDialog
             settings.RecordingRedact = names.Count == 0 ? null : names;
             saved = Ui.TrySave(app, workspace.SaveSettings); // applied for this session either way
             saved &= SaveApprovals(app, workspace, runner, outsideFiles.Value == CheckState.Checked, userDirectory);
+
+            // The sign-in goes with the proxy the settings now name (the system's, or a URL), for this session and in the
+            // user's credentials file, read again first (another TermRest may have saved to it meanwhile): when it was
+            // edited, or when the proxy changed and one was shown, which moves to it (its password left masked too).
+            // Otherwise the file's stay as they are. A file that cannot be read is not saved over: the sign-in then applies
+            // to this session only, and saving it says why.
+            var fresh = ProxyCredentialStore.Load(userDirectory);
+            var credentials = fresh.LoadError is null ? fresh : runner.ProxyCredentials;
+            var edited = proxyUser.Text.Trim() != keptUser || proxyPassword.Text != (hasPassword ? keptPassword : "");
+            var moved = keptUser.Length > 0 && ProxyCredentialStore.KeyOf(settings.Proxy) != ProxyCredentialStore.KeyOf(originalProxy);
+            if (edited || moved)
+            {
+                var password = proxyPassword.Text == keptPassword && hasPassword ? null : proxyPassword.Text;
+                try
+                {
+                    if (credentials.Set(settings.Proxy, proxyUser.Text, password, keptFrom: originalProxy ?? ProxyCredentialStore.SystemProxy))
+                    {
+                        saved &= Ui.TrySave(app, () => fresh.Save(userDirectory));
+                    }
+                }
+                catch (CryptographicException ex)
+                {
+                    Ui.Error(app, "Proxy sign-in", $"The password could not be encrypted for your account, so the sign-in was not kept: {ex.Message}");
+                    saved = false;
+                }
+            }
+
+            runner.ProxyCredentials = credentials;
             return true;
         }
     }
