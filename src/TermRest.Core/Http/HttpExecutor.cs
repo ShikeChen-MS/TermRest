@@ -133,6 +133,11 @@ public sealed class HttpExecutor
             }
 
             headersAt = clock.Elapsed;
+            if (response.StatusCode == HttpStatusCode.ProxyAuthenticationRequired)
+            {
+                request.Warnings.Add(ProxySignInHint);
+            }
+
             var (body, truncated, received, warning) = await ReadBodyAsync(response, request.MaxResponseBytes, linked.Token).ConfigureAwait(false);
             exchange.Response = Snapshot(response, body, truncated, received);
             if (warning is not null)
@@ -216,13 +221,22 @@ public sealed class HttpExecutor
             case null or "" or "system":
                 handler.UseProxy = true;
                 capture.Proxy = HttpClient.DefaultProxy; // the one the handler uses
+
+                // Its sign-in: the user name and password given for it, else the user's own, which .NET sends only to an NTLM or
+                // Negotiate (Kerberos) challenge, never to a Basic or Digest one. A proxy HTTPS_PROXY names with a user and
+                // password signs in with those.
+                handler.DefaultProxyCredentials = request.ProxyCredential ?? CredentialCache.DefaultCredentials;
                 break;
             case "none":
                 handler.UseProxy = false;
                 break;
             default:
                 handler.UseProxy = true;
-                handler.Proxy = capture.Proxy = new WebProxy(request.Proxy!.Trim());
+                var proxy = request.Proxy!.Trim();
+                handler.Proxy = capture.Proxy = new WebProxy(proxy)
+                {
+                    Credentials = request.ProxyCredential ?? CredentialsInUrl(proxy) ?? CredentialCache.DefaultCredentials,
+                };
                 break;
         }
 
@@ -263,6 +277,27 @@ public sealed class HttpExecutor
         handler.SslOptions = options;
         return handler;
     }
+
+    /// <summary>
+    /// The user name and password in a proxy's URL (<c>http://user:password@host:port</c>), as curl and <c>HTTPS_PROXY</c>
+    /// take them: percent-escapes decoded, a user name with a domain (<c>CONTOSO%5Cada</c>) for NTLM. Null without one.
+    /// </summary>
+    internal static NetworkCredential? CredentialsInUrl(string proxy)
+    {
+        if (!Uri.TryCreate(proxy, UriKind.Absolute, out var uri) || uri.UserInfo.Length == 0)
+        {
+            return null;
+        }
+
+        var colon = uri.UserInfo.IndexOf(':', StringComparison.Ordinal);
+        var user = Uri.UnescapeDataString(colon < 0 ? uri.UserInfo : uri.UserInfo[..colon]);
+        return Workspace.ProxyCredentialStore.Credential(user, colon < 0 ? "" : Uri.UnescapeDataString(uri.UserInfo[(colon + 1)..]));
+    }
+
+    /// <summary>What a 407 from the proxy means, and how to give it a user name and password.</summary>
+    internal const string ProxySignInHint =
+        "The proxy asks for a user name and password (407 Proxy Authentication Required), or did not accept those it got: give them in " +
+        "Tools › Settings (Proxy sign-in), with --proxy-user, or in the proxy's URL (http://user:password@host:port).";
 
     /// <summary>
     /// SChannel sends the chain it builds from the certificate stores. Creating a context adds the chain's CA certificates
@@ -670,6 +705,18 @@ public sealed class HttpExecutor
         }
 
         summary = MaskUrlPasswords(summary);
+
+        // A tunnel (https through the proxy) that the proxy refused with 407: what it wants.
+        for (var e = ex; e is not null; e = e.InnerException)
+        {
+            if (e is HttpRequestException { StatusCode: HttpStatusCode.ProxyAuthenticationRequired }
+                || (e is HttpRequestException { HttpRequestError: HttpRequestError.ProxyTunnelError } && e.Message.Contains("'407'", StringComparison.Ordinal)))
+            {
+                summary += $". {ProxySignInHint}";
+                break;
+            }
+        }
+
         return ex is HttpRequestException { HttpRequestError: not HttpRequestError.Unknown } hre ? $"{hre.HttpRequestError}: {summary}" : summary;
     }
 

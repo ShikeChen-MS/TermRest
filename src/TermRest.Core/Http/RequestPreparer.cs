@@ -25,6 +25,12 @@ public sealed class ExecutionDefaults
 
     public string? Proxy { get; set; }
 
+    /// <summary>
+    /// The user name and password for the proxy (see <see cref="Proxy"/>): given on the command line, or kept for it in the
+    /// user's settings. Null: those in the proxy's URL, else the user's own sign-in (NTLM and Negotiate only).
+    /// </summary>
+    public System.Net.NetworkCredential? ProxyCredential { get; set; }
+
     public long MaxResponseBytes { get; set; } = 50L * 1024 * 1024;
 
     public string HttpVersion { get; set; } = "1.1";
@@ -184,6 +190,7 @@ public sealed class RequestPreparer(VariableResolver variables, ClientCertificat
         prepared.UseCookies = !(spec.Settings.DisableCookies ?? false);
         prepared.Timeout = defaults.Timeout;
         prepared.Proxy = defaults.Proxy;
+        prepared.ProxyCredential = defaults.ProxyCredential;
         prepared.HttpVersion = defaults.HttpVersion;
         prepared.MaxResponseBytes = defaults.MaxResponseBytes;
         prepared.ExtraTrustedCertificates = LoadTrust(prepared.Warnings);

@@ -51,12 +51,21 @@ public sealed partial class RequestRunner : IDisposable
     /// <summary>
     /// The proxy URL of the workspace's settings while it is not the <see cref="AllowedProxy"/>: requests use the system's
     /// proxy settings then (the OS's, <c>HTTPS_PROXY</c>), as without a proxy setting. Null when the settings name no proxy
-    /// URL ("system", "none") or the one allowed.
+    /// URL ("system", "none") or the one allowed, and while <see cref="ProxyOverride"/> replaces it.
     /// </summary>
     public string? BlockedProxy =>
-        Workspace.Settings.Proxy is var proxy && WorkspaceSettings.IsProxyUrl(proxy) && !string.Equals(proxy.Trim(), AllowedProxy?.Trim(), StringComparison.Ordinal)
+        ProxyOverride is null && Workspace.Settings.Proxy is var proxy && WorkspaceSettings.IsProxyUrl(proxy) && !string.Equals(proxy.Trim(), AllowedProxy?.Trim(), StringComparison.Ordinal)
             ? proxy
             : null;
+
+    /// <summary>The proxy for every request in place of the workspace's (CLI <c>--proxy</c>: a URL, "system" or "none"); typed by the user, so used as it is.</summary>
+    public string? ProxyOverride { get; set; }
+
+    /// <summary>The proxy's user name and password for every request (CLI <c>--proxy-user</c>), in place of those kept for it.</summary>
+    public System.Net.NetworkCredential? ProxyCredentialOverride { get; set; }
+
+    /// <summary>The user names and passwords the user keeps for proxies (read by <see cref="ConfigureProxy"/>).</summary>
+    public ProxyCredentialStore ProxyCredentials { get; set; } = ProxyCredentialStore.Empty();
 
     /// <summary>
     /// Whether requests may send body and form-data files from outside the workspace folder, and open client certificates and
@@ -107,13 +116,15 @@ public sealed partial class RequestRunner : IDisposable
 
     /// <summary>
     /// Sets <see cref="AllowedProxy"/> to the proxy URL of the workspace's settings when the user's settings allow it for
-    /// this workspace folder (<see cref="UserSettings.IsProxyAllowed"/>), else to none.
+    /// this workspace folder (<see cref="UserSettings.IsProxyAllowed"/>), else to none, and reads the user names and
+    /// passwords the user keeps for proxies (<see cref="ProxyCredentials"/>).
     /// </summary>
     /// <param name="userSettingsDirectory">Overrides the user's configuration folder (tests, portable setups).</param>
     public void ConfigureProxy(string? userSettingsDirectory = null)
     {
         var proxy = Workspace.Settings.Proxy;
         AllowedProxy = WorkspaceSettings.IsProxyUrl(proxy) && UserSettings.Load(userSettingsDirectory).IsProxyAllowed(Workspace.RootPath, proxy) ? proxy : null;
+        ProxyCredentials = ProxyCredentialStore.Load(userSettingsDirectory);
     }
 
     /// <summary>Sets <see cref="OutsideFilesAllowed"/> as the user's settings say for this workspace folder.</summary>
@@ -158,6 +169,10 @@ public sealed partial class RequestRunner : IDisposable
     {
         var settings = Workspace.Settings;
         var timeoutMs = TimeoutOverrideMs ?? settings.TimeoutMs;
+
+        // One not allowed: the system's proxy settings, as without one. Trimmed, as requests use it: recordings then find the
+        // password of a URL written with a space before it.
+        var proxy = ProxyOverride?.Trim() ?? (BlockedProxy is null ? settings.Proxy?.Trim() : null);
         return new ExecutionDefaults
         {
             StrictSsl = StrictSslOverride ?? settings.StrictSsl,
@@ -165,9 +180,8 @@ public sealed partial class RequestRunner : IDisposable
             Timeout = timeoutMs > 0 ? TimeSpan.FromMilliseconds(timeoutMs) : null,
             FollowRedirects = settings.FollowRedirects,
             MaxRedirects = settings.MaxRedirects,
-            // One not allowed: the system's proxy settings, as without one. Trimmed, as requests use it: recordings then find
-            // the password of a URL written with a space before it.
-            Proxy = BlockedProxy is null ? settings.Proxy?.Trim() : null,
+            Proxy = proxy,
+            ProxyCredential = ProxyCredentialOverride ?? ProxyCredentials.Find(proxy),
             MaxResponseBytes = Math.Max(1, settings.MaxResponseSizeMb) * 1024L * 1024L,
             HttpVersion = settings.HttpVersion,
             FilesFolder = FilesFolder,

@@ -309,6 +309,9 @@ public sealed class PreparedRequest
     /// <summary>Null/"system" = OS proxy, "none" = direct, otherwise a proxy URL.</summary>
     public string? Proxy { get; set; }
 
+    /// <summary>The proxy's user name and password (see <see cref="ExecutionDefaults.ProxyCredential"/>); never recorded.</summary>
+    public System.Net.NetworkCredential? ProxyCredential { get; set; }
+
     public long MaxResponseBytes { get; set; } = 50L * 1024 * 1024;
 
     public List<string> Warnings { get; } = [];

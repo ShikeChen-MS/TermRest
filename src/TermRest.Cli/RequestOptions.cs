@@ -54,6 +54,18 @@ internal sealed class RequestOptions
         Description = "Also send body and form-data files from outside the workspace folder (default: only where allowed for the workspace in the full-screen UI, Tools › Settings…)",
     };
 
+    public Option<string?> Proxy { get; } = new("--proxy", "-x")
+    {
+        Description = "The proxy for every request: a URL (http://host:port), \"system\" (the OS's settings, HTTPS_PROXY) or \"none\" " +
+                      "(default: the workspace's, once allowed in the full-screen UI)",
+    };
+
+    public Option<string?> ProxyUser { get; } = new("--proxy-user", "-U")
+    {
+        Description = "The proxy's user name and password: user:password, or user to be asked for the password (DOMAIN\\user for NTLM). " +
+                      "Default: those in the proxy's URL or kept in the full-screen UI (Tools › Settings › Proxy sign-in), else your own sign-in for NTLM and Negotiate proxies",
+    };
+
     public void AddTo(Command command)
     {
         command.Options.Add(Environment);
@@ -67,6 +79,8 @@ internal sealed class RequestOptions
         command.Options.Add(ScriptOrder);
         command.Options.Add(NoScripts);
         command.Options.Add(AllowOutsideFiles);
+        command.Options.Add(Proxy);
+        command.Options.Add(ProxyUser);
     }
 
     /// <summary>
@@ -194,6 +208,47 @@ internal sealed class RequestOptions
         }
 
         runner.ConfigureProxy();
+        if (parseResult.GetValue(Proxy) is { } proxyOverride)
+        {
+            var value = proxyOverride.Trim();
+            if (WorkspaceSettings.IsProxyUrl(value) && !value.Contains("://", StringComparison.Ordinal))
+            {
+                value = "http://" + value; // host:port, as curl takes it
+            }
+
+            if (WorkspaceSettings.IsProxyUrl(value) && !(Uri.TryCreate(value, UriKind.Absolute, out var proxyUri) && proxyUri.Scheme is "http" or "https" or "socks4" or "socks4a" or "socks5"))
+            {
+                Output.Error($"--proxy expects a URL (http://host:port), \"system\" or \"none\", got '{PostmanUrl.MaskCredentials(value)}'.");
+                runner.Dispose();
+                return null;
+            }
+
+            runner.ProxyOverride = value;
+        }
+
+        if (parseResult.GetValue(ProxyUser) is { } proxyUser)
+        {
+            var colon = proxyUser.IndexOf(':', StringComparison.Ordinal);
+            var user = colon < 0 ? proxyUser : proxyUser[..colon];
+            var password = colon < 0 ? ConsolePassword.Read($"Proxy password for {user}: ") : proxyUser[(colon + 1)..];
+            if (user.Trim().Length == 0 || password is null)
+            {
+                Output.Error(password is null
+                    ? "--proxy-user: give the password as user:password, as there is no terminal to type it in."
+                    : "--proxy-user expects user:password, or user to be asked for the password.");
+                runner.Dispose();
+                return null;
+            }
+
+            runner.ProxyCredentialOverride = ProxyCredentialStore.Credential(user.Trim(), password);
+        }
+
+        if (runner.ProxyCredentials.LoadError is { } credentialsProblem)
+        {
+            Output.Warning(credentialsProblem);
+            Output.Info("  The proxy user names and passwords kept in the full-screen UI are not used until the file is fixed.");
+        }
+
         if (runner.BlockedProxy is { } proxy)
         {
             Output.Warning($"The proxy in {workspace.SettingsPath} ({PostmanUrl.MaskCredentials(proxy.Trim())}) is not used, as a cloned repository could send " +

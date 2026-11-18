@@ -117,6 +117,14 @@ A `settings.json` or `certificates.json` that can't be read (invalid JSON, a mer
 
 A proxy URL in `.termrest/settings.json` (`proxy`) is used only once you allow it for that workspace folder: the file comes with the repository you clone, and a proxy sees every request, with its credentials. Until then, requests use the system's proxy settings (the OS's, `HTTPS_PROXY`), as with `system`; the status bar and *Help › Workspace info* say so, and `send` and `run` print a warning (the proxy's password masked). Saving in *Tools › Settings* allows the proxy shown there; the dialog shows its password masked too, and keeps it while the mask is left in place (also when only the host or port changes). The approval is kept per workspace folder in your user settings (`allowedProxies`) as a SHA-256 hash, never the proxy's URL, which can hold a password; when the file names another proxy (after a `git pull`, say), that one must be allowed again. `system` and `none` need no approval, and the file's other settings, TLS verification and the CA bundle included, apply as they are.
 
+**Proxy sign-in.** A proxy that asks for a user name and password (407 Proxy Authentication Required) gets the ones given for it, answered with Basic, Digest, NTLM or Negotiate (Kerberos), as the proxy asks:
+
+- in *Tools › Settings › Proxy sign-in*: kept for that proxy (or for the system's) in `proxy-credentials.json` in your user settings folder, never in the workspace. Only you can read the file, and on Windows the password in it is also encrypted for your account (DPAPI). A password left masked stays as it was; clear the user name to forget them;
+- with `--proxy-user user:password` on `send` and `run`, or `--proxy-user user` to type the password (`DOMAIN\user` for NTLM);
+- in the proxy's URL, `http://user:password@proxy:3128`, also in `HTTPS_PROXY`.
+
+Without any, a proxy that asks for NTLM or Negotiate, as corporate proxies do, gets your own sign-in (as browsers give it); one that asks for Basic or Digest gets nothing, and the 407 comes back with a note that says how to give one. `--proxy <url|system|none>` (`-x`; `host:port` works too, as in curl) sets the proxy for `send` and `run` in place of the workspace's.
+
 Requests send body and form-data files only from the workspace folder, also once links are resolved: a collection that comes with a repository could otherwise send any file you can read (SSH keys, cloud credentials) to a server of its choosing, with no script needed. A file outside the folder (an absolute path, a `../` path, or a link in the repository that leads out) stops its request with an error that names it; a path outside the folder as written is not even looked at, by the request or by its Body tab, so a Windows `\\server\share` path doesn't reach that server. For the same reason, on Windows, client certificates and the CA bundle (named by a request, `.termrest/certificates.json` or `.termrest/settings.json`) are not opened from a network share outside the folder, nor through a link that leads there: the request is sent without them, with a warning. To send such files and use such certificates, check *Outside files: Allow files from outside this folder* in *Tools › Settings* (kept per workspace folder in your user settings, `outsideFilesAllowed`), or pass `--allow-outside-files` to `send`, `run` or `certs list`.
 
 Variables resolve Postman-style. The highest precedence comes first: `--var`/local, then environment, then collection, then globals. Values may reference other variables, and Postman dynamic variables work, with a new value each time: `{{$guid}}` (also `$randomUUID`), `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$randomInt}}` (0 to 1000), `$randomBoolean`, `$randomAlphaNumeric` and `$randomHexadecimal` (one character), `$randomFirstName`, `$randomLastName`, `$randomFullName`, `$randomUserName`, `$randomEmail`, `$randomWord` and `$randomPassword`. Scripts resolve them too (`.replaceIn`, `.replace_in`, `.ReplaceIn`): `pm.environment.set('email', pm.variables.replaceIn('{{$randomEmail}}'))` keeps one address for the requests that use `{{email}}`. A variable of the same name takes the place of a dynamic one (`$timestamp` set by a script, say), in requests and scripts alike, as in Postman. Unresolved `{{names}}` are kept and reported as warnings. Replacing variables adds at most 4,194,304 characters to a text: a reference whose value would go past that (a value that references itself several times, say) stays unresolved and is reported.
@@ -372,6 +380,7 @@ TermRest runs scripts the way a terminal runs commands: it starts the runtime yo
 
 - It never chooses a runtime by itself. Runtimes are chosen per workspace folder and kept in your user settings, never in the workspace, so a cloned repository cannot turn its scripts on. *Find* only looks when you press it, and doesn't run a Python it finds in the workspace. A command such as `node` is looked up in the folders of PATH only, so a `node.exe` that a repository ships never runs in its place. *Find* and *Check* run a runtime in TermRest's cache folder, never in the workspace, whose files would otherwise act before you choose it (a `bunfig.toml` that preloads code into Bun, a `global.json` that points `dotnet` to other SDKs).
 - It never uses a proxy that a workspace names until you allow it: a proxy URL in `.termrest/settings.json` is allowed per workspace folder in your user settings, never in the workspace (*Tools › Settings › Save*, and again whenever it changes), so a cloned repository cannot send your requests through a proxy of its choosing.
+- Proxy passwords are never kept in a workspace either: *Proxy sign-in* keeps them in a file of your user settings that only you can read, encrypted for your account on Windows (see [Proxy sign-in](#workspace-layout)).
 - It never sends a body or form-data file from outside the workspace folder until you allow it for that folder (*Tools › Settings*, or `--allow-outside-files`), so a cloned repository's requests cannot upload your other files. Until then it doesn't open certificates or a CA bundle on a Windows network share outside the folder either, so a cloned repository cannot make Windows sign in to a server of its choosing with your credentials. Scripts are not bound by this: they can read any file.
 - Without a runtime, the UI sends requests and skips their scripts (`⚠ scripts not run`). On the command line, scripts without a runtime are an error until one is chosen (in the UI, or with `--python`, `--javascript`, `--csharp` or `--powershell`), or until you pass `--no-scripts`.
 - `tr` and `pm` cannot change collection, environment or settings files: the values scripts set stay in memory until TermRest closes. Recordings redact secrets, in what scripts print too.
@@ -708,6 +717,7 @@ termrest snapshot [<workspace>] [--send]       render the UI headlessly (smoke t
 
 <collection>: a *.postman_collection.json file or a v3 collection folder
 common options:      -e/--env <name|file>  --var key=value  --timeout <ms>  -k/--insecure  --record <file.har>
+                     -x/--proxy <url|system|none>  -U/--proxy-user <user[:password]>
                      --python <path>  --javascript <path>  --csharp <path>  --powershell <path>
                      --script-order <languages>  --no-scripts  --allow-outside-files
 send options:        -i/--include  -v/--verbose  -o/--output <file>  --raw  --filter <jsonpath>  -f/--fail  --curl  --no-history
@@ -814,10 +824,7 @@ Notes:
 
 ## Roadmap
 
-- **Next:** saving responses as Postman examples, and showing them in v3 collections.
-- **Phase 2:**
-  - Proxy authentication.
-  - Code snippets.
+- **Next:** code snippets (a request as code in other languages, besides cURL).
 - **Packaging:** winget, Homebrew, `.deb`/`.rpm`, and signed binaries.
 
 ## License

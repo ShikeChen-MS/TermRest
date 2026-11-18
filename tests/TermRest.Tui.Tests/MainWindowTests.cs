@@ -1189,6 +1189,43 @@ public sealed class MainWindowTests : IDisposable
         Assert.Equal((0, "none"), (ui.Workspace.Settings.MaxRedirects, ui.Workspace.Settings.Proxy));
     }
 
+    [Fact]
+    public void A_proxy_sign_in_typed_in_the_settings_is_kept_in_the_users_private_file_not_the_workspace()
+    {
+        var userDirectory = TestFiles.NewTempDirectory();
+        using var ui = new Harness(_directory, runner => runner.ConfigureProxy(userDirectory));
+        var saved = false;
+
+        var screens = Drive(ui, () =>
+            {
+                SettingsDialog.Show(ui.App, ui.Workspace, ui.Runner, out saved, userDirectory);
+                ui.App.RequestStop();
+            },
+            ("Workspace settings", () =>
+            {
+                var label = ui.Find("Proxy sign-in");
+                ui.App.InjectSequence(InputInjectionExtensions.LeftButtonClick(new Point(label.X + 23, label.Y))); // its user field
+                ui.Type("CONTOSO\\ada");
+                ui.App.InjectKey(Key.Tab); // the password
+                ui.Type("s3cret-pw");
+                ui.Click("► Save ◄");
+            }));
+
+        Assert.Single(screens);
+        Assert.True(saved);
+        var credential = ui.Runner.CreateDefaults().ProxyCredential; // the system's proxy, used at once
+        Assert.Equal(("ada", "s3cret-pw", "CONTOSO"), (credential?.UserName, credential?.Password, credential?.Domain));
+        var file = File.ReadAllText(Path.Combine(userDirectory, ProxyCredentialStore.FileName));
+        Assert.Contains("CONTOSO\\\\ada", file, StringComparison.Ordinal);
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.DoesNotContain("s3cret-pw", file, StringComparison.Ordinal);
+        }
+
+        var workspaceSettings = ui.Workspace.SettingsPath;
+        Assert.False(File.Exists(workspaceSettings) && File.ReadAllText(workspaceSettings).Contains("ada", StringComparison.Ordinal));
+    }
+
     [Theory]
     [InlineData("http://ada:***@proxy:3128", "http://ada:s3cret@proxy:3128")] // left as shown
     [InlineData("http://ada:***@proxy:8080", "http://ada:s3cret@proxy:8080")] // only the port changed

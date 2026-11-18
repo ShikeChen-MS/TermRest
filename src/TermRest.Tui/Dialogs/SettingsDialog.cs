@@ -64,6 +64,14 @@ internal static class SettingsDialog
 
         dialog.Add(proxyHint);
         y += 1;
+
+        // Kept for the proxy in the user's private credentials file, never in the workspace; a password left masked stays.
+        const string keptPassword = "********";
+        var (keptUser, hasPassword) = runner.ProxyCredentials.Describe(settings.Proxy);
+        var proxyUser = Ui.AddRow(dialog, "Proxy sign-in", new TextField { Text = keptUser, Width = 22 }, y, 22);
+        var proxyPassword = new TextField { X = Pos.Right(proxyUser) + 11, Y = y, Width = 16, Secret = true, Text = hasPassword ? keptPassword : "" };
+        dialog.Add(new Label { Text = "password", X = Pos.Right(proxyUser) + 2, Y = y }, proxyPassword);
+        y += 1;
         var http = Ui.AddRow(dialog, "HTTP version", new OptionSelector { Labels = ["HTTP/1.1", "HTTP/2 (when supported)"], Orientation = Orientation.Horizontal, Value = settings.HttpVersion == "2" ? 1 : 0 }, y, 22);
         y += 1;
         var maxSize = Ui.AddRow(dialog, "Max response (MB)", new TextField { Text = settings.MaxResponseSizeMb.ToString(CultureInfo.InvariantCulture), Width = 8 }, y, 22);
@@ -104,7 +112,7 @@ internal static class SettingsDialog
         var redact = Ui.AddRow(dialog, "Recordings redact", new TextField { Text = string.Join(", ", settings.RecordingRedact ?? []) }, y, 22);
         y += 1;
         dialog.Add(Ui.Hint("Extra header, parameter and field names, comma-separated (credentials, cookies and tokens always are).", 24, y));
-        y += 2;
+        y += 1; // no blank line before the last row: with the proxy sign-in, the dialog still fits a terminal of 30 rows
         var outsideFiles = Ui.AddRow(dialog, "Outside files", new CheckBox
         {
             Text = "Allow files from outside this folder",
@@ -172,6 +180,15 @@ internal static class SettingsDialog
             settings.RecordingRedact = names.Count == 0 ? null : names;
             saved = Ui.TrySave(app, workspace.SaveSettings); // applied for this session either way
             saved &= SaveApprovals(app, workspace, runner, outsideFiles.Value == CheckState.Checked, userDirectory);
+
+            // The sign-in goes with the proxy the settings now name (the system's, or a URL), for this session and in the
+            // user's credentials file.
+            var password = proxyPassword.Text == keptPassword && hasPassword ? null : proxyPassword.Text;
+            if (runner.ProxyCredentials.Set(settings.Proxy, proxyUser.Text, password))
+            {
+                saved &= Ui.TrySave(app, () => runner.ProxyCredentials.Save(userDirectory));
+            }
+
             return true;
         }
     }

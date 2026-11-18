@@ -1116,6 +1116,29 @@ public sealed class CommandLineTests
     }
 
     [Fact]
+    public async Task Send_signs_in_to_a_proxy_with_proxy_user_and_says_what_a_proxy_that_wants_a_sign_in_needs()
+    {
+        await using var proxy = new SignInProxy("ada", "s3cret");
+        var collection = WriteCollection(TestFiles.NewTempDirectory(), "Api", [("Hello", "GET", "http://api.example.test/hello")]);
+
+        var signedIn = await Termrest.RunAsync(["send", collection, "Hello", "--proxy", proxy.Url, "--proxy-user", "ada:s3cret"]);
+        var refused = await Termrest.RunAsync(["send", collection, "Hello", "-x", proxy.Url["http://".Length..]]); // host:port, as curl takes it
+        var noPassword = await Termrest.RunAsync(["send", collection, "Hello", "--proxy", proxy.Url, "--proxy-user", "ada"]); // nobody to type it
+        var invalid = await Termrest.RunAsync(["send", collection, "Hello", "--proxy", "ftp://proxy:21"]);
+
+        Assert.True(signedIn.ExitCode == 0, signedIn.ToString());
+        Assert.Contains("through the proxy", signedIn.Text, StringComparison.Ordinal);
+        Assert.True(refused.ExitCode == 0, refused.ToString()); // a response: the proxy's 407
+        Assert.Contains("407", refused.Error, StringComparison.Ordinal);
+        Assert.Contains("The proxy asks for a user name and password", refused.Error, StringComparison.Ordinal);
+        Assert.Equal(2, noPassword.ExitCode);
+        Assert.Contains("give the password as user:password", noPassword.Error, StringComparison.Ordinal);
+        Assert.Equal(2, invalid.ExitCode);
+        Assert.Contains("--proxy expects a URL", invalid.Error, StringComparison.Ordinal);
+        Assert.Equal(3, proxy.Requests.Count); // the two that reached it: one with a sign-in after the challenge
+    }
+
+    [Fact]
     public async Task Files_from_outside_the_workspace_are_sent_only_with_allow_outside_files()
     {
         // A collection someone else wrote, whose body is a file of the user's.
