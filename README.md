@@ -1,6 +1,15 @@
 # TermRest
 
-A lightweight terminal REST client for development and testing:
+A small terminal REST client for development and testing. **It is not another Postman.** It aims at the 80% of an API client that people use every day, with about 20% of the resources, so that your memory and CPU go back to what you are working on: your own services, your IDE, containers, the browser you test with.
+
+**Small by design:**
+
+- One native executable of about 21 MB. Nothing else to install: no runtime, no browser engine.
+- The full-screen UI, with a workspace open, takes under 90 MB of memory and next to no CPU when idle (16 ms of CPU time in 10 idle seconds). A `termrest send` takes about 23 MB. *(Working set, measured on Windows x64.)*
+- No account, no cloud sync, no telemetry, no update checks, no background service: when you quit, nothing of it keeps running. Script runtimes start only for the scripts that need them, and stop when idle.
+- Collections stay Postman's own files, so Postman and Newman open them at any time, for the 20% that TermRest leaves out: mock servers, monitors, team workspaces, API design and documentation, and gRPC and WebSocket requests.
+
+What it has:
 
 - **Full-screen, mouse-friendly UI** in the style of Microsoft Edit: menu bar, resizable panes, tables with checkboxes, context menus. Every action also works from the keyboard. Color themes are built in (Dracula, Nord, Solarized, and more), or you can create your own.
 - **Postman-compatible storage.** Collections and environments are Postman files, edited in place: v2.1 JSON, or the v3 YAML folders that Postman v12 keeps in Git. TermRest writes them back as Postman would (untouched JSON byte-for-byte; in YAML only the lines you changed) and keeps everything it doesn't understand (examples, unknown fields).
